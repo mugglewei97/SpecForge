@@ -302,7 +302,9 @@ def _run(cfg, control_group):
             warmup_ratio=cfg.training.warmup_ratio,
         ),
     )
-    backend.prepare_model(model, optimizer_target=draft)
+    # FSDP must preserve the captured FP32 p/q; BF16 rounding can break their
+    # normalization and replay parity. Replay casts only the model features.
+    backend.prepare_model(model, optimizer_target=draft, cast_root_forward_inputs=False)
     _publish_weights(backend, draft_config, root, 0, rank, control_group)
     _prepare_rollout_phase(control_group)
     pool = None

@@ -227,10 +227,13 @@ class FSDPTrainingBackend(TrainingBackend):
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
+        cast_root_forward_inputs: bool = True,
     ) -> nn.Module:
         """Register and wrap the trainable module unless ``wrap=False``.
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
+        Disable ``cast_root_forward_inputs`` when the wrapper owns input dtypes,
+        e.g. BF16 activations alongside FP32 probability distributions.
         """
         if not wrap:
             self.module = model
@@ -286,7 +289,9 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                        param_dtype=pc.param_dtype,
+                        buffer_dtype=torch.float32,
+                        cast_root_forward_inputs=cast_root_forward_inputs,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,

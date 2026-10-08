@@ -15,6 +15,7 @@ from specforge.on_policy.trainer import (
     train_effective_batch,
 )
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from tests.test_on_policy.test_precision import check_bf16_replay_precision
 from tests.test_on_policy.test_training import tensors, traces
 
 
@@ -47,6 +48,7 @@ def _worker(rank, directory):
     )
     control_group = dist.new_group(backend="gloo")
     try:
+        check_bf16_replay_precision(torch.device("cuda", rank))
         model = CudaReplay(torch.device("cuda", rank))
         backend = FSDPTrainingBackend(
             ParallelConfig(
