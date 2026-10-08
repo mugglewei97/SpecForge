@@ -1,12 +1,12 @@
 # Converted from the 8-GPU train_dspark.py server job.
 model:
-  target_model_path: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-8B
+  target_model_path: /personal/model/Qwen3-8B
   draft_checkpoint_path: /mnt/amed-s1/common/ckpt/gaochang/EagleModel/outputs/qwen3-8b-dspark-120w-mix/epoch_6_step_228768
   draft_model_config: ./configs/qwen3-8b-dspark.json
 data:
   train_data_path: /mnt/amed-s1/common/data/gaochang/eagle-data/qwen3-8b-regen-mix-70w.jsonl
   max_prompt_length: 4096
-  max_length: 4096  # Prompt + generated output; reserve anchor/candidate room.
+  max_length: 8192  # Prompt + generated output; reserve anchor/candidate room.
   chat_template: qwen
   # Preserve the tokenizer's thinking default, as in --chat-template qwen.
   chat_template_kwargs: {}
@@ -14,7 +14,7 @@ training:
   output_dir: /personal/checkpoints/specforge/onpolicy/
   num_epochs: 6
   batch_size: 32  # Original per-GPU batch 4 * 8 GPUs; global in this entrypoint.
-  learning_rate: 0.0006
+  learning_rate: 6e-4
   warmup_ratio: 0.04
   max_grad_norm: 1.0
   attention_backend: flex_attention
@@ -25,14 +25,15 @@ training:
   # synchronized update; retaining full-vocabulary tensors for 6 epochs is huge.
   retain_replay_tensors: false
 rollout:
-  cuda_devices: [0]
+  placement: colocated
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6, 7]
   mem_fraction_static: 0.3
-  context_length: 4112  # max_length (4096) + 16 verification scratch slots.
+  context_length: 10000  # 3072 visible tokens + verification scratch space.
   attention_backend: flashinfer
 sampling:
   # New on-policy sampling choices; the old supervised command had no sampler.
   temperature: 1.0
   top_k: -1
   top_p: 1.0
-  max_new_tokens: 3072  # Per request, capped to 3072 - prompt_length.
+  max_new_tokens: 4096  # Per request, capped to 3072 - prompt_length.
   ignore_eos: false

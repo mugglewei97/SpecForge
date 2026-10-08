@@ -6,7 +6,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$REPO_ROOT"
 CONFIG="$REPO_ROOT/examples/on_policy/qwen3-8b-dspark-tv.yaml"
 
-export SPECFORGE_DATA_NUM_PROC=32
+export SPECFORGE_DATA_NUM_PROC=96
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 # All eight GPUs run FSDP, with one TP=1 SGLang rollout worker on each same GPU.
 # The effective global batch remains the original 4 samples per rank * 8 = 32.
