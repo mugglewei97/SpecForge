@@ -29,7 +29,7 @@ Check out [**our documentation**](https://docs.sglang.io/SpecForge/) to get star
 
 ## 🔧 Supported Methods
 
-Every method uses the same typed training entry point:
+Feature-based training for every method uses the same typed entry point:
 
 ```bash
 specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
@@ -41,7 +41,13 @@ supervises the producer and consumer on one trainer node, while the user or
 scheduler owns Mooncake and SGLang. Recipes under `managed-local` also start
 those services on the local host. Online target parallelism belongs to SGLang;
 `deployment.trainer` owns trainer DP and offline EAGLE3 USP process groups.
-There are no method-specific Python training entry points.
+These feature-based recipes share the same training lifecycle.
+
+DSpark also has an opt-in [on-policy TV post-training mode](./docs/recipes/dspark-on-policy-tv.md)
+through `specforge train-on-policy`. It starts from an existing checkpoint,
+records complete native speculative trajectories, and synchronizes the draft
+after each sample-balanced FSDP update. See the recipe for its initial supported
+scope and H200 validation gates.
 
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |

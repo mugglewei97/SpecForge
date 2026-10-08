@@ -1,0 +1,340 @@
+"""Synchronous rollout -> sample-balanced FSDP replay -> full-weight barrier."""
+
+import json
+import logging
+import os
+import random
+import uuid
+from contextlib import nullcontext
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+from .data import atomic_json, load_prompts, load_trace
+
+logger = logging.getLogger(__name__)
+
+
+def _leader_call(action, rank):
+    """Propagate control-plane failures before peers enter the next collective."""
+    result, error = None, None
+    if rank == 0:
+        try:
+            result = action()
+        except Exception as exc:
+            error = exc
+    status = torch.tensor(
+        int(error is None), device=torch.device("cuda", torch.cuda.current_device())
+    )
+    dist.broadcast(status, src=0)
+    if not status.item():
+        if error is not None:
+            raise error
+        raise RuntimeError("on-policy coordinator failed; the batch cannot continue")
+    return result
+
+
+def replay_schedule(traces, rank, world_size):
+    """Equal collective counts despite unequal numbers of blocks per sample.
+
+    FSDP averages over ranks. Each real block therefore gets weight W/(N*M).
+    Empty slots execute a real block with zero loss to join all collectives.
+    """
+    valid = [
+        trace for trace in traces if any(any(b["valid_mask"]) for b in trace["blocks"])
+    ]
+    if not valid:
+        raise ValueError("effective batch has no valid samples")
+    per_rank = [[] for _ in range(world_size)]
+    for sample_index, trace in enumerate(valid):
+        blocks = [
+            index
+            for index, block in enumerate(trace["blocks"])
+            if any(block["valid_mask"])
+        ]
+        for index in blocks:
+            per_rank[sample_index % world_size].append(
+                (trace, index, world_size / len(valid) / len(blocks))
+            )
+    slots = max(map(len, per_rank))
+    exemplar = next(items[0] for items in per_rank if items)
+    return per_rank[rank] + [(exemplar[0], exemplar[1], 0.0)] * (
+        slots - len(per_rank[rank])
+    )
+
+
+def train_effective_batch(
+    backend, traces, tensor_loader, rank, world_size, replay_max_tv
+):
+    schedule = replay_schedule(traces, rank, world_size)
+    metrics = torch.zeros(2, device=next(backend.module.parameters()).device)
+    for slot, (trace, index, weight) in enumerate(schedule):
+        block = trace["blocks"][index]
+        data = tensor_loader(trace)
+        boundary = slot == len(schedule) - 1
+        # no_sync must enclose FORWARD as well as backward (FSDP/DDP contract).
+        context = nullcontext() if boundary else backend.module.no_sync()
+        with context:
+            loss, parity = backend.module(
+                block,
+                data["context_hidden"][: block["context_length"]],
+                data[f"p_{index}"],
+                data[f"q_{index}"],
+            )
+            error = parity.detach().clone()
+            if dist.is_initialized():
+                dist.all_reduce(error, op=dist.ReduceOp.MAX)
+            if not torch.isfinite(error) or error.item() > replay_max_tv:
+                raise RuntimeError(
+                    f"rollout/replay q TV={error.item():.6f} exceeds {replay_max_tv}; optimizer was not stepped"
+                )
+            backend.backward(loss * weight, is_boundary=True)
+        metrics[0] += loss.detach() * weight / world_size
+        metrics[1] = torch.maximum(metrics[1], parity)
+    if dist.is_initialized():
+        dist.all_reduce(metrics[0], op=dist.ReduceOp.SUM)
+        dist.all_reduce(metrics[1], op=dist.ReduceOp.MAX)
+    backend.step()  # exactly once, after the whole effective batch
+    return {"loss": metrics[0].item(), "replay_max_tv": metrics[1].item()}
+
+
+def _publish_weights(backend, draft_config, root, version, rank):
+    from safetensors.torch import save_file
+
+    # All FSDP ranks must participate, including ranks with no local samples.
+    state = backend._module_state_dict()
+
+    def publish():
+        path = root / "weights" / f"{version:08d}"
+        path.mkdir(parents=True, exist_ok=False)
+        draft_state = {
+            name.removeprefix("draft_model."): value.detach().cpu().contiguous()
+            for name, value in state.items()
+            if name.startswith("draft_model.")
+        }
+        if not draft_state:
+            raise RuntimeError("FSDP export contained no draft parameters")
+        save_file(draft_state, str(path / "model.safetensors"))
+        draft_config.save_pretrained(path)
+
+    _leader_call(publish, rank)
+
+
+def _validate_draft(config):
+    if config.architectures != ["DSparkDraftModel"]:
+        raise ValueError("on-policy supports the registered dense DSparkDraftModel")
+    if getattr(config, "is_causal", None) is not None:
+        raise ValueError(
+            "explicit is_causal overrides are not supported by DSpark replay"
+        )
+    if config.dflash_config.get("attention_mode", "gqa") not in {"gqa", "mha"}:
+        raise ValueError("the initial on-policy gate supports GQA/MHA dense drafts")
+    if config.dflash_config.get("markov_rank", 0) <= 0:
+        raise ValueError("SGLang DSpark requires a Markov head")
+    if config.dflash_config.get("mask_token_id") is None:
+        raise ValueError("checkpoint must define dflash_config.mask_token_id")
+    if getattr(config, "attention_dropout", 0) != 0:
+        raise ValueError("on-policy rollout/replay requires attention_dropout=0")
+    if getattr(config, "draft_vocab_size", config.vocab_size) != config.vocab_size:
+        raise ValueError("reduced-vocabulary DSpark replay is not supported")
+
+
+def run(cfg):
+    from transformers import AutoTokenizer
+
+    from specforge.modeling.auto import AutoDraftModel
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+    from specforge.optimizer import BF16Optimizer
+    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.model_loading import (
+        load_draft_config_source,
+        warm_start_draft_model,
+    )
+
+    from .replay import DSparkReplayModel
+    from .rollout import RolloutPool
+
+    rank, world = dist.get_rank(), dist.get_world_size()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    root = Path(cfg.training.output_dir).expanduser().resolve()
+
+    def initialize_output():
+        # Existing runs are never silently overwritten; warm-start from an
+        # exported version into a fresh output directory to continue training.
+        root.mkdir(parents=True, exist_ok=True)
+        if (root / "run.json").exists() or (root / "weights").exists():
+            raise ValueError("on-policy output directory already contains a run")
+        atomic_json(root / "run.json", cfg.model_dump())
+
+    _leader_call(initialize_output, rank)
+    torch.manual_seed(cfg.training.seed)
+    draft_config = load_draft_config_source(
+        cfg.model.draft_model_config or cfg.model.draft_checkpoint_path,
+        cache_dir=cfg.model.cache_dir,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    _validate_draft(draft_config)
+    if (
+        cfg.rollout.context_length
+        < cfg.data.max_prompt_length
+        + cfg.sampling.max_new_tokens
+        + draft_config.block_size
+        + 7
+    ):
+        raise ValueError(
+            "rollout context must also cover the complete speculative block"
+        )
+    draft_config._attn_implementation = "sdpa"
+    draft = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
+    warm_start_draft_model(
+        draft,
+        cfg.model.draft_checkpoint_path,
+        draft_config=draft_config,
+        strategy="dspark",
+        cache_dir=cfg.model.cache_dir,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    parts = TargetEmbeddingsAndHead.from_pretrained(
+        cfg.model.target_model_path,
+        embed_key=cfg.model.embedding_key,
+        lm_head_key=cfg.model.lm_head_key,
+        cache_dir=cfg.model.cache_dir,
+        trust_remote_code=cfg.model.trust_remote_code,
+        device=str(device),
+        dtype=torch.bfloat16,
+    )
+    model = DSparkReplayModel(draft, parts).to(device)
+    model.eval()  # gradients remain enabled; match the inference backbone
+    backend = FSDPTrainingBackend(
+        ParallelConfig.from_distributed(sharding_strategy=cfg.training.fsdp_sharding),
+        optimizer_factory=lambda module: BF16Optimizer(
+            module,
+            lr=cfg.training.learning_rate,
+            weight_decay=cfg.training.weight_decay,
+            max_grad_norm=cfg.training.max_grad_norm,
+            total_steps=cfg.training.max_steps,
+            warmup_ratio=cfg.training.warmup_ratio,
+        ),
+    )
+    backend.prepare_model(model, optimizer_target=draft)
+    _publish_weights(backend, draft_config, root, 0, rank)
+    pool = None
+    try:
+
+        def start_rollouts():
+            tokenizer = AutoTokenizer.from_pretrained(
+                cfg.model.target_model_path,
+                trust_remote_code=cfg.model.trust_remote_code,
+            )
+            prompts = load_prompts(
+                cfg.data.train_data_path,
+                tokenizer,
+                cfg.data.max_prompt_length,
+                cfg.data.chat_template_kwargs,
+            )
+            random.Random(cfg.training.seed).shuffle(prompts)
+            # skip_tokenizer_init requires explicit EOS IDs on the engine requests.
+            if not cfg.sampling.ignore_eos:
+                eos = getattr(parts.config, "eos_token_id", None)
+                eos = eos if isinstance(eos, list) else ([] if eos is None else [eos])
+                cfg.sampling.stop_token_ids = sorted(
+                    set(
+                        cfg.sampling.stop_token_ids
+                        + eos
+                        + (
+                            []
+                            if tokenizer.eos_token_id is None
+                            else [tokenizer.eos_token_id]
+                        )
+                    )
+                )
+            return RolloutPool(cfg, root, draft.block_size), prompts
+
+        initialized = _leader_call(start_rollouts, rank)
+        if rank == 0:
+            pool, prompts = initialized
+        cursor = 0
+        for step in range(cfg.training.max_steps):
+            # Nothing for version step+1 may be generated during this batch.
+            def collect_batch():
+                nonlocal cursor
+                traces, empty = [], 0
+                while len(traces) < cfg.training.batch_size:
+                    requests = []
+                    for _ in range(
+                        min(len(pool.workers), cfg.training.batch_size - len(traces))
+                    ):
+                        prompt = prompts[cursor % len(prompts)]
+                        cursor += 1
+                        requests.append(
+                            {
+                                "request_id": uuid.uuid4().hex,
+                                "input_ids": prompt["input_ids"],
+                            }
+                        )
+                    for result in pool.generate(requests):
+                        trace, _ = load_trace(root, result["request_id"], step)
+                        if any(any(block["valid_mask"]) for block in trace["blocks"]):
+                            traces.append(trace)
+                        else:
+                            empty += 1
+                            if empty >= cfg.training.max_empty_samples:
+                                raise RuntimeError(
+                                    "too many rollouts without a valid candidate block"
+                                )
+                atomic_json(
+                    root / "batches" / f"{step:08d}.json",
+                    [trace["request_id"] for trace in traces],
+                )
+
+            _leader_call(collect_batch, rank)
+            request_ids = json.loads(
+                (root / "batches" / f"{step:08d}.json").read_text()
+            )
+            traces = [
+                load_trace(root, request_id, step, metadata_only=True)[0]
+                for request_id in request_ids
+            ]
+            # Keep at most one sequence's features/logits resident on the host.
+            cached_id, cached_tensors = None, None
+
+            def tensor_loader(trace):
+                nonlocal cached_id, cached_tensors
+                if cached_id != trace["request_id"]:
+                    _, cached_tensors = load_trace(root, trace["request_id"], step)
+                    cached_id = trace["request_id"]
+                return cached_tensors
+
+            metrics = train_effective_batch(
+                backend, traces, tensor_loader, rank, world, cfg.training.replay_max_tv
+            )
+            _publish_weights(backend, draft_config, root, step + 1, rank)
+
+            def synchronize_and_log():
+                pool.synchronize(step + 1)
+                blocks = [
+                    block
+                    for trace in traces
+                    for block in trace["blocks"]
+                    if any(block["valid_mask"])
+                ]
+                metrics.update(
+                    step=step + 1,
+                    weight_version=pool.version,
+                    samples=len(traces),
+                    blocks=len(blocks),
+                    actual_accepted_length=sum(
+                        block["actual_accepted_count"] for block in blocks
+                    )
+                    / len(blocks),
+                )
+                atomic_json(root / "metrics" / f"{step + 1:08d}.json", metrics)
+                logger.info("on-policy %s", json.dumps(metrics))
+
+            # Completion ACK from ALL rollout workers precedes the next batch.
+            _leader_call(synchronize_and_log, rank)
+        return cfg.training.max_steps
+    finally:
+        if pool is not None:
+            pool.close()

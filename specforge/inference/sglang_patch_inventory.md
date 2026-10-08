@@ -5,6 +5,14 @@ the Kimi K3 SGLang fork at the current validated `kimi-k3` branch tip `9acd9cb`
 (and its original `f8493a4` integration point). There are deliberately separate
 SGLang integration surfaces.
 
+## Opt-in DSpark on-policy post-training
+
+[`patches/sglang/v0.5.18/on-policy.patch`](../../patches/sglang/v0.5.18/on-policy.patch)
+adds gated native DSpark trajectory hooks and a full-draft synchronization RPC.
+It is separate from, and additive to, spec capture. See the
+[on-policy TV recipe](../../docs/recipes/dspark-on-policy-tv.md) for the supported
+runtime, sampling contract and H200 validation commands.
+
 ## Online: external spec-capture server
 
 Online training uses one of these source-specific patches:

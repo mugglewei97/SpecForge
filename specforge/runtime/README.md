@@ -14,12 +14,18 @@ The runtime has three responsibilities:
 - `data_plane/` owns feature stores, fixed offline refs, consume-once online
   channels, rank inboxes, and `FeatureDataLoader`.
 
-All trainer-bearing launchers converge on the same
+All feature-based `specforge train` launchers converge on the same
 `Trainer -> FeatureDataLoader -> TrainerController -> TrainerCore` lifecycle.
 Offline refs remain a fixed list and never enter an online queue or ledger.
 Online capture always runs in an external patched SGLang server and uses
 `RefDistributor -> per-rank InboxChannel -> StreamingRefQueue`, including for a
 single consumer rank. There is no colocated target-model or local-rollout path.
+
+The opt-in `specforge train-on-policy` command has a separate synchronous
+trajectory lifecycle in `specforge.on_policy`, reusing the FSDP backend and
+checkpoint loading without entering the feature stream. Its isolated SGLang
+engines synchronize at every optimizer boundary. See the
+[DSpark on-policy recipe](../../docs/recipes/dspark-on-policy-tv.md).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the supported topology matrix and
 cross-plane flow, [control_plane/DESIGN.md](control_plane/DESIGN.md) for ledger

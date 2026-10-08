@@ -1,0 +1,26 @@
+model:
+  target_model_path: /models/Qwen3-4B
+  draft_checkpoint_path: /models/qwen3-4b-dspark-checkpoint
+  # Supports a HF draft directory or existing SpecForge checkpoint.
+  draft_model_config: configs/qwen3-4b-dspark.json
+data:
+  train_data_path: /data/conversations.jsonl
+  max_prompt_length: 2048
+  chat_template_kwargs:
+    enable_thinking: false
+training:
+  output_dir: /checkpoints/dspark-on-policy-tv
+  batch_size: 4
+  max_steps: 100
+  learning_rate: 0.000001
+  fsdp_sharding: FULL_SHARD
+  replay_max_tv: 0.02
+rollout:
+  cuda_devices: [0]
+  context_length: 4096
+  mem_fraction_static: 0.75
+sampling:
+  temperature: 1.0
+  top_k: -1
+  top_p: 1.0
+  max_new_tokens: 256

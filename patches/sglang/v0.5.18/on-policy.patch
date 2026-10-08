@@ -1,0 +1,63 @@
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ from contextlib import nullcontext
+ from dataclasses import replace
+ from typing import Optional
+@@ -462,6 +463,11 @@
+             )
+         if batch.out_cache_loc is None:
+             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
++
++        if os.environ.get("SPECFORGE_ON_POLICY_ROOT"):
++            from specforge.on_policy.sglang_hooks import prefill as specforge_prefill
++
++            specforge_prefill(self, batch, logits_output.hidden_states, next_token_ids)
+ 
+         # Must inject before prefill returns: the scheduler may update radix
+         # afterward, invalidating out_cache_loc.
+@@ -701,6 +707,13 @@
+             if grammar_mask is not None:
+                 grammar_mask.apply(logits_output.next_token_logits)
+ 
++        specforge_block = None
++        if os.environ.get("SPECFORGE_ON_POLICY_ROOT"):
++            from specforge.on_policy.sglang_hooks import before_verify_accept
++
++            specforge_block = before_verify_accept(
++                self, batch, proposal, logits_output, layout, run_compact
++            )
+         epilogue = self._verify_executor.verify_epilogue
+         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+         accept = self._verify_executor.accept_and_finalize(
+@@ -715,6 +728,12 @@
+             prefix_lens=prefix_lens,
+             draft_tokens=draft_tokens,
+         )
++        if specforge_block is not None:
++            from specforge.on_policy.sglang_hooks import after_verify_accept
++
++            after_verify_accept(
++                self, specforge_block, verify_ids_2d, logits_output, accept
++            )
+         if batch.return_logprob:
+             compute_spec_logprobs(
+                 batch,
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4417,6 +4417,11 @@
+     def save_sharded_model(self, **kwargs):
+         self.weight_updater.save_sharded_model(kwargs)
+ 
++    def specforge_on_policy(self, **kwargs):
++        from specforge.on_policy.sglang_hooks import scheduler_rpc
++
++        return scheduler_rpc(self, **kwargs)
++
+     def handle_rpc_request(self, recv_req: RpcReqInput):
+         # Handle RPC requests
+         logger.info(

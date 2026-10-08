@@ -10,7 +10,8 @@ every plane exchanges are in
 
 Owns the one caller-facing `Trainer` lifecycle that turns a normalized,
 tensor-carrying `TrainBatch` stream into optimizer steps and checkpoints.
-`Trainer.fit()` is the only package-level training call: it enters any
+For feature-based `specforge train`, `Trainer.fit()` is the package-level
+training call: it enters any
 topology-owned stream context, invokes the internal `TrainerController` over its
 private loader, exits the context, and writes the final checkpoint when the
 last optimizer step was not already saved by the periodic checkpoint path.
@@ -18,6 +19,12 @@ For the disaggregated online consumer, that same lifecycle then publishes its
 terminal done/failed signal and always stops the rank-0 ref distributor. Direct
 Python builder callers therefore receive the same cleanup guarantees as the
 CLI; there is no second wrapper-owned training lifecycle.
+
+The opt-in DSpark `train-on-policy` mode is implemented in `specforge.on_policy`.
+It reuses this plane's `FSDPTrainingBackend`, optimizer and checkpoint loading,
+with an explicit rollout/replay/full-weight synchronization boundary instead of
+the feature-stream lifecycle. Its contract and supported scope are documented
+in the [on-policy recipe](../../docs/recipes/dspark-on-policy-tv.md).
 
 Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;

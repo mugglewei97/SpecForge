@@ -181,6 +181,17 @@ def cli() -> None:
     """SpecForge: speculative decoding training framework."""
 
 
+@cli.command("train-on-policy", short_help="post-train DSpark with on-policy TV loss")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+@click.option(
+    "--plan", is_flag=True, help="Validate and print the recipe without CUDA."
+)
+def train_on_policy(config_path: str, plan: bool) -> int:
+    from specforge.on_policy.__main__ import main
+
+    return main(["--config", config_path] + (["--plan"] if plan else []))
+
+
 @cli.command(short_help="train a draft model from a typed config")
 @click.option(
     "-c",
