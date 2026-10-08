@@ -9,7 +9,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
-from specforge.on_policy.trainer import train_effective_batch
+from specforge.on_policy.trainer import (
+    _leader_call,
+    _prepare_rollout_phase,
+    train_effective_batch,
+)
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from tests.test_on_policy.test_training import tensors, traces
 
@@ -41,6 +45,7 @@ def _worker(rank, directory):
     dist.init_process_group(
         "nccl", init_method=f"file://{directory}/rdzv", rank=rank, world_size=2
     )
+    control_group = dist.new_group(backend="gloo")
     try:
         model = CudaReplay(torch.device("cuda", rank))
         backend = FSDPTrainingBackend(
@@ -50,12 +55,17 @@ def _worker(rank, directory):
             optimizer_factory=SGDStep,
         )
         backend.prepare_model(model, optimizer_target=model)
+        _prepare_rollout_phase(control_group)
+        _leader_call(
+            lambda: torch.ones(8, device="cuda").sum().item(), rank, control_group
+        )
         train_effective_batch(backend, traces(), tensors, rank, 2, 0.02)
         state = backend._module_state_dict()
         if rank == 0:
             torch.testing.assert_close(state["weight"], torch.full((8,), 0.3))
         assert backend.optimizer.calls == 1
     finally:
+        dist.destroy_process_group(control_group)
         dist.destroy_process_group()
 
 

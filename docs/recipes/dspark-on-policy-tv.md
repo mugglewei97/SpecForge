@@ -11,9 +11,10 @@ new command is `specforge train-on-policy`; the torchrun module is
 Use SGLang **0.5.18** with the patch below, a dense `DSparkDraftModel` with
 GQA/MHA and vanilla/gated/RNN Markov head, BF16, one trainer node, and one or
 more independent single-GPU rollout engines. Qwen3-4B and Qwen3-8B recipes are
-provided for H200. FSDP training may use multiple other H200s. Each rollout GPU must fit
-the complete frozen target plus draft. Target TP, MoE/MLA drafts, vocabulary
-remapping, custom logit processors, penalties, string stops, quantized models,
+provided for H200. FSDP training may use dedicated GPUs or share each GPU with
+one rollout engine. Each rollout GPU must fit the complete frozen target plus
+draft, alongside the trainer in colocated mode. Target TP, MoE/MLA drafts,
+vocabulary remapping, custom logit processors, penalties, string stops, quantized models,
 and full optimizer-state resume are not implemented in this mode. Unknown
 recipe fields fail validation instead of being silently ignored.
 
@@ -65,8 +66,11 @@ CUDA_VISIBLE_DEVICES=1 specforge train-on-policy --config /path/to/run.yaml
 ```
 
 `rollout.cuda_devices` contains physical GPU ordinals. Trainer devices must be
-explicit and disjoint. Multiple rollout workers each load their own target and
-draft; every worker receives every weight version, including workers idle in a
+explicit. `rollout.placement: dedicated` (the default) requires disjoint devices.
+`rollout.placement: colocated` requires one TP=1 engine per trainer GPU, with
+`rollout.cuda_devices` matching `CUDA_VISIBLE_DEVICES` in order. Multiple rollout
+workers each load their own target and draft; every worker receives every
+weight version, including workers idle in a
 small batch. Run directories are never overwritten. Published
 `weights/00000000` is the initial model; `weights/00000001`, etc. are complete
 HF draft checkpoints suitable for the existing serving/export workflow. A
@@ -92,10 +96,16 @@ bash scripts/train_dspark_on_policy_8gpu.sh --plan
 bash scripts/train_dspark_on_policy_8gpu.sh
 ```
 
-The launcher uses physical GPU 0 for SGLang and GPUs 1–7 for FSDP. The old
-per-GPU batch size 4 on eight ranks becomes **global batch size 32** in this
-entrypoint; it is not reduced to 4 or 28. Replay accumulates all sample/block
-gradients before the single optimizer step, independent of the trainer count.
+The launcher restores eight FSDP ranks on physical GPUs 0–7. Each of those
+same GPUs also hosts one TP=1 SGLang rollout engine (eight engines total), with
+`mem_fraction_static: 0.3` per engine. Rank 0 coordinates the engine subprocesses.
+The original per-GPU batch size 4 on eight ranks is **global batch size 32** in
+this entrypoint. Full batches assign four samples per FSDP rank; replay
+accumulates their block gradients before the single optimizer step.
+Rollout and replay execute in separate phases. Trainers use a CPU/Gloo group
+to wait for rollout and all-worker weight synchronization, keeping NCCL waits
+off the shared GPUs. Both processes release unused CUDA allocator blocks at
+phase boundaries; live model weights and the SGLang KV pool remain resident.
 The launcher keeps `SPECFORGE_DATA_NUM_PROC=32` for CPU prompt tokenization and
 `FLASHINFER_DISABLE_VERSION_CHECK=1`.
 

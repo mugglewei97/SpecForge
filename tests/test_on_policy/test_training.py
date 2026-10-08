@@ -8,7 +8,11 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from specforge.on_policy.trainer import replay_schedule, train_effective_batch
+from specforge.on_policy.trainer import (
+    _leader_call,
+    replay_schedule,
+    train_effective_batch,
+)
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 
 
@@ -74,6 +78,20 @@ def _distributed_worker(rank, directory):
         "gloo", init_method=f"file://{directory}/rendezvous", rank=rank, world_size=3
     )
     try:
+        # Colocated control flow must work on a CPU group without touching CUDA,
+        # including propagating a coordinator failure to every waiting rank.
+        value = _leader_call(lambda: "ready", rank, dist.group.WORLD)
+        assert value == ("ready" if rank == 0 else None)
+
+        def fail():
+            raise ValueError("rollout failed")
+
+        try:
+            _leader_call(fail, rank, dist.group.WORLD)
+        except (ValueError, RuntimeError):
+            pass
+        else:
+            raise AssertionError("coordinator failure was not propagated")
         module = DistributedDataParallel(ToyReplay())
         backend = FSDPTrainingBackend(ParallelConfig())
         backend.prepare_model(module, wrap=False)
@@ -89,6 +107,19 @@ def _distributed_worker(rank, directory):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_eight_rank_full_batch_assigns_four_samples_per_rank(self):
+        batch = [
+            {"request_id": str(i), "blocks": [{"valid_mask": [True]}]}
+            for i in range(32)
+        ]
+        for rank in range(8):
+            schedule = replay_schedule(batch, rank, 8)
+            self.assertEqual(
+                [t["request_id"] for t, _, _ in schedule],
+                [str(i) for i in range(rank, 32, 8)],
+            )
+            self.assertEqual([weight for _, _, weight in schedule], [0.25] * 4)
+
     def test_ranks_have_equal_slots_and_sample_weights(self):
         plans = [replay_schedule(traces(), rank, 3) for rank in range(3)]
         self.assertEqual([len(plan) for plan in plans], [3, 3, 3])

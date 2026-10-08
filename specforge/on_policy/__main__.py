@@ -8,6 +8,28 @@ import os
 from .config import OnPolicyConfig
 
 
+def validate_topology(cfg, visible, world_size, local_world_size):
+    devices = visible.split(",")
+    if not devices or any(not item.isdigit() for item in devices):
+        raise ValueError("set CUDA_VISIBLE_DEVICES to explicit trainer GPU ordinals")
+    devices = list(map(int, devices))
+    if (
+        local_world_size != world_size
+        or len(devices) != world_size
+        or len(set(devices)) != len(devices)
+    ):
+        raise ValueError(
+            "on-policy supports one node, one process per distinct visible trainer GPU"
+        )
+    if cfg.rollout.placement == "colocated":
+        if devices != cfg.rollout.cuda_devices:
+            raise ValueError(
+                "colocated rollout requires one worker per trainer GPU, in CUDA_VISIBLE_DEVICES order"
+            )
+    elif set(devices) & set(cfg.rollout.cuda_devices):
+        raise ValueError("dedicated trainer and rollout GPUs must be disjoint")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="DSpark on-policy TV post-training")
     parser.add_argument("--config", required=True)
@@ -17,21 +39,12 @@ def main(argv=None):
     if args.plan:
         print(json.dumps(cfg.model_dump(), indent=2, ensure_ascii=False))
         return 0
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    if not visible or any(not item.isdigit() for item in visible):
-        raise ValueError(
-            "set CUDA_VISIBLE_DEVICES to explicit trainer GPU ordinals, separate from rollout.cuda_devices"
-        )
-    if set(map(int, visible)) & set(cfg.rollout.cuda_devices):
-        raise ValueError("trainer and rollout GPUs must be disjoint")
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if (
-        int(os.environ.get("LOCAL_WORLD_SIZE", "1")) != world_size
-        or len(visible) != world_size
-    ):
-        raise ValueError(
-            "initial on-policy launcher supports one node, one process per visible trainer GPU"
-        )
+    validate_topology(
+        cfg,
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        int(os.environ.get("WORLD_SIZE", "1")),
+        int(os.environ.get("LOCAL_WORLD_SIZE", "1")),
+    )
     import torch
 
     if not torch.cuda.is_available():

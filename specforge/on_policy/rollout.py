@@ -54,6 +54,11 @@ def _engine_process(connection, configuration, root, worker_id, device, block_si
                 "CUDA_VISIBLE_DEVICES": str(device),
                 "SPECFORGE_ON_POLICY_ROOT": root,
                 "SPECFORGE_ON_POLICY_WORKER": str(worker_id),
+                "SPECFORGE_ON_POLICY_COLOCATED": (
+                    "1"
+                    if configuration["rollout"].get("placement") == "colocated"
+                    else "0"
+                ),
                 "SGLANG_RAGGED_VERIFY_MODE": "static",
                 "SGLANG_DSPARK_FOLDED_PROPOSAL": "0",
                 "SGLANG_DSPARK_FAST_SAMPLING": "0",

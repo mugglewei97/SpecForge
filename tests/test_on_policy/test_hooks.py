@@ -85,9 +85,11 @@ class HookTests(unittest.TestCase):
                 {
                     "SPECFORGE_ON_POLICY_ROOT": directory,
                     "SPECFORGE_ON_POLICY_WORKER": "0",
+                    "SPECFORGE_ON_POLICY_COLOCATED": "1",
                 },
             ),
             patch("torch.cuda.synchronize"),
+            patch("torch.cuda.empty_cache") as release,
         ):
             model = ServingModel()
             state = {"fc.weight": torch.full((2, 2), 7.0)}
@@ -107,6 +109,7 @@ class HookTests(unittest.TestCase):
             self.assertIs(model._stacked_ctx_kv_cache, False)
             self.assertIsNone(model._fused_kv_write_cache)
             self.assertEqual(flushed, [True])
+            release.assert_called_once()
             with self.assertRaisesRegex(RuntimeError, "nonsequential"):
                 scheduler_rpc(scheduler, "sync", 0)
 

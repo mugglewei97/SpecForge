@@ -5,6 +5,7 @@ import logging
 import os
 import uuid
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -16,7 +17,7 @@ from .schedule import planned_steps, prompt_batches
 logger = logging.getLogger(__name__)
 
 
-def _leader_call(action, rank):
+def _leader_call(action, rank, control_group=None):
     """Propagate control-plane failures before peers enter the next collective."""
     result, error = None, None
     if rank == 0:
@@ -24,10 +25,15 @@ def _leader_call(action, rank):
             result = action()
         except Exception as exc:
             error = exc
-    status = torch.tensor(
-        int(error is None), device=torch.device("cuda", torch.cuda.current_device())
+    # A GPU/NCCL wait can compete with the SGLang process on the same device.
+    # Colocated trainers wait on the CPU group throughout rollout and sync.
+    device = (
+        "cpu"
+        if control_group is not None
+        else torch.device("cuda", torch.cuda.current_device())
     )
-    dist.broadcast(status, src=0)
+    status = torch.tensor(int(error is None), device=device)
+    dist.broadcast(status, src=0, group=control_group)
     if not status.item():
         if error is not None:
             raise error
@@ -99,7 +105,7 @@ def train_effective_batch(
     return {"loss": metrics[0].item(), "replay_max_tv": metrics[1].item()}
 
 
-def _publish_weights(backend, draft_config, root, version, rank):
+def _publish_weights(backend, draft_config, root, version, rank, control_group=None):
     from safetensors.torch import save_file
 
     # All FSDP ranks must participate, including ranks with no local samples.
@@ -118,7 +124,16 @@ def _publish_weights(backend, draft_config, root, version, rank):
         save_file(draft_state, str(path / "model.safetensors"))
         draft_config.save_pretrained(path)
 
-    _leader_call(publish, rank)
+    _leader_call(publish, rank, control_group)
+
+
+def _prepare_rollout_phase(control_group):
+    if control_group is not None:
+        # All ranks finish training/export and return unused allocator blocks
+        # before the colocated engines allocate or update their serving weights.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        dist.barrier(group=control_group)
 
 
 def _validate_draft(config):
@@ -161,6 +176,19 @@ def retire_step_artifacts(root, version, training, request_ids):
 
 
 def run(cfg):
+    control_group = None
+    if cfg.rollout.placement == "colocated":
+        control_group = dist.new_group(
+            backend="gloo", timeout=timedelta(minutes=cfg.training.dist_timeout)
+        )
+    try:
+        return _run(cfg, control_group)
+    finally:
+        if control_group is not None:
+            dist.destroy_process_group(control_group)
+
+
+def _run(cfg, control_group):
     from transformers import AutoTokenizer
 
     from specforge.modeling.auto import AutoDraftModel
@@ -187,7 +215,7 @@ def run(cfg):
             raise ValueError("on-policy output directory already contains a run")
         atomic_json(root / "run.json", cfg.model_dump())
 
-    _leader_call(initialize_output, rank)
+    _leader_call(initialize_output, rank, control_group)
     torch.manual_seed(cfg.training.seed)
     draft_config = load_draft_config_source(
         cfg.model.draft_model_config or cfg.model.draft_checkpoint_path,
@@ -261,7 +289,7 @@ def run(cfg):
         atomic_json(root / "run.json", cfg.model_dump())
         return prompts
 
-    prompts = _leader_call(prepare_prompts, rank)
+    prompts = _leader_call(prepare_prompts, rank, control_group)
     total_steps = json.loads((root / "schedule.json").read_text())["total_steps"]
     backend = FSDPTrainingBackend(
         ParallelConfig.from_distributed(sharding_strategy=cfg.training.fsdp_sharding),
@@ -275,10 +303,13 @@ def run(cfg):
         ),
     )
     backend.prepare_model(model, optimizer_target=draft)
-    _publish_weights(backend, draft_config, root, 0, rank)
+    _publish_weights(backend, draft_config, root, 0, rank, control_group)
+    _prepare_rollout_phase(control_group)
     pool = None
     try:
-        pool = _leader_call(lambda: RolloutPool(cfg, root, draft.block_size), rank)
+        pool = _leader_call(
+            lambda: RolloutPool(cfg, root, draft.block_size), rank, control_group
+        )
         batches = prompt_batches(prompts, cfg.training) if rank == 0 else None
         for step in range(total_steps):
             # Nothing for version step+1 may be generated during this batch.
@@ -323,7 +354,7 @@ def run(cfg):
                 )
                 return epoch, all_ids
 
-            collected = _leader_call(collect_batch, rank)
+            collected = _leader_call(collect_batch, rank, control_group)
             request_ids = json.loads(
                 (root / "batches" / f"{step:08d}.json").read_text()
             )
@@ -344,7 +375,8 @@ def run(cfg):
             metrics = train_effective_batch(
                 backend, traces, tensor_loader, rank, world, cfg.training.replay_max_tv
             )
-            _publish_weights(backend, draft_config, root, step + 1, rank)
+            _publish_weights(backend, draft_config, root, step + 1, rank, control_group)
+            _prepare_rollout_phase(control_group)
 
             def synchronize_and_log():
                 pool.synchronize(step + 1)
@@ -375,7 +407,7 @@ def run(cfg):
                     logger.info("on-policy %s", json.dumps(metrics))
 
             # Completion ACK from ALL rollout workers precedes the next batch.
-            _leader_call(synchronize_and_log, rank)
+            _leader_call(synchronize_and_log, rank, control_group)
         return total_steps
     finally:
         if pool is not None:

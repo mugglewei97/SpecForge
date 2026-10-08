@@ -25,7 +25,8 @@ training:
   # synchronized update; retaining full-vocabulary tensors for 6 epochs is huge.
   retain_replay_tensors: false
 rollout:
-  cuda_devices: [0]
+  placement: colocated
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6, 7]
   mem_fraction_static: 0.3
   context_length: 3088  # 3072 visible tokens + verification scratch space.
   attention_backend: flashinfer

@@ -90,6 +90,7 @@ class TrainingConfig(StrictConfigModel):
 
 class RolloutConfig(StrictConfigModel):
     # Independent single-GPU engines; each loads the frozen target and draft.
+    placement: Literal["dedicated", "colocated"] = "dedicated"
     cuda_devices: list[int] = Field(default_factory=lambda: [0], min_length=1)
     mem_fraction_static: float = Field(default=0.75, gt=0, lt=1)
     context_length: int = Field(default=4096, gt=0)

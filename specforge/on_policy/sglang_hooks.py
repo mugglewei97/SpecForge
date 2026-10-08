@@ -282,3 +282,8 @@ def scheduler_rpc(scheduler, operation, version, request_id=None, output_ids=Non
         worker._specforge_tensors = {}
     else:
         raise ValueError(f"unknown on-policy operation: {operation}")
+    if os.environ.get("SPECFORGE_ON_POLICY_COLOCATED") == "1":
+        # Release inactive CUDA allocations before the trainer reuses this GPU.
+        # Live target/draft parameters and preallocated KV pools stay resident.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()

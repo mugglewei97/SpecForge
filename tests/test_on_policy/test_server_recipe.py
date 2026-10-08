@@ -1,8 +1,11 @@
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from specforge.on_policy.__main__ import validate_topology
 from specforge.on_policy.config import OnPolicyConfig, TrainingConfig
 from specforge.on_policy.data import trace_stem
 from specforge.on_policy.schedule import planned_steps, prompt_batches
@@ -47,6 +50,9 @@ class ServerRecipeTests(unittest.TestCase):
         self.assertEqual(cfg.training.log_interval, 50)
         self.assertEqual(cfg.training.save_interval, 2000)
         self.assertEqual(cfg.rollout.mem_fraction_static, 0.3)
+        self.assertEqual(cfg.rollout.placement, "colocated")
+        self.assertEqual(cfg.rollout.cuda_devices, list(range(8)))
+        validate_topology(cfg, "0,1,2,3,4,5,6,7", 8, 8)
         self.assertEqual(cfg.data.chat_template, "qwen")
         self.assertEqual(cfg.data.chat_template_kwargs, {})
         self.assertEqual(cfg.sequence_limit, 3072)
@@ -60,6 +66,46 @@ class ServerRecipeTests(unittest.TestCase):
         self.assertEqual(cfg.sampling.max_new_tokens, 3072)
         draft = json.loads(Path(cfg.model.draft_model_config).read_text())
         self.assertEqual(draft["block_size"], 7)
+
+    def test_topology_rejects_partial_colocation_and_preserves_dedicated_mode(self):
+        cfg = OnPolicyConfig.from_file("examples/on_policy/qwen3-8b-dspark-tv.yaml")
+        for visible, world, local in (
+            ("1,2,3,4,5,6,7", 7, 7),
+            ("0,1,2,3,4,5,6,7", 8, 7),
+            ("0,0,2,3,4,5,6,7", 8, 8),
+            ("7,6,5,4,3,2,1,0", 8, 8),
+        ):
+            with self.subTest(visible=visible, world=world, local=local):
+                with self.assertRaises(ValueError):
+                    validate_topology(cfg, visible, world, local)
+        cfg = OnPolicyConfig.from_file("examples/on_policy/qwen3-4b-dspark-tv.yaml")
+        self.assertEqual(cfg.rollout.placement, "dedicated")
+        validate_topology(cfg, "1,2", 2, 2)
+        with self.assertRaisesRegex(ValueError, "disjoint"):
+            validate_topology(cfg, "0,1", 2, 2)
+        with self.assertRaisesRegex(ValueError, "explicit"):
+            validate_topology(cfg, "", 1, 1)
+
+    def test_server_script_launches_eight_ranks_on_all_eight_devices(self):
+        # Capture the real shell argv/environment without starting CUDA or torchrun.
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "torchrun"
+            stub.write_text(
+                '#!/bin/bash\nprintf "%s\\n" "$CUDA_VISIBLE_DEVICES" "$@"\n'
+            )
+            stub.chmod(0o700)
+            result = subprocess.run(
+                ["bash", "scripts/train_dspark_on_policy_8gpu.sh"],
+                env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]},
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+        arguments = result.stdout.splitlines()
+        self.assertEqual(arguments[0], "0,1,2,3,4,5,6,7")
+        self.assertIn("--nproc_per_node=8", arguments)
+        self.assertIn("specforge.on_policy", arguments)
 
     def test_post_ack_cleanup_preserves_proposals_initial_interval_and_latest(self):
         training = TrainingConfig(
