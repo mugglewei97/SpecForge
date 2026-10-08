@@ -6,6 +6,20 @@ from torch import nn
 from .objective import block_loss, draft_distribution
 
 
+def create_replay_draft(config):
+    """BF16 parameters with RoPE frequencies computed and retained in FP32."""
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+    from specforge.modeling.auto import AutoDraftModel
+
+    draft = AutoDraftModel.from_config(config, torch_dtype=torch.bfloat16)
+    # AutoDraftModel casts the entire module, including nonpersistent inv_freq.
+    # Casting that rounded buffer back to FP32 in FSDP cannot recover it. Rebuild
+    # from the config, like SGLang, before any device-only move/FSDP wrapping.
+    draft.rotary_emb = Qwen3RotaryEmbedding(config, device=draft.fc.weight.device)
+    return draft
+
+
 def replay_inputs(
     context_length,
     block_size,
@@ -72,7 +86,8 @@ class DSparkReplayModel(nn.Module):
             # The requested objective supervises q, not the scheduling predictor.
             draft_model.confidence_head.requires_grad_(False)
 
-    def forward(self, block, context_hidden, target_probs, rollout_q):
+    def draft_probabilities(self, block, context_hidden):
+        """Recompute q without a loss; also used by read-only trajectory audits."""
         draft = self.draft_model
         device = self.embed_tokens.weight.device
         k = len(block["proposal"])
@@ -110,7 +125,11 @@ class DSparkReplayModel(nn.Module):
         logits = draft.apply_logits_head(
             self.lm_head(hidden), prev_token_ids=previous, hidden_states=hidden
         )[0]
-        q = draft_distribution(logits, block["sampling"]["temperature"])
+        return draft_distribution(logits, block["sampling"]["temperature"])
+
+    def forward(self, block, context_hidden, target_probs, rollout_q):
+        q = self.draft_probabilities(block, context_hidden)
+        device = q.device
         mask = torch.tensor(block["valid_mask"], device=device, dtype=torch.bool)
         p = target_probs.to(device=device)
         loss = block_loss(p, q, mask)

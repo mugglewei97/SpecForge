@@ -191,7 +191,6 @@ def run(cfg):
 def _run(cfg, control_group):
     from transformers import AutoTokenizer
 
-    from specforge.modeling.auto import AutoDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -200,7 +199,7 @@ def _run(cfg, control_group):
         warm_start_draft_model,
     )
 
-    from .replay import DSparkReplayModel
+    from .replay import DSparkReplayModel, create_replay_draft
     from .rollout import RolloutPool
 
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -228,7 +227,7 @@ def _run(cfg, control_group):
             "rollout context must also cover the complete speculative block"
         )
     draft_config._attn_implementation = cfg.training.attention_backend
-    draft = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
+    draft = create_replay_draft(draft_config)
     warm_start_draft_model(
         draft,
         cfg.model.draft_checkpoint_path,

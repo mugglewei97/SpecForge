@@ -10,6 +10,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from specforge.on_policy.objective import block_loss, draft_distribution
+from specforge.on_policy.replay import create_replay_draft
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from tests.test_on_policy.test_replay import tiny_model
 
@@ -17,6 +18,9 @@ from tests.test_on_policy.test_replay import tiny_model
 def check_bf16_replay_precision(device):
     """Shared CPU and two-GPU gate: real DSpark replay with BF16 FSDP."""
     model = tiny_model().to(device=device, dtype=torch.bfloat16)
+    model.draft_model.config.architectures = ["DSparkDraftModel"]
+    model.draft_model = create_replay_draft(model.draft_model.config).to(device=device)
+    expected_inv_freq = model.draft_model.rotary_emb.inv_freq.clone()
     features = torch.randn(4, 32)  # Replay must explicitly cast these to BF16.
     target = torch.zeros(3, 16)
     target[:, :2] = torch.tensor([0.9, 0.1])
@@ -39,6 +43,9 @@ def check_bf16_replay_precision(device):
             )
 
     def check_activations(_module, _args, kwargs):
+        torch.testing.assert_close(
+            _module.rotary_emb.inv_freq, expected_inv_freq, atol=0, rtol=0
+        )
         assert kwargs["target_hidden"].dtype == torch.bfloat16
         assert kwargs["noise_embedding"].dtype == torch.bfloat16
 

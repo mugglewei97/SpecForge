@@ -193,6 +193,30 @@ per-position TV above `training.replay_max_tv` aborts without stepping that
 batch. The default 0.02 is an initial BF16 cross-kernel gate, not a measured
 H200 tolerance; inspect the observed values and tighten it after validation.
 
+Replay initialization preserves FP32 RoPE frequencies while keeping draft
+parameters in BF16. Casting `inv_freq` to BF16 and later back to FP32 loses
+frequency precision, causing position-dependent drift against SGLang. These
+nonpersistent buffers are absent from exported weights, so weight equality
+checks cannot detect that error.
+
+For a failed first batch, compare the old rounded frequencies against the fixed
+initialization using the saved rollout tensors on one GPU (no new rollout or
+optimizer step):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m specforge.on_policy.diagnose \
+  --run-dir /personal/checkpoints/specforge/onpolicy/ --version 0 --max-blocks 8
+```
+
+The report includes `legacy_rope` and `fp32_rope` TV per position, with separate
+maxima for all positions and loss-valid positions. It samples blocks across
+requests before advancing to later blocks; increase `--max-blocks` to inspect
+more of the batch. `--attention-backend sdpa` can isolate FlexAttention effects.
+The comparison does not use FSDP and does not eliminate other cross-kernel
+rounding differences. Failed batches retain their replay tensors even when
+`retain_replay_tensors: false`, since cleanup occurs only after a successful
+update and synchronization.
+
 After the optimizer step, all ranks gather the complete draft. Every rollout
 worker loads every serving parameter, checks the packed tensor values, clears
 the stacked/fused weight caches, flushes the request/KV pools and acknowledges
