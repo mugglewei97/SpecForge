@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-import random
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
@@ -11,7 +10,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .data import atomic_json, load_prompts, load_trace
+from .data import atomic_json, load_prompts, load_trace, trace_stem
+from .schedule import planned_steps, prompt_batches
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,26 @@ def _validate_draft(config):
         raise ValueError("reduced-vocabulary DSpark replay is not supported")
 
 
+def retire_step_artifacts(root, version, training, request_ids):
+    """Release only this run's generated artifacts after the all-worker ACK."""
+    previous = version - 1
+    if previous > 0 and previous % training.save_interval:
+        path = root / "weights" / f"{previous:08d}"
+        # COSEC: never follow a substituted directory outside this run's weights.
+        if path.resolve().parent != root.resolve() / "weights":
+            raise ValueError("weight directory escaped the run")
+        for name in ("model.safetensors", "config.json"):
+            (path / name).unlink()
+        path.rmdir()
+    if not training.retain_replay_tensors:
+        for request_id in request_ids:
+            path = trace_stem(root, request_id).with_suffix(".safetensors")
+            # COSEC: delete only generated tensor files, never trajectory JSON.
+            if path.resolve().parent != root.resolve() / "trajectories":
+                raise ValueError("trajectory directory escaped the run")
+            path.unlink()
+
+
 def run(cfg):
     from transformers import AutoTokenizer
 
@@ -175,17 +195,11 @@ def run(cfg):
         trust_remote_code=cfg.model.trust_remote_code,
     )
     _validate_draft(draft_config)
-    if (
-        cfg.rollout.context_length
-        < cfg.data.max_prompt_length
-        + cfg.sampling.max_new_tokens
-        + draft_config.block_size
-        + 7
-    ):
+    if cfg.rollout.context_length < cfg.sequence_limit + draft_config.block_size + 7:
         raise ValueError(
             "rollout context must also cover the complete speculative block"
         )
-    draft_config._attn_implementation = "sdpa"
+    draft_config._attn_implementation = cfg.training.attention_backend
     draft = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
     warm_start_draft_model(
         draft,
@@ -206,6 +220,49 @@ def run(cfg):
     )
     model = DSparkReplayModel(draft, parts).to(device)
     model.eval()  # gradients remain enabled; match the inference backbone
+
+    def prepare_prompts():
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.model.target_model_path,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        prompts = load_prompts(
+            cfg.data.train_data_path,
+            tokenizer,
+            cfg.data.prompt_limit,
+            cfg.data.chat_template_kwargs,
+            chat_template=cfg.data.chat_template,
+        )
+        # skip_tokenizer_init requires explicit EOS IDs on engine requests.
+        if not cfg.sampling.ignore_eos:
+            eos = getattr(parts.config, "eos_token_id", None)
+            eos = eos if isinstance(eos, list) else ([] if eos is None else [eos])
+            cfg.sampling.stop_token_ids = sorted(
+                set(
+                    cfg.sampling.stop_token_ids
+                    + eos
+                    + (
+                        []
+                        if tokenizer.eos_token_id is None
+                        else [tokenizer.eos_token_id]
+                    )
+                )
+            )
+        atomic_json(
+            root / "schedule.json",
+            {
+                "eligible_prompts": len(prompts),
+                "total_steps": planned_steps(len(prompts), cfg.training),
+                "global_batch_size": cfg.training.batch_size,
+                "num_epochs": cfg.training.num_epochs,
+            },
+        )
+        # Include resolved stop IDs so run.json describes actual engine sampling.
+        atomic_json(root / "run.json", cfg.model_dump())
+        return prompts
+
+    prompts = _leader_call(prepare_prompts, rank)
+    total_steps = json.loads((root / "schedule.json").read_text())["total_steps"]
     backend = FSDPTrainingBackend(
         ParallelConfig.from_distributed(sharding_strategy=cfg.training.fsdp_sharding),
         optimizer_factory=lambda module: BF16Optimizer(
@@ -213,7 +270,7 @@ def run(cfg):
             lr=cfg.training.learning_rate,
             weight_decay=cfg.training.weight_decay,
             max_grad_norm=cfg.training.max_grad_norm,
-            total_steps=cfg.training.max_steps,
+            total_steps=total_steps,
             warmup_ratio=cfg.training.warmup_ratio,
         ),
     )
@@ -221,58 +278,23 @@ def run(cfg):
     _publish_weights(backend, draft_config, root, 0, rank)
     pool = None
     try:
-
-        def start_rollouts():
-            tokenizer = AutoTokenizer.from_pretrained(
-                cfg.model.target_model_path,
-                trust_remote_code=cfg.model.trust_remote_code,
-            )
-            prompts = load_prompts(
-                cfg.data.train_data_path,
-                tokenizer,
-                cfg.data.max_prompt_length,
-                cfg.data.chat_template_kwargs,
-            )
-            random.Random(cfg.training.seed).shuffle(prompts)
-            # skip_tokenizer_init requires explicit EOS IDs on the engine requests.
-            if not cfg.sampling.ignore_eos:
-                eos = getattr(parts.config, "eos_token_id", None)
-                eos = eos if isinstance(eos, list) else ([] if eos is None else [eos])
-                cfg.sampling.stop_token_ids = sorted(
-                    set(
-                        cfg.sampling.stop_token_ids
-                        + eos
-                        + (
-                            []
-                            if tokenizer.eos_token_id is None
-                            else [tokenizer.eos_token_id]
-                        )
-                    )
-                )
-            return RolloutPool(cfg, root, draft.block_size), prompts
-
-        initialized = _leader_call(start_rollouts, rank)
-        if rank == 0:
-            pool, prompts = initialized
-        cursor = 0
-        for step in range(cfg.training.max_steps):
+        pool = _leader_call(lambda: RolloutPool(cfg, root, draft.block_size), rank)
+        batches = prompt_batches(prompts, cfg.training) if rank == 0 else None
+        for step in range(total_steps):
             # Nothing for version step+1 may be generated during this batch.
             def collect_batch():
-                nonlocal cursor
-                traces, empty = [], 0
-                while len(traces) < cfg.training.batch_size:
-                    requests = []
-                    for _ in range(
-                        min(len(pool.workers), cfg.training.batch_size - len(traces))
-                    ):
-                        prompt = prompts[cursor % len(prompts)]
-                        cursor += 1
-                        requests.append(
-                            {
-                                "request_id": uuid.uuid4().hex,
-                                "input_ids": prompt["input_ids"],
-                            }
-                        )
+                epoch, batch_prompts = next(batches)
+                traces, empty, all_ids = [], 0, []
+                for offset in range(0, len(batch_prompts), len(pool.workers)):
+                    wave = batch_prompts[offset : offset + len(pool.workers)]
+                    requests = [
+                        {
+                            "request_id": uuid.uuid4().hex,
+                            "input_ids": prompt["input_ids"],
+                        }
+                        for prompt in wave
+                    ]
+                    all_ids.extend(request["request_id"] for request in requests)
                     for result in pool.generate(requests):
                         trace, _ = load_trace(root, result["request_id"], step)
                         if any(any(block["valid_mask"]) for block in trace["blocks"]):
@@ -283,12 +305,25 @@ def run(cfg):
                                 raise RuntimeError(
                                     "too many rollouts without a valid candidate block"
                                 )
+                if not traces:
+                    raise RuntimeError(
+                        "batch has no valid candidate blocks; no optimizer step"
+                    )
                 atomic_json(
                     root / "batches" / f"{step:08d}.json",
                     [trace["request_id"] for trace in traces],
                 )
+                atomic_json(
+                    root / "batches" / f"{step:08d}-prompts.json",
+                    {
+                        "epoch": epoch,
+                        "sample_ids": [prompt["sample_id"] for prompt in batch_prompts],
+                        "request_ids": all_ids,
+                    },
+                )
+                return epoch, all_ids
 
-            _leader_call(collect_batch, rank)
+            collected = _leader_call(collect_batch, rank)
             request_ids = json.loads(
                 (root / "batches" / f"{step:08d}.json").read_text()
             )
@@ -322,6 +357,9 @@ def run(cfg):
                 metrics.update(
                     step=step + 1,
                     weight_version=pool.version,
+                    epoch=collected[0],
+                    full_weight_sync=True,
+                    replay_tensors_retained=cfg.training.retain_replay_tensors,
                     samples=len(traces),
                     blocks=len(blocks),
                     actual_accepted_length=sum(
@@ -330,11 +368,15 @@ def run(cfg):
                     / len(blocks),
                 )
                 atomic_json(root / "metrics" / f"{step + 1:08d}.json", metrics)
-                logger.info("on-policy %s", json.dumps(metrics))
+                retire_step_artifacts(root, step + 1, cfg.training, collected[1])
+                if (
+                    step + 1
+                ) % cfg.training.log_interval == 0 or step + 1 == total_steps:
+                    logger.info("on-policy %s", json.dumps(metrics))
 
             # Completion ACK from ALL rollout workers precedes the next batch.
             _leader_call(synchronize_and_log, rank)
-        return cfg.training.max_steps
+        return total_steps
     finally:
         if pool is not None:
             pool.close()

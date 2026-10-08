@@ -7,7 +7,14 @@ from .objective import block_loss, draft_distribution
 
 
 def replay_inputs(
-    context_length, block_size, anchor, mask_token, device, layer_types, window=None
+    context_length,
+    block_size,
+    anchor,
+    mask_token,
+    device,
+    layer_types,
+    window=None,
+    attention_backend="sdpa",
 ):
     ids = torch.full((1, block_size), mask_token, device=device, dtype=torch.long)
     ids[0, 0] = anchor
@@ -27,7 +34,31 @@ def replay_inputs(
             )
         elif kind != "full_attention":
             raise ValueError(f"unsupported DSpark layer: {kind}")
-        masks[kind] = allowed[None, None]
+        if attention_backend == "flex_attention":
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            # Use arithmetic masks, not indexing into a dense tensor: flex mask
+            # construction evaluates padded query/KV indices at block boundaries.
+            def full_mask(b, h, qi, ki):
+                return (qi < block_size) & (ki < context_length + block_size)
+
+            def sliding_mask(b, h, qi, ki):
+                return (
+                    full_mask(b, h, qi, ki)
+                    & (ki >= context_length + qi - (window - 1))
+                    & (ki <= context_length + qi)
+                )
+
+            masks[kind] = create_block_mask(
+                sliding_mask if kind == "sliding_attention" else full_mask,
+                B=1,
+                H=None,
+                Q_LEN=block_size,
+                KV_LEN=context_length + block_size,
+                device=str(device),
+            )
+        else:
+            masks[kind] = allowed[None, None]
     return ids, positions, masks
 
 
@@ -58,6 +89,7 @@ class DSparkReplayModel(nn.Module):
             device,
             draft.layer_types,
             draft.sliding_window,
+            draft.config._attn_implementation,
         )
         hidden = draft(
             position_ids=positions,

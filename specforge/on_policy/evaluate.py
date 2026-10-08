@@ -50,8 +50,9 @@ def main(argv=None):
     prompts = load_prompts(
         cfg.data.train_data_path,
         tokenizer,
-        cfg.data.max_prompt_length,
+        cfg.data.prompt_limit,
         cfg.data.chat_template_kwargs,
+        chat_template=cfg.data.chat_template,
     )[: args.max_samples]
     destination = Path(args.output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=False)

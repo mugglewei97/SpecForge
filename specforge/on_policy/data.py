@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 
@@ -28,7 +29,9 @@ def prompt_messages(record: dict) -> list[dict]:
     return messages[:-1]
 
 
-def load_prompts(path, tokenizer, max_length, template_kwargs=None):
+def load_prompts(
+    path, tokenizer, max_length, template_kwargs=None, *, chat_template=None
+):
     path = Path(path)
     with path.open(encoding="utf-8") as stream:
         records = (
@@ -54,10 +57,20 @@ def load_prompts(path, tokenizer, max_length, template_kwargs=None):
         raise ValueError(
             "tokenization and generation-prompt options are owned by on-policy training"
         )
-    prompts = []
-    for index, record in enumerate(records):
+    system_prompt = None
+    if chat_template is not None:
+        from specforge.data.template import TEMPLATE_REGISTRY
+
+        system_prompt = TEMPLATE_REGISTRY.get(chat_template).system_prompt
+
+    def encode(record, index):
+        messages = prompt_messages(record)
+        # Match the legacy qwen parser's default system prompt, while keeping
+        # an explicit system message from the dataset unchanged.
+        if system_prompt and messages[0]["role"] != "system":
+            messages.insert(0, {"role": "system", "content": system_prompt})
         ids = tokenizer.apply_chat_template(
-            prompt_messages(record),
+            messages,
             tokenize=True,
             add_generation_prompt=True,
             return_dict=False,
@@ -67,8 +80,30 @@ def load_prompts(path, tokenizer, max_length, template_kwargs=None):
             not isinstance(token, int) for token in ids
         ):
             raise ValueError("chat template must return a single list of token IDs")
-        if 0 < len(ids) <= max_length:
-            prompts.append({"sample_id": str(index), "input_ids": list(ids)})
+        return {"sample_id": str(index), "input_ids": list(ids)}
+
+    num_proc = int(os.environ.get("SPECFORGE_DATA_NUM_PROC", "1"))
+    if num_proc < 1:
+        raise ValueError("SPECFORGE_DATA_NUM_PROC must be positive")
+    if num_proc > 1 and records:
+        from datasets import Dataset
+        from multiprocess import set_start_method
+
+        # Tokenization starts inside the trainer. Forking CUDA/NCCL or tokenizer
+        # threads here can deadlock; these CPU-only workers must start fresh.
+        set_start_method("spawn", force=True)
+        dataset = Dataset.from_list(records)
+        encoded = dataset.map(
+            encode,
+            with_indices=True,
+            num_proc=min(num_proc, len(records)),
+            remove_columns=dataset.column_names,
+            load_from_cache_file=False,
+            desc="Tokenizing on-policy prompts",
+        )
+    else:
+        encoded = (encode(record, index) for index, record in enumerate(records))
+    prompts = [row for row in encoded if 0 < len(row["input_ids"]) <= max_length]
     if not prompts:
         raise ValueError("no valid prompts within data.max_prompt_length")
     return prompts

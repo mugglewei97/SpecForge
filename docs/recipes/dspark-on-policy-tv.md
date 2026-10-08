@@ -10,8 +10,8 @@ new command is `specforge train-on-policy`; the torchrun module is
 
 Use SGLang **0.5.18** with the patch below, a dense `DSparkDraftModel` with
 GQA/MHA and vanilla/gated/RNN Markov head, BF16, one trainer node, and one or
-more independent single-GPU rollout engines. Qwen3-4B is the supplied H200
-example. FSDP training may use multiple other H200s. Each rollout GPU must fit
+more independent single-GPU rollout engines. Qwen3-4B and Qwen3-8B recipes are
+provided for H200. FSDP training may use multiple other H200s. Each rollout GPU must fit
 the complete frozen target plus draft. Target TP, MoE/MLA drafts, vocabulary
 remapping, custom logit processors, penalties, string stops, quantized models,
 and full optimizer-state resume are not implemented in this mode. Unknown
@@ -72,6 +72,65 @@ small batch. Run directories are never overwritten. Published
 HF draft checkpoints suitable for the existing serving/export workflow. A
 new run may warm-start from any of these; it starts a fresh optimizer.
 
+## Converted Qwen3-8B eight-GPU server job
+
+`examples/on_policy/qwen3-8b-dspark-tv.yaml` preserves the supplied job's target
+and dataset paths, draft architecture config, output directory, learning rate
+`6e-4`, six epochs, warmup ratio `0.04`, gradient norm `1.0`, total sequence limit
+3072, Qwen template, block size 7, trainer FlexAttention, log interval 50, save
+interval 2000 and SGLang memory fraction `0.3`. It warm-starts from:
+
+```
+/mnt/amed-s1/common/ckpt/gaochang/EagleModel/outputs/qwen3-8b-dspark-120w-mix/epoch_6_step_228768
+```
+
+After installing the SGLang patch above, run on the server:
+
+```bash
+cd /ossfs/workspace/SpecForge
+bash scripts/train_dspark_on_policy_8gpu.sh --plan
+bash scripts/train_dspark_on_policy_8gpu.sh
+```
+
+The launcher uses physical GPU 0 for SGLang and GPUs 1–7 for FSDP. The old
+per-GPU batch size 4 on eight ranks becomes **global batch size 32** in this
+entrypoint; it is not reduced to 4 or 28. Replay accumulates all sample/block
+gradients before the single optimizer step, independent of the trainer count.
+The launcher keeps `SPECFORGE_DATA_NUM_PROC=32` for CPU prompt tokenization and
+`FLASHINFER_DISABLE_VERSION_CHECK=1`.
+
+In epoch mode, each length-eligible prompt is visited exactly once per epoch,
+with a deterministic shuffle for each epoch. The final batch of each epoch may
+be smaller. The scheduler horizon is `6 * ceil(eligible_prompts / 32)`; its
+warmup uses the original 0.04 ratio. Immediate-EOS rollouts have no candidate
+loss and are excluded from that batch's mean. An entirely empty batch fails
+before an optimizer update. `schedule.json`, batch prompt IDs and metric sample
+counts expose these boundaries. Set either `num_epochs` or `max_steps`, never
+both. The old step-budget recipe remains supported.
+
+`data.max_length: 3072` bounds prompt **plus** generated tokens. Per-request
+generation is capped to `3072 - prompt_length`; prompts longer than 3070 are
+filtered because they leave no anchor/candidate budget. Engine context 3088
+includes scratch space for full speculative verification; it does not raise
+the 3072 visible-token limit. The Qwen default system message is inserted only
+when the data has no system message. The tokenizer's thinking default is kept.
+
+The new stochastic sampling settings are temperature 1, no top-k/top-p
+filtering, and EOS stopping. The original supervised job did not specify these
+settings. `loss_decay_gamma=4.0` and `num_anchors=512` have no equivalent in this
+objective: equal block means replace decay weighting, and native rollout
+blocks replace sampled offline anchors. They are intentionally absent.
+
+Full draft weights are still published and acknowledged **every step**.
+`save_interval: 2000` controls retention: initial, every 2000th and latest/final
+weights remain; superseded intermediate sync snapshots are removed only after
+the next all-worker ACK. All trajectory JSON remains, including complete
+rejected proposals. This long-run recipe sets `retain_replay_tensors: false`
+to release full-vocabulary p/q and target features after the batch's completed
+update and synchronization. Set it to true for a short full-replay audit.
+The existing output directory may contain older offline checkpoints, but an
+existing on-policy `run.json` or `weights/` makes the launcher refuse reuse.
+
 ## Objective and trajectory contract
 
 For each block, `a_i = 1 - 0.5 * sum_v |p_i(v)-q_i(v)|` and
@@ -85,8 +144,8 @@ Input records are JSON arrays or JSONL with `messages` or ShareGPT
 `conversations`. A record must end with an assistant turn; that turn is removed
 before applying the target tokenizer's generation chat template. Earlier
 assistant turns remain. Overlong prompts are filtered, not silently truncated.
-The supplied recipe disables Qwen thinking explicitly; change that setting to
-match the desired deployment prompts.
+The Qwen3-4B smoke recipe disables Qwen thinking explicitly. The converted
+Qwen3-8B recipe preserves the tokenizer default from the original Qwen job.
 
 SGLang performs the real proposal, target verification, accept/reject walk and
 residual correction/bonus sampling. The hooks preserve the complete proposal,
@@ -109,7 +168,8 @@ The first proposal EOS remains valid; later positions are masked. Generation
 budget truncation is measured from the actual anchor, never from the accepted
 count. Thus rejection does not truncate loss. Blocks speculatively launched
 after the final sequence ended are retained with an all-false mask. All-empty
-rollouts are excluded and replaced before the effective batch is formed.
+rollouts are excluded from the effective batch's loss denominator. An entirely
+empty batch stops before an optimizer update.
 
 Each sample's valid blocks have equal weight, and valid samples have equal
 weight. For world size W the per-block backward weight is `W/(N*M_n)`, because
@@ -140,8 +200,11 @@ anchor/correction/bonus; proxy loss is reported separately.
 
 Full-vocabulary p/q are saved to make replay auditable. Storage can be large:
 two FP32 distributions cost `8*K*V` bytes per block, in addition to target
-features and a full checkpoint per step. Keep the first run short and size the
-output filesystem before extending it.
+features. With `retain_replay_tensors: false`, this tensor storage is bounded
+to the pending effective batch; proposal metadata is still retained. Set
+`save_interval` to bound full-weight snapshot retention. Audit reports whether
+it checked full replay tensors or only retained trajectory metadata. Keep the
+first validation run short and size the output filesystem before extending it.
 
 To compare initial and trained acceptance, copy the recipe and point
 `data.train_data_path` to a **held-out** set. Keep target, sampling, block size

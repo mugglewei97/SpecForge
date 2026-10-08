@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -18,6 +19,46 @@ from specforge.on_policy.data import (
 
 
 class DataTests(unittest.TestCase):
+    def test_qwen_system_prompt_and_parallel_preprocessing(self):
+        def template(messages, **kwargs):
+            assert "enable_thinking" not in kwargs
+            assert all(m["content"] != "held out" for m in messages)
+            # Two different sequences expose whether a dataset system was lost.
+            return (
+                [1, 2]
+                if messages[0]["content"] == "You are a helpful assistant."
+                else [3]
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            conversation = [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "held out"},
+            ]
+            path.write_text(
+                json.dumps(
+                    [
+                        {"messages": conversation},
+                        {
+                            "messages": [
+                                {"role": "system", "content": "custom"},
+                                *conversation,
+                            ]
+                        },
+                    ]
+                )
+            )
+            tokenizer = SimpleNamespace(apply_chat_template=template)
+            outputs = []
+            for workers in ("1", "2"):
+                with patch.dict("os.environ", SPECFORGE_DATA_NUM_PROC=workers):
+                    outputs.append(
+                        load_prompts(path, tokenizer, 10, chat_template="qwen")
+                    )
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual([p["input_ids"] for p in outputs[0]], [[1, 2], [3]])
+
     def test_only_held_out_assistant_removed(self):
         messages = [
             {"role": r, "content": str(i)}

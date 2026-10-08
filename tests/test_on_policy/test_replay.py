@@ -43,6 +43,32 @@ def tiny_model(head="vanilla"):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_flex_mask_matches_dense_including_padding_boundaries(self):
+        for length in (3, 133):
+            _, _, dense = replay_inputs(
+                length, 7, 2, 15, "cpu", ["full_attention", "sliding_attention"], 3
+            )
+            _, _, flex = replay_inputs(
+                length,
+                7,
+                2,
+                15,
+                "cpu",
+                ["full_attention", "sliding_attention"],
+                3,
+                attention_backend="flex_attention",
+            )
+            qi = torch.arange(7)[:, None]
+            ki = torch.arange(length + 7)[None, :]
+            for kind in dense:
+                actual = flex[kind].mask_mod(0, 0, qi, ki)
+                torch.testing.assert_close(actual, dense[kind][0, 0])
+                self.assertFalse(
+                    flex[kind].mask_mod(
+                        0, 0, torch.tensor(128), torch.tensor(length + 128)
+                    )
+                )
+
     def test_full_and_sliding_masks(self):
         ids, positions, masks = replay_inputs(
             3, 3, 7, 15, "cpu", ["full_attention", "sliding_attention"], 3

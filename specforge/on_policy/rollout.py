@@ -70,6 +70,9 @@ def _engine_process(connection, configuration, root, worker_id, device, block_si
         if not hasattr(Scheduler, "specforge_on_policy"):
             raise RuntimeError("apply patches/sglang/v0.5.18/on-policy.patch first")
         model, rollout = configuration["model"], configuration["rollout"]
+        from .config import OnPolicyConfig
+
+        cfg = OnPolicyConfig.model_validate(configuration)
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
@@ -111,7 +114,7 @@ def _engine_process(connection, configuration, root, worker_id, device, block_si
             elif operation == "rollout":
                 response = engine.generate(
                     input_ids=request["input_ids"],
-                    sampling_params=configuration["sampling"],
+                    sampling_params=cfg.sampling_for_prompt(len(request["input_ids"])),
                     rid=request["request_id"],
                 )
                 if (

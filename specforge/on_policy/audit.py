@@ -10,6 +10,9 @@ from .data import load_trace
 def audit(root, min_steps=2):
     root = Path(root)
     metrics_files = sorted((root / "metrics").glob("*.json"))
+    cfg = json.loads((root / "run.json").read_text())
+    save_interval = cfg["training"].get("save_interval", 1)
+    keep_tensors = cfg["training"].get("retain_replay_tensors", True)
     if len(metrics_files) < min_steps:
         raise ValueError(f"need at least {min_steps} completed, synchronized steps")
     rejections, bonuses, blocks_count = 0, 0, 0
@@ -21,7 +24,9 @@ def audit(root, min_steps=2):
         if len(ids) != metrics["samples"]:
             raise ValueError("sample count differs from the effective batch")
         for request_id in ids:
-            trace, _ = load_trace(root, request_id, version)
+            trace, _ = load_trace(
+                root, request_id, version, metadata_only=not keep_tensors
+            )
             for block in trace["blocks"]:
                 if not any(block["valid_mask"]):
                     continue
@@ -30,11 +35,18 @@ def audit(root, min_steps=2):
                     rejections += 1
                 else:
                     bonuses += 1
-        if not (
-            root / "weights" / f"{version + 1:08d}" / "model.safetensors"
-        ).is_file():
+        retained_checkpoint = (version + 1) % save_interval == 0 or version + 1 == len(
+            metrics_files
+        )
+        if not retained_checkpoint and not metrics.get("full_weight_sync"):
+            raise ValueError("missing synchronization record for retired checkpoint")
+        if (
+            retained_checkpoint
+            and not (
+                root / "weights" / f"{version + 1:08d}" / "model.safetensors"
+            ).is_file()
+        ):
             raise ValueError("missing full draft checkpoint")
-    cfg = json.loads((root / "run.json").read_text())
     for worker in range(len(cfg["rollout"]["cuda_devices"])):
         ack = json.loads((root / "acks" / f"worker-{worker}.json").read_text())
         if ack["weight_version"] != len(metrics_files) or not ack["cache_invalidated"]:
@@ -49,6 +61,7 @@ def audit(root, min_steps=2):
         "rejection_blocks": rejections,
         "all_accepted_bonus_blocks": bonuses,
         "final_weight_version": len(metrics_files),
+        "replay_tensors_retained": keep_tensors,
     }
 
 

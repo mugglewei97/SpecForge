@@ -64,6 +64,36 @@ def _worker(rank, directory):
     "set SPECFORGE_RUN_H200_GATE=1 on the validation server",
 )
 class FSDPCudaTests(unittest.TestCase):
+    def test_real_dspark_flex_matches_sdpa_backward(self):
+        from tests.test_on_policy.test_replay import tiny_model
+
+        self.assertTrue(torch.cuda.is_available())
+        baseline = tiny_model().to(device="cuda", dtype=torch.bfloat16)
+        flex = tiny_model().to(device="cuda", dtype=torch.bfloat16)
+        flex.draft_model.config._attn_implementation = "flex_attention"
+        features = torch.randn(133, 32, device="cuda", dtype=torch.bfloat16)
+        target = torch.randn(3, 16, device="cuda").softmax(-1)
+        block = {
+            "context_length": 133,
+            "anchor": 2,
+            "proposal": [3, 4, 5],
+            "valid_mask": [True, True, True],
+            "sampling": {"temperature": 1.0},
+        }
+        losses = []
+        for model in (baseline, flex):
+            loss, _ = model(block, features, target, target)
+            loss.backward()
+            losses.append(loss)
+        torch.testing.assert_close(losses[0], losses[1], atol=0.002, rtol=0.02)
+        for (name, a), (_, b) in zip(
+            baseline.named_parameters(), flex.named_parameters()
+        ):
+            if a.requires_grad:
+                self.assertIsNotNone(a.grad, name)
+                self.assertIsNotNone(b.grad, name)
+                torch.testing.assert_close(a.grad, b.grad, atol=0.002, rtol=0.02)
+
     def test_two_rank_full_shard_matches_sample_mean(self):
         self.assertGreaterEqual(torch.cuda.device_count(), 2)
         with tempfile.TemporaryDirectory() as directory:

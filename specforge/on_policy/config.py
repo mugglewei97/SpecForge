@@ -40,13 +40,27 @@ class ModelConfig(StrictConfigModel):
 class DataConfig(StrictConfigModel):
     train_data_path: str
     max_prompt_length: int = Field(default=2048, gt=0)
+    # Optional combined prompt + generated sequence limit (legacy --max-length).
+    max_length: int | None = Field(default=None, gt=2)
+    chat_template: Literal["qwen"] | None = None
     chat_template_kwargs: dict = Field(default_factory=dict)
+
+    @property
+    def prompt_limit(self):
+        # Leave room for the initial anchor and at least one candidate.
+        return (
+            min(self.max_prompt_length, self.max_length - 2)
+            if self.max_length
+            else self.max_prompt_length
+        )
 
 
 class TrainingConfig(StrictConfigModel):
     output_dir: str
-    max_steps: int = Field(default=100, gt=0)
-    # A global number of valid samples, independent of rank/block/token count.
+    max_steps: int | None = Field(default=None, gt=0)
+    num_epochs: int | None = Field(default=None, gt=0)
+    # Global prompt budget, independent of rank/block/token count. Samples with
+    # no candidate positions are excluded from the actual loss denominator.
     batch_size: int = Field(default=4, gt=0)
     learning_rate: float = Field(default=1e-6, gt=0, allow_inf_nan=False)
     weight_decay: float = Field(default=0.0, ge=0, allow_inf_nan=False)
@@ -58,6 +72,20 @@ class TrainingConfig(StrictConfigModel):
     # Different CUDA kernels have rounding differences; fail closed on drift.
     replay_max_tv: float = Field(default=0.02, gt=0, lt=1)
     max_empty_samples: int = Field(default=100, gt=0)
+    attention_backend: Literal["sdpa", "eager", "flex_attention"] = "sdpa"
+    log_interval: int = Field(default=1, gt=0)
+    save_interval: int = Field(default=1, gt=0)
+    # Always keep trajectory JSON (including discarded proposals). Large replay
+    # tensors can be released only after training and all synchronization ACKs.
+    retain_replay_tensors: bool = True
+
+    @model_validator(mode="after")
+    def training_budget(self):
+        if self.max_steps is not None and self.num_epochs is not None:
+            raise ValueError("set exactly one of training.max_steps or num_epochs")
+        if self.max_steps is None and self.num_epochs is None:
+            self.max_steps = 100
+        return self
 
 
 class RolloutConfig(StrictConfigModel):
@@ -88,14 +116,26 @@ class OnPolicyConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def context_budget(self):
-        if (
-            self.rollout.context_length
-            < self.data.max_prompt_length + self.sampling.max_new_tokens + 16
-        ):
+        if self.rollout.context_length < self.sequence_limit + 16:
             raise ValueError(
                 "rollout.context_length must cover prompt + generation + 16 slots"
             )
         return self
+
+    @property
+    def sequence_limit(self):
+        limit = self.data.max_prompt_length + self.sampling.max_new_tokens
+        return min(limit, self.data.max_length) if self.data.max_length else limit
+
+    def sampling_for_prompt(self, prompt_length):
+        sampling = self.sampling.model_dump()
+        if self.data.max_length is not None:
+            sampling["max_new_tokens"] = min(
+                sampling["max_new_tokens"], self.data.max_length - prompt_length
+            )
+        if sampling["max_new_tokens"] < 2:
+            raise ValueError("prompt leaves no budget for speculative candidates")
+        return sampling
 
     @classmethod
     def from_file(cls, path):
