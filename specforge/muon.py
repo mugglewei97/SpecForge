@@ -13,6 +13,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecis
 
 from specforge.lr_scheduler import CosineAnnealingWarmupLR
 
+from specforge.legacy.dspark_training.options import add_muon_optimizer_args as add_muon_optimizer_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,17 +39,6 @@ def configure_fsdp_optimizer_precision(model, optimizer_name):
                           reduce_dtype=torch.float32, keep_low_precision_grads=False)
 
 
-def add_muon_optimizer_args(group):
-    group.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
-    group.add_argument("--weight-decay", type=float, default=0.0,
-                       help="AdamW weight decay, including the AdamW group in Muon mode.")
-    group.add_argument("--muon-lr", type=float, default=None,
-                       help="Muon LR; defaults to 10 * --learning-rate, as in speculators CLI.")
-    group.add_argument("--muon-momentum", type=float, default=0.95)
-    group.add_argument("--muon-weight-decay", type=float, default=0.1)
-    group.add_argument("--muon-ns-steps", type=int, default=5)
-    group.add_argument("--muon-adjust-lr-fn", choices=["original", "match_rms_adamw"],
-                       default="match_rms_adamw")
 
 
 def validate_muon_options(*, lr, muon_lr, momentum, weight_decay,

@@ -79,10 +79,18 @@ checkpoint 导出复制这套兼容模型及其相对导入依赖。
 SGLang in-process backend 也来自 AQ；远程需要其对应的 SGLang 环境。
 本次没有更改项目依赖版本，也没有在个人电脑启动 GPU 训练。
 
+训练入口和实现按职责拆分，原命令与参数保持兼容：
+
+- `scripts/train_dspark.py`：解析参数并启动训练；`--help` 不加载 GPU 训练依赖。
+- `specforge/legacy/dspark_training/`：参数声明、配置合并、模型/数据构建、
+  checkpoint 导出与训练循环；`objective.py` 集中处理 TV 参数、resume 检查和启用逻辑。
+- `specforge/core/tv_acceptance.py`：候选采样、TV 公式、checkpoint 分块和全局归约。
+- `specforge/inference/target_engine/candidate_verifier.py`：独立前缀构造、批量 target 验证和 hidden 对齐。
+
 CPU 测试：
 
 ```bash
-python -m pytest -q tests/test_utils/test_tv_acceptance.py
+python -m pytest -q tests/test_utils/test_tv_acceptance.py tests/test_scripts/test_train_dspark.py
 ```
 
 覆盖公式、梯度有限差分、空 block、mask 截断、EOS、温度、低精度，

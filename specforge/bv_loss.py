@@ -14,16 +14,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from specforge.legacy.dspark_training.options import add_bv_args as add_bv_args
 
-def add_bv_args(parser):
-    group = parser.add_argument_group("BV distribution-loss replacement")
-    group.add_argument("--bv-loss-alpha", type=float, default=0.0,
-                       help="BV weight; positive requires l1-loss-alpha=0.")
-    group.add_argument("--bv-temperature", type=float, default=1.0)
-    group.add_argument("--bv-anneal-ratio", type=float, default=0.5,
-                       help="Fraction of optimizer steps annealing beta from 0 to 1.")
-    group.add_argument("--bv-block-chunk-size", type=int, default=8,
-                       help="Blocks per recomputed full-vocabulary BV chunk.")
+
 
 
 def validate_bv_options(alpha, temperature, anneal_ratio, chunk_size,

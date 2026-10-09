@@ -173,8 +173,8 @@ def candidate_tv_forward(model, input_ids, attention_mask, anchors, hidden, vali
             )
         )
 
-    loss_sum, count, length, overlap_pp, correct_pp, count_pp = (
-        checkpointed_chunk_reduce(
+    terms = TVAcceptanceTerms(
+        *checkpointed_chunk_reduce(
             chunk_terms,
             flat_hidden,
             previous,
@@ -183,40 +183,49 @@ def candidate_tv_forward(model, input_ids, attention_mask, anchors, hidden, vali
             chunk_size=model.tv_objective_chunk_blocks,
         )
     )
-    # FSDP averages rank gradients. This yields the mean over all NONEMPTY
-    # blocks in the distributed microbatch, not a mean of rank-local means.
-    global_count = count.detach().clone()
-    world = 1
-    if dist.is_available() and dist.is_initialized():
-        world = dist.get_world_size()
-        dist.all_reduce(global_count)
-    if global_count.item() <= 0:
-        raise ValueError("tv-acceptance has no valid candidate blocks on any rank")
-    loss = world * loss_sum / global_count
-    # Global telemetry remains correct when ranks have unequal valid lengths.
-    scalars = torch.stack([loss_sum.detach(), length.detach(), count.detach()])
+    return reduce_tv_terms(terms)
+
+
+def reduce_tv_terms(terms: TVAcceptanceTerms):
+    """Normalize across ranks and return DSpark's loss/telemetry contract."""
+    scalars = torch.stack(
+        [terms.loss_sum.detach(), terms.length_sum.detach(), terms.block_count.detach()]
+    )
     positions = torch.stack(
-        [overlap_pp.detach(), correct_pp.detach(), count_pp.detach()]
+        [
+            terms.overlap_position_sum.detach(),
+            terms.correct_position_sum.detach(),
+            terms.position_count.detach(),
+        ]
+    )
+    world = (
+        dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
     )
     if world > 1:
         dist.all_reduce(scalars)
         dist.all_reduce(positions)
-    overlap_pp, correct_pp, count_pp = positions.unbind(0)
-    denom_pp = count_pp.clamp_min(1)
-    accuracy = correct_pp.sum() / count_pp.sum().clamp_min(1)
+    global_loss, global_length, global_count = scalars.unbind(0)
+    if global_count.item() <= 0:
+        raise ValueError("tv-acceptance has no valid candidate blocks on any rank")
+    # FSDP averages rank gradients: compensate to weight every nonempty block
+    # equally. The same reduced count also normalizes the detached telemetry.
+    loss = world * terms.loss_sum / global_count
+    overlap, correct, count = positions.unbind(0)
+    position_denominator = count.clamp_min(1)
+    total_positions = count.sum().clamp_min(1)
     components = {
-        "tv_acceptance_loss": scalars[0] / scalars[2].clamp_min(1),
-        "tv_acceptance_length_proxy": scalars[1] / scalars[2].clamp_min(1),
-        "tv_mean_overlap": overlap_pp.sum() / count_pp.sum().clamp_min(1),
-        "tv_valid_blocks": scalars[2],
-        "tv_mean_valid_length": count_pp.sum() / scalars[2].clamp_min(1),
+        "tv_acceptance_loss": global_loss / global_count,
+        "tv_acceptance_length_proxy": global_length / global_count,
+        "tv_mean_overlap": overlap.sum() / total_positions,
+        "tv_valid_blocks": global_count,
+        "tv_mean_valid_length": count.sum() / global_count,
     }
     return (
         loss,
-        accuracy,
-        (count_pp - overlap_pp) / denom_pp,
-        correct_pp / denom_pp,
-        count_pp,
+        correct.sum() / total_positions,
+        (count - overlap) / position_denominator,
+        correct / position_denominator,
+        count,
         components,
     )
 

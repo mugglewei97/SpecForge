@@ -126,9 +126,12 @@ class RecordingTarget:
         )
 
 
-def test_verifier_replaces_gold_prefix_independently_and_aligns_prediction_rows():
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_verifier_replaces_gold_prefix_independently_and_aligns_prediction_rows(
+    batch_size,
+):
     target = RecordingTarget(2)
-    verifier = CandidatePrefixVerifier(target, batch_size=2)
+    verifier = CandidatePrefixVerifier(target, batch_size=batch_size, pad_token_id=99)
     ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
     anchors = torch.tensor([[1, 2, 4]])
     proposals = torch.tensor([[[9, 8, 7], [6, 5, 4], [3, 2, 1]]])
@@ -329,8 +332,8 @@ def test_distributed_gradient_scaling_uses_global_block_count(empty_rank):
 
     def all_reduce(tensor):
         calls.append(tuple(tensor.shape))
-        if tensor.ndim == 0:
-            tensor.fill_(global_blocks)
+        if tensor.shape == (3,):
+            tensor[2] = global_blocks
 
     with (
         patch(
@@ -345,7 +348,7 @@ def test_distributed_gradient_scaling_uses_global_block_count(empty_rank):
             model, ids, torch.ones_like(ids), anchors, hidden, valid
         )[0]
         loss.backward()
-    assert calls == [(), (3,), (3, 3)]
+    assert calls == [(3,), (3, 3)]
     actual = hidden.grad.clone()
     hidden.grad = None
     teacher = model.tv_candidate_verifier(

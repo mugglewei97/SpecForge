@@ -13,14 +13,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from specforge.legacy.dspark_training.options import add_predictive_auxiliary_args as add_predictive_auxiliary_args
 
-def add_predictive_auxiliary_args(parser):
-    group = parser.add_argument_group("training-only predictive supervision")
-    group.add_argument("--conv-source-semantic-alpha", type=float, default=0.0)
-    group.add_argument("--carh-reference-calibration-alpha", type=float, default=0.0)
-    group.add_argument("--predictive-aux-warmup-ratio", type=float, default=0.10)
-    group.add_argument("--predictive-aux-ramp-ratio", type=float, default=0.15)
-    group.add_argument("--source-semantic-codebook-seed", type=int, default=20261001)
+
 
 
 def validate_predictive_auxiliary(args, draft_model):

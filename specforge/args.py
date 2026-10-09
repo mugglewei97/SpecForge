@@ -2,8 +2,6 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
-
 
 @dataclass
 class TrackerArgs:
@@ -108,8 +106,7 @@ class SGLangBackendArgs:
             "--sglang-attention-backend",
             type=str,
             default="flashinfer",
-            choices=ATTENTION_BACKEND_CHOICES,
-            help="The attention backend of SGLang backend",
+            help="Attention backend supported by the installed SGLang version.",
         )
         parser.add_argument(
             "--sglang-mem-fraction-static",
@@ -155,12 +152,22 @@ class SGLangBackendArgs:
             help="The ep size of the SGLang backend",
         )
         parser.add_argument(
-            "--sglang-moe-runner-backend", default="auto",
+            "--sglang-moe-runner-backend",
+            default="auto",
             help="SGLang MoE runner (e.g. marlin for DeepSeek-V4 on Hopper)",
         )
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "SGLangBackendArgs":
+        # Loading SGLang imports its GPU stack. Do this only when constructing
+        # that backend, so CLI help and HF training stay independent of it.
+        from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+
+        if args.sglang_attention_backend not in ATTENTION_BACKEND_CHOICES:
+            raise ValueError(
+                f"Unsupported SGLang attention backend: {args.sglang_attention_backend!r}; "
+                f"choose from {ATTENTION_BACKEND_CHOICES}"
+            )
         return SGLangBackendArgs(
             sglang_attention_backend=args.sglang_attention_backend,
             sglang_mem_fraction_static=args.sglang_mem_fraction_static,
@@ -171,7 +178,9 @@ class SGLangBackendArgs:
             sglang_enable_dp_attention=args.sglang_enable_dp_attention,
             sglang_enable_dp_lm_head=args.sglang_enable_dp_lm_head,
             sglang_ep_size=args.sglang_ep_size,
-            sglang_moe_runner_backend=getattr(args, "sglang_moe_runner_backend", "auto"),
+            sglang_moe_runner_backend=getattr(
+                args, "sglang_moe_runner_backend", "auto"
+            ),
             sglang_max_running_requests=(
                 args.target_batch_size if hasattr(args, "target_batch_size") else None
             ),

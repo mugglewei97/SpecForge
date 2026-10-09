@@ -12,14 +12,9 @@ import torch.distributed as dist
 from specforge.netprefix import GreedyPrefixHook, cpu_copy, file_digest, rng_state, restore_rng
 from specforge.netprefix_stream import TrainingStreamSource
 
+from specforge.legacy.dspark_training.options import add_reference_args as add_reference_args
 
-def add_reference_args(parser):
-    group = parser.add_argument_group("Repair value D / fixed reference E")
-    group.add_argument("--on-policy-repair-value", action="store_true")
-    group.add_argument("--on-policy-repair-value-horizon", type=int, default=2)
-    group.add_argument("--fixed-prefix-reference-alpha", type=float, default=0.0)
-    group.add_argument("--fixed-prefix-reference-batches", type=int, default=4)
-    group.add_argument("--fixed-prefix-reference-interval", type=int, default=32)
+
 
 
 def validate_reference_args(args):

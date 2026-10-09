@@ -17,23 +17,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from specforge.legacy.dspark_training.options import add_netprefix_args as add_netprefix_args
 
-def add_netprefix_args(parser):
-    g = parser.add_argument_group("NetPrefix H1 greedy pilot")
-    g.add_argument("--netprefix-mode", choices=["off", "baseline", "fixed-greedy", "h1-greedy"], default="off")
-    g.add_argument("--netprefix-ramp-steps", type=int, default=0)
-    g.add_argument("--netprefix-start-step", type=int, default=20000)
-    g.add_argument("--netprefix-interval", type=int, default=128)
-    g.add_argument("--netprefix-repair-weights", type=float, nargs="+", default=[0.05, 0.1])
-    g.add_argument("--netprefix-protect-weight", type=float, default=0.1)
-    g.add_argument("--netprefix-control-data-path")
-    g.add_argument("--netprefix-audit-data-path")
-    g.add_argument("--netprefix-data-source", choices=["files", "train-stream"], default="files")
-    g.add_argument("--netprefix-control-batches", type=int, default=4)
-    g.add_argument("--netprefix-extra-time-ratio", type=float, default=0.2)
-    g.add_argument("--netprefix-min-gain", type=float, default=0.0)
-    g.add_argument("--netprefix-audit-tolerance", type=float, default=0.0)
-    g.add_argument("--stop-after-steps", type=int, help="Pilot stop; does not shorten LR/auxiliary schedules.")
+
 
 
 def validate_netprefix_args(a):
