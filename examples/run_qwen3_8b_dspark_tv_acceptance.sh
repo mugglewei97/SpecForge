@@ -10,6 +10,8 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 NUM_GPUS="${1:-8}"
 ATTENTION_BACKEND="${2:-flex_attention}"
 TARGET_BACKEND="${3:-sglang}"
+# Remaining arguments override recipe defaults or select a warm-start checkpoint.
+shift "$(( $# < 3 ? $# : 3 ))"
 
 exec torchrun --standalone --nproc_per_node "$NUM_GPUS" scripts/train_dspark.py \
     --target-model-path /mnt/amed-s1/common/ckpt/gaochang/Qwen3-8B \
@@ -34,4 +36,5 @@ exec torchrun --standalone --nproc_per_node "$NUM_GPUS" scripts/train_dspark.py 
     --dspark-loss-type tv-acceptance \
     --tv-sampling-temperature 1.0 \
     --tv-objective-chunk-blocks 8 \
-    --tv-verification-batch-size 4
+    --tv-verification-batch-size 4 \
+    "$@"

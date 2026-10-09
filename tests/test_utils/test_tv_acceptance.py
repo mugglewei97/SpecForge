@@ -1,6 +1,7 @@
 """CPU formula, prefix alignment, checkpoint and real DSpark gradient tests."""
 
 import copy
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -404,3 +405,91 @@ def test_anchor_sampler_keeps_partial_tail_and_empty_rank_placeholder():
             loss_mask=torch.zeros(1, 8),
             attention_mask=torch.ones(1, 8).long(),
         )
+
+
+@pytest.mark.parametrize("model_type", ["dspark", "qwen3"])
+@pytest.mark.parametrize("weight_format", ["safetensors", "sharded", "bin"])
+def test_checkpoint_post_training_preserves_weights_and_takes_tv_step(
+    tmp_path, model_type, weight_format
+):
+    from specforge.legacy.dspark_training.initialization import (
+        initialize_draft_weights,
+        load_checkpoint_model,
+        load_draft_config,
+        prepare_warm_start,
+    )
+
+    torch.manual_seed(12)
+    source, _ = make_model()
+    source.draft_model.config.dflash_config["mask_token_id"] = 13
+    # Make the checkpoint observably trained instead of just another identical
+    # zero-initialized Markov projection.
+    with torch.no_grad():
+        source.draft_model.markov_head.markov_w2.weight.normal_(std=0.01)
+    if weight_format == "bin":
+        source.draft_model.config.save_pretrained(tmp_path)
+        torch.save(source.draft_model.state_dict(), tmp_path / "pytorch_model.bin")
+    else:
+        source.draft_model.save_pretrained(
+            tmp_path, max_shard_size="2KB" if weight_format == "sharded" else "1GB"
+        )
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config.update(model_type=model_type, architectures=["Qwen3DSparkModel"])
+    config_path.write_text(json.dumps(config))
+    # Post-training must not attempt to read optimizer/counters from this file.
+    (tmp_path / "training_state.pt").write_bytes(b"not an optimizer checkpoint")
+    args = SimpleNamespace(
+        init_draft_model_path=str(tmp_path),
+        resume=False,
+        output_dir=str(tmp_path / "new-run"),
+        allow_conv_position_pruning=False,
+    )
+    prepare_warm_start(args)
+    resolved = load_draft_config(args.draft_config_path)
+    assert resolved.block_size == 7
+    assert resolved.dflash_config["target_layer_ids"] == [1]
+    loaded = load_checkpoint_model(args.init_draft_model_path, dtype=torch.float32)
+    assert loaded.mask_token_id == 13
+    assert loaded.markov_rank == 4
+    model, _ = make_model()
+    initialize_draft_weights(model.draft_model, args)
+    for key, expected in source.draft_model.state_dict().items():
+        torch.testing.assert_close(
+            model.draft_model.state_dict()[key], expected, rtol=0, atol=0
+        )
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad), lr=1e-4
+    )
+    assert not optimizer.state
+    before = model.draft_model.markov_head.markov_w2.weight.detach().clone()
+    ids = torch.randint(0, 13, (1, 12))
+    loss, *_ = model(
+        input_ids=ids,
+        hidden_states=torch.randn(1, 12, 16),
+        loss_mask=torch.ones(1, 12),
+        attention_mask=torch.ones_like(ids),
+    )
+    loss.backward()
+    optimizer.step()
+    assert torch.isfinite(loss)
+    assert not torch.equal(model.draft_model.markov_head.markov_w2.weight, before)
+
+
+@pytest.mark.parametrize("invalid", ["missing", "unexpected"])
+def test_warm_start_rejects_silently_reinitialized_source_weights(tmp_path, invalid):
+    from safetensors.torch import load_file, save_file
+
+    from specforge.legacy.dspark_training.initialization import load_checkpoint_model
+
+    model, _ = make_model()
+    model.draft_model.save_pretrained(tmp_path)
+    path = tmp_path / "model.safetensors"
+    state = load_file(path)
+    if invalid == "missing":
+        del state["markov_head.markov_w2.weight"]
+    else:
+        state["unknown.weight"] = torch.ones(1)
+    save_file(state, path)
+    with pytest.raises(ValueError, match="Incomplete or incompatible"):
+        load_checkpoint_model(tmp_path, dtype=torch.float32)

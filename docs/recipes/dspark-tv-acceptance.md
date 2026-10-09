@@ -17,6 +17,33 @@ block size 7 和 512 anchors，输出到独立的 `qwen3-8b-dspark-tv-acceptance
 --tv-verification-batch-size 4
 ```
 
+## 从已有 DSpark checkpoint 后训练
+
+指定具体 checkpoint 目录（包含 `config.json` 和模型权重），以及新的输出目录：
+
+```bash
+bash examples/run_qwen3_8b_dspark_tv_acceptance.sh 8 flex_attention sglang \
+    --init-draft-model-path /path/to/dspark/epoch_5_step_20000 \
+    --output-dir /path/to/dspark-tv-posttrain
+```
+
+也可直接在 `torchrun ... scripts/train_dspark.py` 命令后加入这两个参数，
+并保留 `--dspark-loss-type tv-acceptance`。
+启动脚本允许在末尾追加训练参数，覆盖示例默认的 `--learning-rate`、
+`--num-epochs`、`--max-steps` 等设置。
+
+- 从 checkpoint 加载 draft 权重和结构配置，覆盖通用 `--draft-config-path`。
+  保留其中的 block size、target capture layers 和 mask token；显式
+  `--mask-token-id` 仍可覆盖。target 模型需与该 draft 训练时使用的模型匹配。
+- 支持旧的 `model_type=qwen3` 和原生 `model_type=dspark` 导出配置，
+  模型权重支持 safetensors / PyTorch 权重文件及其分片。
+  缺失或不匹配的源模型权重会报错，避免随机补权重后继续后训练。
+- 只加载模型，不读取旧的 `training_state.pt`。optimizer、scheduler、epoch、
+  global step 从新训练开始；后训练的学习率和训练时长由当前命令决定。
+- 从 CE/L1 训练的 vanilla Markov DSpark 切换到 TV loss 使用此方式。
+  已启动的 TV 后训练任务中断后，用该任务的输出目录和 `--resume` 恢复；
+  此时移除 `--init-draft-model-path`。两者互斥。
+
 ## 数学与前缀语义
 
 在实际 draft 候选前缀下，使用完整词表分布

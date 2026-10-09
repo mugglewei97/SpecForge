@@ -63,6 +63,11 @@ from specforge.tracker import create_tracker
 from specforge.utils import get_local_device, print_on_rank0, print_with_rank
 
 from .checkpoint import save_checkpoint
+from .initialization import (
+    initialize_draft_weights,
+    prepare_warm_start,
+    resolve_mask_token_id,
+)
 from .objective import (
     configure_objective,
     validate_objective_args,
@@ -71,7 +76,6 @@ from .objective import (
 from .setup import (
     _apply_trainable_parameter_scope,
     _build_dialogue_token_class_lookup,
-    _load_draft_state_allowing_selector_expansion,
     _load_parallel_refiner_teacher,
     _patch_flex_attention_triton_backend,
     build_dataloader,
@@ -244,8 +248,7 @@ def run_training(args):
         raise ValueError("multi-teacher export requires --init-draft-model-path")
     if args.multi_teacher_export_top_k < 2:
         raise ValueError("multi-teacher export top-k must be at least 2")
-    if args.resume and args.init_draft_model_path:
-        raise ValueError("--resume and --init-draft-model-path are mutually exclusive")
+    prepare_warm_start(args)
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -280,15 +283,9 @@ def run_training(args):
             print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
             args.draft_config_path = checkpoint_config_path
     elif args.init_draft_model_path:
-        init_config_path = os.path.join(args.init_draft_model_path, "config.json")
-        if not os.path.exists(init_config_path):
-            raise FileNotFoundError(
-                f"Initialization checkpoint has no config.json: {init_config_path}"
-            )
         print(
-            f"Loading draft config from initialization checkpoint: {init_config_path}"
+            f"Loading draft config from initialization checkpoint: {args.draft_config_path}"
         )
-        args.draft_config_path = init_config_path
 
     target_model, draft_model = build_models(args, device)
     validate_predictive_auxiliary(args, draft_model)
@@ -370,18 +367,10 @@ def run_training(args):
                 f"step {resume_state['global_step']}"
             )
     elif args.init_draft_model_path:
-        loaded_model = DSparkDraftModel.from_pretrained(
-            args.init_draft_model_path, torch_dtype=torch.bfloat16
-        )
-        _load_draft_state_allowing_selector_expansion(
-            draft_model,
-            loaded_model,
-            allow_conv_position_pruning=args.allow_conv_position_pruning,
-        )
-        del loaded_model
+        initialize_draft_weights(draft_model, args)
         print(
-            "Loaded draft model weights without optimizer state from "
-            f"{args.init_draft_model_path}"
+            f"Post-training initialized from {args.init_draft_model_path}; "
+            "optimizer, scheduler and training progress start fresh."
         )
 
     if args.optimizer == "muon" and args.resume and resume_state is None:
@@ -422,13 +411,7 @@ def run_training(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
-    if args.mask_token_id is not None:
-        mask_token_id = args.mask_token_id
-    elif tokenizer.mask_token_id is not None:
-        mask_token_id = tokenizer.mask_token_id
-    else:
-        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-        mask_token_id = tokenizer.mask_token_id
+    mask_token_id = resolve_mask_token_id(args, draft_model, tokenizer)
     print_on_rank0(f"Using mask_token_id: {mask_token_id}")
 
     draft_model.mask_token_id = mask_token_id

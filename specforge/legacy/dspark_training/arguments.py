@@ -1563,8 +1563,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Initialize draft weights/config from a checkpoint without restoring "
-            "optimizer or training progress. Mutually exclusive with --resume."
+            "Post-train from a local DSpark checkpoint directory (config.json and model weights). "
+            "Uses its architecture and mask token, with a fresh optimizer/scheduler and step 0. "
+            "Overrides --draft-config-path; mutually exclusive with --resume."
         ),
     )
     training_group.add_argument(

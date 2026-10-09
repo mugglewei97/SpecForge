@@ -24,6 +24,7 @@ from specforge.legacy.dspark import DSparkDraftModel
 from specforge.utils import print_on_rank0
 
 from .config import _apply_dspark_config
+from .initialization import load_draft_config
 
 
 def _build_dialogue_token_class_lookup(tokenizer) -> torch.Tensor:
@@ -124,7 +125,7 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, DSparkDraftModel]:
     )
 
     if args.draft_config_path:
-        draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+        draft_config = load_draft_config(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
         if (
             hasattr(draft_config, "block_size")
@@ -352,132 +353,6 @@ def _patch_flex_attention_triton_backend() -> None:
         "Flex attention: forcing BACKEND=TRITON (avoids Inductor "
         "flex-decoding NoValidChoicesError on dynamic short-query batches)."
     )
-
-
-def _load_draft_state_allowing_selector_expansion(
-    draft_model: DSparkDraftModel,
-    loaded_model: DSparkDraftModel,
-    allow_conv_position_pruning: bool = False,
-) -> None:
-    """Load a warm start that may predate optional research modules.
-
-    All shared weights remain strict. Newly constructed research modules may be
-    missing, and DynamicConv-only parameters may be dropped when an SPSM run
-    explicitly replaces that backbone component.
-    """
-    loaded_state = loaded_model.state_dict()
-    replacing_dynamic_conv = (
-        getattr(draft_model, "prefix_state_mixer", None) is not None
-        and getattr(loaded_model, "dynamic_conv_enabled", False)
-        and not getattr(draft_model, "dynamic_conv_enabled", False)
-    )
-    dropped_dynamic_conv = []
-    if replacing_dynamic_conv:
-        dropped_dynamic_conv = [
-            key
-            for key in loaded_state
-            if ".attention_conv." in key or ".mlp_conv." in key
-        ]
-        loaded_state = {
-            key: value
-            for key, value in loaded_state.items()
-            if key not in dropped_dynamic_conv
-        }
-    target_state = draft_model.state_dict()
-    if allow_conv_position_pruning:
-        removed = [
-            key
-            for key in loaded_state
-            if key not in target_state
-            and (".attention_conv." in key or ".mlp_conv." in key)
-        ]
-        for key in removed:
-            del loaded_state[key]
-        print_on_rank0(f"Explicit conv-position pruning: removed {removed}")
-    expanded_depth_embeddings = []
-    for key, value in list(loaded_state.items()):
-        target_value = target_state.get(key)
-        if (
-            target_value is not None
-            and key.endswith("depth_embedding.weight")
-            and value.ndim == target_value.ndim == 2
-            and value.shape[1:] == target_value.shape[1:]
-            and value.shape[0] < target_value.shape[0]
-        ):
-            expanded = value.new_empty(target_value.shape)
-            expanded[: value.shape[0]].copy_(value)
-            # New depths start close to the deepest learned K=7 state while
-            # retaining a tiny symmetry-breaking perturbation.
-            tail = value[-1:].expand(target_value.shape[0] - value.shape[0], -1)
-            expanded[value.shape[0] :].copy_(tail)
-            expanded[value.shape[0] :].add_(
-                torch.randn_like(expanded[value.shape[0] :]) * 1e-4
-            )
-            loaded_state[key] = expanded
-            expanded_depth_embeddings.append(key)
-    incompatible = draft_model.load_state_dict(loaded_state, strict=False)
-    unexpected = list(incompatible.unexpected_keys)
-    adding_second_predecessor = (
-        getattr(draft_model.markov_head, "predecessor_count", 1) >= 2
-        and getattr(loaded_model.markov_head, "predecessor_count", 1) == 1
-        and getattr(loaded_model.markov_head, "markov_head_type", "") == "carh"
-    )
-    adding_third_predecessor = (
-        getattr(draft_model.markov_head, "predecessor_count", 1) == 3
-        and getattr(loaded_model.markov_head, "predecessor_count", 1) < 3
-        and getattr(loaded_model.markov_head, "markov_head_type", "") == "carh"
-    )
-    adding_sampled_prefix_memory = (
-        int(getattr(draft_model.markov_head, "sampled_prefix_memory_rank", 0)) > 0
-        and int(getattr(loaded_model.markov_head, "sampled_prefix_memory_rank", 0)) == 0
-        and getattr(loaded_model.markov_head, "markov_head_type", "") == "carh"
-    )
-    disallowed_missing = [
-        key
-        for key in incompatible.missing_keys
-        if not key.startswith(
-            (
-                "candidate_selector.",
-                "recall_correction.",
-                "target_layer_fusion_weights",
-                "target_layer_fusion_proj.",
-                "prefix_state_mixer.",
-                "block_summary.",
-                "parallel_refiner.",
-            )
-        )
-        and ".local_transition_attention." not in key
-        and not (
-            adding_second_predecessor and key == "markov_head.second_prev_proj.weight"
-        )
-        and not (
-            adding_third_predecessor and key == "markov_head.third_prev_proj.weight"
-        )
-        and not (
-            adding_sampled_prefix_memory
-            and key.startswith("markov_head.sampled_prefix_memory.")
-        )
-    ]
-    if unexpected or disallowed_missing:
-        raise RuntimeError(
-            "Warm-start state is incompatible: "
-            f"missing={disallowed_missing}, unexpected={unexpected}"
-        )
-    if incompatible.missing_keys:
-        print_on_rank0(
-            "Warm start predates optional research modules; initialized the "
-            f"following parameters from scratch: {incompatible.missing_keys}"
-        )
-    if dropped_dynamic_conv:
-        print_on_rank0(
-            "SPSM replacement warm start: discarded DynamicConv-only "
-            f"parameters: {dropped_dynamic_conv}"
-        )
-    if expanded_depth_embeddings:
-        print_on_rank0(
-            "Elastic warm start: expanded depth embeddings for K_max: "
-            f"{expanded_depth_embeddings}"
-        )
 
 
 def _load_parallel_refiner_teacher(

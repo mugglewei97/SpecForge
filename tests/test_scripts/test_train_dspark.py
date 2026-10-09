@@ -13,6 +13,10 @@ import pytest
 
 from specforge.legacy.dspark_training.arguments import parse_args
 from specforge.legacy.dspark_training.config import _apply_dspark_config
+from specforge.legacy.dspark_training.initialization import (
+    prepare_warm_start,
+    resolve_mask_token_id,
+)
 from specforge.legacy.dspark_training.objective import (
     validate_objective_args,
     validate_objective_resume,
@@ -191,3 +195,69 @@ def test_checkpoint_exports_models_relative_to_relocated_module(tmp_path, monkey
     assert json.loads((saved / "config.json").read_text())["architectures"] == [
         "Qwen3DSparkModel"
     ]
+
+
+def test_warm_start_selects_checkpoint_config_and_rejects_resume(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    args = training_args("--init-draft-model-path", str(source))
+    with pytest.raises(FileNotFoundError, match="no model weights"):
+        prepare_warm_start(args)
+    (source / "model.safetensors").touch()
+    prepare_warm_start(args)
+    assert args.draft_config_path == str(source / "config.json")
+    args.resume = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        prepare_warm_start(args)
+    args.resume = False
+    args.output_dir = str(source)
+    with pytest.raises(ValueError, match="different"):
+        prepare_warm_start(args)
+
+
+@pytest.mark.parametrize(
+    "explicit,saved,expected", [(None, 13, 13), (7, 13, 7), (None, None, 9)]
+)
+def test_mask_token_preserves_checkpoint_unless_explicitly_overridden(
+    explicit, saved, expected
+):
+    args = SimpleNamespace(mask_token_id=explicit)
+    model = SimpleNamespace(mask_token_id=saved, config=SimpleNamespace(vocab_size=16))
+    assert (
+        resolve_mask_token_id(args, model, SimpleNamespace(mask_token_id=9)) == expected
+    )
+    args.mask_token_id = 16
+    with pytest.raises(ValueError, match="vocabulary"):
+        resolve_mask_token_id(args, model, SimpleNamespace(mask_token_id=9))
+
+
+def test_example_forwards_post_training_options_without_starting_training(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    # Replace the executable for this subprocess only; capture argv without GPUs.
+    executable = tmp_path / "torchrun"
+    executable.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    executable.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            "examples/run_qwen3_8b_dspark_tv_acceptance.sh",
+            "8",
+            "sdpa",
+            "hf",
+            "--init-draft-model-path",
+            "/checkpoint with spaces",
+            "--num-epochs",
+            "1",
+        ],
+        cwd=root,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    forwarded = result.stdout.splitlines()
+    args = parse_args(forwarded[forwarded.index("scripts/train_dspark.py") + 1 :])
+    assert args.init_draft_model_path == "/checkpoint with spaces"
+    assert args.num_epochs == 1
+    assert args.attention_backend == "sdpa"
