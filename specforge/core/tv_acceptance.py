@@ -1,7 +1,7 @@
-"""TV acceptance-length proxy on fixed draft-sampled candidate prefixes.
+"""TV acceptance-length proxy on ground-truth training-sequence prefixes.
 
-This differentiates the proxy, not the sampling law. It is deliberately not
-an unbiased gradient estimator of true expected speculative acceptance length.
+Reuse the target's single sequence forward for every anchor. The prefix-product
+objective is a teacher-forced proxy, not measured speculative acceptance length.
 """
 
 import math
@@ -55,8 +55,8 @@ def sample_tv_anchors(loss_mask, attention_mask, num_anchors):
 def tv_acceptance_terms(draft_logits, target_logits, valid_mask, temperature=1.0):
     """Additive block terms for [..., K, V] logits on identical prefixes.
 
-    Full-vocabulary softmax at a shared positive temperature is the sampling
-    distribution. An invalid position terminates its block; EOS is included by
+    Full-vocabulary softmax uses a shared positive temperature for both models.
+    An invalid position terminates its block; EOS is included by
     the caller, and subsequent positions are invalid. Empty blocks have zero
     weight. Only target logits are detached; all prefix products retain grad.
     """
@@ -92,67 +92,56 @@ def tv_acceptance_terms(draft_logits, target_logits, valid_mask, temperature=1.0
     )
 
 
-@torch.no_grad()
-def sample_fixed_candidates(model, hidden, first_tokens, valid_mask):
-    """Sample q autoregressively through the vanilla Markov head, once."""
-    blocks, width, _ = hidden.shape
-    sampled = torch.empty_like(valid_mask, dtype=torch.long)
-    size = model.tv_objective_chunk_blocks
-    for start in range(0, blocks, size):
-        stop = min(start + size, blocks)
-        base = model.lm_head(hidden[start:stop])
-        previous = first_tokens[start:stop]
-        for depth in range(width):
-            logits = base[:, depth]
-            head = model.draft_model.markov_head
-            if head is not None:
-                logits = logits + head.compute_step_bias(
-                    previous, hidden[start:stop, depth]
-                )
-            probabilities = torch.softmax(
-                logits.float() / model.tv_sampling_temperature, dim=-1
-            )
-            previous = torch.multinomial(probabilities, 1).squeeze(-1)
-            sampled[start:stop, depth] = previous
-    valid = valid_mask.bool().int().cumprod(-1).bool()
-    eos = torch.zeros_like(valid)
-    for token_id in model.tv_eos_token_ids:
-        eos |= sampled == token_id
-    # EOS itself is a candidate. No position after the first EOS is scored.
-    valid &= (eos.int().cumsum(-1) - eos.int()) == 0
-    previous = torch.cat([first_tokens[:, None], sampled[:, :-1]], dim=-1)
-    return sampled.detach(), previous.detach(), valid
+def teacher_forced_tv_forward(
+    model, input_ids, attention_mask, anchors, hidden, valid_mask, last_hidden_states
+):
+    """Score all blocks using target states and predecessors from the same sequence.
 
-
-def candidate_tv_forward(model, input_ids, attention_mask, anchors, hidden, valid_mask):
-    """DSpark's six-value forward contract with an exact proxy-only loss."""
-    if model.tv_candidate_verifier is None:
-        raise ValueError("tv-acceptance requires a live target candidate verifier")
+    Slot j at anchor s predicts input_ids[s+j+1]. Its Markov predecessor is
+    input_ids[s+j], and its target distribution comes from final hidden row s+j.
+    No token sampling or target transformer forward occurs here or in backward.
+    """
     batch, blocks, width, hidden_size = hidden.shape
-    flat_hidden = hidden.reshape(-1, width, hidden_size)
-    sampled, previous, valid = sample_fixed_candidates(
-        model,
-        flat_hidden.detach(),
-        input_ids.gather(1, anchors).reshape(-1),
-        valid_mask.reshape(-1, width),
-    )
-    # External target forwards and random sampling must NEVER be checkpointed:
-    # backward replays only the deterministic logits/loss calculation below.
-    with torch.no_grad():
-        teacher = (
-            model.tv_candidate_verifier(
-                input_ids,
-                attention_mask,
-                anchors,
-                sampled.reshape(batch, blocks, width),
-                valid.reshape(batch, blocks, width),
-                hidden_size,
-            )
-            .detach()
-            .to(device=hidden.device, dtype=hidden.dtype)
+    if last_hidden_states is None:
+        raise ValueError("tv-acceptance requires target final hidden states")
+    if (
+        input_ids.ndim != 2
+        or input_ids.size(0) != batch
+        or input_ids.size(1) < 1
+        or attention_mask.shape != input_ids.shape
+        or anchors.shape != (batch, blocks)
+        or valid_mask.shape != hidden.shape[:-1]
+        or last_hidden_states.shape != (*input_ids.shape, hidden_size)
+    ):
+        raise ValueError(
+            "teacher-forced TV inputs and target hidden states are misaligned"
         )
-    if teacher.shape != hidden.shape:
-        raise ValueError("candidate verifier returned misaligned final hidden states")
+    flat_hidden = hidden.reshape(-1, width, hidden_size)
+    with torch.no_grad():
+        positions = anchors[..., None] + torch.arange(width, device=input_ids.device)
+        label_positions = positions + 1
+        length = input_ids.size(1)
+        in_bounds = (positions >= 0) & (label_positions < length)
+        safe_positions = positions.clamp(0, length - 1)
+        safe_labels = label_positions.clamp(0, length - 1)
+        rows = torch.arange(batch, device=input_ids.device)[:, None, None]
+        previous = input_ids[rows, safe_positions]
+        labels = input_ids[rows, safe_labels]
+        valid = (
+            valid_mask.bool()
+            & in_bounds
+            & attention_mask[rows, safe_positions].bool()
+            & attention_mask[rows, safe_labels].bool()
+        )
+        eos = torch.zeros_like(valid)
+        for token_id in model.tv_eos_token_ids:
+            eos |= labels == token_id
+        # Include the ground-truth EOS, but never score the following turn.
+        valid &= (eos.int().cumsum(-1) - eos.int()) == 0
+        valid = valid.int().cumprod(-1).bool().reshape(-1, width)
+        teacher = last_hidden_states.detach()[rows, safe_positions].to(
+            device=hidden.device, dtype=hidden.dtype
+        )
 
     def chunk_terms(h, prev, target_h, mask):
         logits = model.lm_head(h)
@@ -169,7 +158,7 @@ def candidate_tv_forward(model, input_ids, attention_mask, anchors, hidden, vali
                 logits,
                 target_logits,
                 mask,
-                model.tv_sampling_temperature,
+                model.tv_temperature,
             )
         )
 
@@ -177,7 +166,7 @@ def candidate_tv_forward(model, input_ids, attention_mask, anchors, hidden, vali
         *checkpointed_chunk_reduce(
             chunk_terms,
             flat_hidden,
-            previous,
+            previous.reshape(-1, width),
             teacher.reshape_as(flat_hidden),
             valid,
             chunk_size=model.tv_objective_chunk_blocks,
@@ -206,7 +195,7 @@ def reduce_tv_terms(terms: TVAcceptanceTerms):
         dist.all_reduce(positions)
     global_loss, global_length, global_count = scalars.unbind(0)
     if global_count.item() <= 0:
-        raise ValueError("tv-acceptance has no valid candidate blocks on any rank")
+        raise ValueError("tv-acceptance has no valid blocks on any rank")
     # FSDP averages rank gradients: compensate to weight every nonempty block
     # equally. The same reduced count also normalizes the detached telemetry.
     loss = world * terms.loss_sum / global_count
@@ -230,14 +219,12 @@ def reduce_tv_terms(terms: TVAcceptanceTerms):
     )
 
 
-def configure_tv_acceptance(
-    model, *, temperature, chunk_blocks, verifier, eos_token_ids
-):
+def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
     """Enable the pure objective before FSDP/optimizer creation.
 
     Initial support is the user's vanilla Markov DSpark configuration (or no
     Markov head). Experimental recurrent, selector and refiner heads have
-    different proposal laws and must not silently use this sampler.
+    different conditioning rules and need their own objective integration.
     """
     if not math.isfinite(temperature) or temperature <= 0 or chunk_blocks < 1:
         raise ValueError("temperature must be finite and > 0; chunk_blocks must be > 0")
@@ -260,8 +247,7 @@ def configure_tv_acceptance(
     if confidence is not None:
         confidence.requires_grad_(False)
     model.lm_head.requires_grad_(False)
-    model.tv_sampling_temperature = float(temperature)
+    model.tv_temperature = float(temperature)
     model.tv_objective_chunk_blocks = int(chunk_blocks)
-    model.tv_candidate_verifier = verifier
     model.tv_eos_token_ids = tuple(eos_token_ids)
     model.tv_acceptance_enabled = True

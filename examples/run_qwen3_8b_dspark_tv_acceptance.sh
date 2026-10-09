@@ -34,7 +34,6 @@ exec torchrun --standalone --nproc_per_node "$NUM_GPUS" scripts/train_dspark.py 
     --build-dataset-num-proc 32 \
     --sglang-mem-fraction-static 0.3 \
     --dspark-loss-type tv-acceptance \
-    --tv-sampling-temperature 1.0 \
+    --tv-temperature 1.0 \
     --tv-objective-chunk-blocks 8 \
-    --tv-verification-batch-size 4 \
     "$@"

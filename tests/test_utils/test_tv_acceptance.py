@@ -1,6 +1,5 @@
 """CPU formula, prefix alignment, checkpoint and real DSpark gradient tests."""
 
-import copy
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,13 +9,11 @@ import torch
 from torch import nn
 
 from specforge.core.tv_acceptance import (
-    candidate_tv_forward,
     configure_tv_acceptance,
-    sample_fixed_candidates,
     sample_tv_anchors,
+    teacher_forced_tv_forward,
     tv_acceptance_terms,
 )
-from specforge.inference.target_engine.candidate_verifier import CandidatePrefixVerifier
 
 
 def test_formula_and_single_token_tv():
@@ -93,7 +90,7 @@ def test_gradcheck_and_all_prefix_credit_matches_naive_reference():
 
 
 @pytest.mark.parametrize("temperature", [0, -1, float("nan"), float("inf")])
-def test_invalid_sampling_temperature(temperature):
+def test_invalid_temperature(temperature):
     with pytest.raises(ValueError, match="temperature"):
         tv_acceptance_terms(
             torch.zeros(1, 1, 2), torch.zeros(1, 1, 2), torch.ones(1, 1), temperature
@@ -115,52 +112,19 @@ class RecordingTarget:
         self.hidden_size = hidden_size
         self.requests = []
 
+    @torch.no_grad()
     def generate_dflash_data(self, input_ids, attention_mask, loss_mask):
         assert not torch.is_grad_enabled()
         self.requests.extend(
             [row[mask.bool()].tolist() for row, mask in zip(input_ids, attention_mask)]
         )
-        # Causal state depends on every token in the ACTUAL prefix.
-        state = (input_ids * attention_mask).double().cumsum(-1)[..., None]
+        # Distinct causal states expose incorrect sequence-position alignment.
+        state = (input_ids * attention_mask).float().cumsum(-1)[..., None] / 10
+        states = state * torch.linspace(-1, 1, self.hidden_size)
         return SimpleNamespace(
-            last_hidden_states=state.expand(-1, -1, self.hidden_size)
+            hidden_states=states,
+            last_hidden_states=states,
         )
-
-
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_verifier_replaces_gold_prefix_independently_and_aligns_prediction_rows(
-    batch_size,
-):
-    target = RecordingTarget(2)
-    verifier = CandidatePrefixVerifier(target, batch_size=batch_size, pad_token_id=99)
-    ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
-    anchors = torch.tensor([[1, 2, 4]])
-    proposals = torch.tensor([[[9, 8, 7], [6, 5, 4], [3, 2, 1]]])
-    mask = torch.tensor([[[1, 1, 1], [1, 1, 0], [0, 0, 0]]]).bool()
-    result = verifier(ids, torch.ones_like(ids), anchors, proposals, mask, 2)
-    assert target.requests == [[1, 2, 9, 8], [1, 2, 3, 6]]
-    assert result[0, 0, :, 0].tolist() == [3, 12, 20]
-    assert result[0, 1, :, 0].tolist() == [6, 12, 0]
-    assert result[0, 2].count_nonzero() == 0
-
-
-def test_verifier_rejects_missing_hidden_and_left_padding():
-    target = SimpleNamespace(
-        generate_dflash_data=lambda *args: SimpleNamespace(last_hidden_states=None)
-    )
-    verifier = CandidatePrefixVerifier(target)
-    args = (
-        torch.tensor([[1, 2, 3]]),
-        torch.ones(1, 3).long(),
-        torch.tensor([[1]]),
-        torch.tensor([[[4]]]),
-        torch.ones(1, 1, 1).bool(),
-        2,
-    )
-    with pytest.raises(ValueError, match="final hidden"):
-        verifier(*args)
-    with pytest.raises(ValueError, match="right-padded"):
-        verifier(args[0], torch.tensor([[0, 1, 1]]), *args[2:])
 
 
 def make_model():
@@ -200,97 +164,144 @@ def make_model():
         model,
         temperature=0.8,
         chunk_blocks=1,
-        verifier=CandidatePrefixVerifier(target, 2),
         eos_token_ids=[],
     )
     return model, target
 
 
-def test_sampling_uses_sampled_predecessors_and_truncates_after_eos():
+def test_ground_truth_predecessors_eos_padding_and_partial_tail():
     model, _ = make_model()
-    hidden = torch.randn(2, 3, 16)
-    first = torch.tensor([3, 4])
-    model.tv_objective_chunk_blocks = 2
+    hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
+    ids = torch.tensor([[1, 2, 7, 4, 5, 6], [8, 9, 10, 11, 0, 0]])
+    attention = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]])
+    anchors = torch.tensor([[0, 4], [1, 3]])
+    model.tv_objective_chunk_blocks = 4
     model.tv_eos_token_ids = (7,)
-    draws = [
-        torch.tensor([[7], [5]]),
-        torch.tensor([[8], [7]]),
-        torch.tensor([[6], [9]]),
-    ]
     head = model.draft_model.markov_head
     with (
-        patch("torch.multinomial", side_effect=draws),
-        patch.object(head, "compute_step_bias", wraps=head.compute_step_bias) as spy,
+        patch("torch.multinomial", side_effect=AssertionError("must not sample")),
+        patch.object(head, "apply_block_logits", wraps=head.apply_block_logits) as spy,
     ):
-        sampled, prev, mask = sample_fixed_candidates(
-            model, hidden, first, torch.ones(2, 3)
+        result = teacher_forced_tv_forward(
+            model,
+            ids,
+            attention,
+            anchors,
+            hidden,
+            torch.ones(2, 2, 3),
+            torch.randn(2, 6, 16),
         )
-    assert sampled.tolist() == [[7, 8, 6], [5, 7, 9]]
-    assert prev.tolist() == [[3, 7, 8], [4, 5, 7]]
-    assert mask.tolist() == [[True, False, False], [True, True, False]]
-    assert [c.args[0].tolist() for c in spy.call_args_list] == [[3, 4], [7, 5], [8, 7]]
-    assert not sampled.requires_grad
+        assert spy.call_args.kwargs["token_ids"].tolist() == [
+            [1, 2, 7],
+            [5, 6, 6],
+            [9, 10, 11],
+            [11, 0, 0],
+        ]
+        result[0].backward()
+    # EOS counts at slot 1 of block 0. Tail and right padding truncate blocks.
+    assert result[4].tolist() == [3, 2, 0]
+    assert result[5]["tv_valid_blocks"].item() == 3
+    assert hidden.grad[0, 0, 2].count_nonzero() == 0
+    assert hidden.grad[0, 1, 1:].count_nonzero() == 0
+    assert hidden.grad[1, 1].count_nonzero() == 0
 
 
-def test_checkpoint_replay_matches_fixed_candidate_reference_and_never_rescores():
+@pytest.mark.parametrize("chunk_size", [1, 2, 16])
+@pytest.mark.parametrize("with_markov", [False, True])
+def test_checkpoint_replay_matches_teacher_forced_reference(chunk_size, with_markov):
     torch.manual_seed(21)
     model, target = make_model()
-    hidden = torch.randn(1, 2, 3, 16, requires_grad=True)
-    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7]])
-    anchors = torch.tensor([[1, 3]])
-    valid = torch.tensor([[[1, 1, 1], [1, 1, 0]]]).bool()
-    sampled = torch.tensor([[8, 9, 10], [11, 12, 13]])
-    previous = torch.tensor([[2, 8, 9], [4, 11, 12]])
-    with patch(
-        "specforge.core.tv_acceptance.sample_fixed_candidates",
-        return_value=(sampled, previous, valid.reshape(2, 3)),
-    ) as sample:
-        result = candidate_tv_forward(
-            model, ids, torch.ones_like(ids), anchors, hidden, valid
+    model.tv_objective_chunk_blocks = chunk_size
+    if not with_markov:
+        model.draft_model.markov_head = None
+    else:
+        # Nonzero head weights ensure the loss detects wrong predecessor tokens.
+        with torch.no_grad():
+            model.draft_model.markov_head.markov_w2.weight.normal_(std=0.1)
+    hidden = torch.randn(2, 2, 3, 16, requires_grad=True)
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7], [8, 7, 6, 5, 4, 3, 2]])
+    anchors = torch.tensor([[1, 3], [0, 2]])
+    valid = torch.tensor([[[1, 1, 1], [1, 1, 0]], [[1, 0, 0], [1, 1, 1]]]).bool()
+    teacher_states = target.generate_dflash_data(
+        ids, torch.ones_like(ids), torch.ones_like(ids)
+    ).last_hidden_states.requires_grad_()
+    with patch("torch.multinomial", side_effect=AssertionError("must not sample")):
+        result = teacher_forced_tv_forward(
+            model, ids, torch.ones_like(ids), anchors, hidden, valid, teacher_states
         )
-        requests_before_backward = copy.deepcopy(target.requests)
         result[0].backward()
-        sample.assert_called_once()
-    assert target.requests == requests_before_backward
+    assert target.requests == ids.tolist()
     grad = hidden.grad.clone()
-    markov_grad = model.draft_model.markov_head.markov_w2.weight.grad.clone()
+    head = model.draft_model.markov_head
+    markov_grad = head.markov_w2.weight.grad.clone() if with_markov else None
     model.zero_grad()
     reference_hidden = hidden.detach().clone().requires_grad_()
-    teacher = model.tv_candidate_verifier(
-        ids, torch.ones_like(ids), anchors, sampled.reshape(1, 2, 3), valid, 16
-    )
-    logits = model.draft_model.markov_head.apply_block_logits(
-        model.lm_head(reference_hidden),
-        token_ids=previous.reshape(1, 2, 3),
-        hidden_states=reference_hidden,
-    )
-    terms = tv_acceptance_terms(logits, model.lm_head(teacher.float()), valid, 0.8)
-    reference = terms.loss_sum / terms.block_count
+    # Independent per-block reference using plain sequence slices, not gather.
+    reference = hidden.new_zeros(())
+    for b in range(2):
+        for block, s in enumerate(anchors[b].tolist()):
+            h = reference_hidden[b, block : block + 1]
+            logits = model.lm_head(h)
+            if with_markov:
+                logits = head.apply_block_logits(
+                    logits, token_ids=ids[b : b + 1, s : s + 3], hidden_states=h
+                )
+            target_logits = model.lm_head(teacher_states[b : b + 1, s : s + 3])
+            terms = tv_acceptance_terms(
+                logits, target_logits, valid[b, block : block + 1], 0.8
+            )
+            reference = reference + terms.loss_sum / 4
     reference.backward()
     torch.testing.assert_close(result[0], reference)
     torch.testing.assert_close(grad, reference_hidden.grad)
-    torch.testing.assert_close(
-        markov_grad, model.draft_model.markov_head.markov_w2.weight.grad
-    )
+    if with_markov:
+        torch.testing.assert_close(markov_grad, head.markov_w2.weight.grad)
     assert model.lm_head.weight.grad is None
+    assert teacher_states.grad is None
 
 
-def test_real_dspark_forward_backward_uses_new_loss_without_gold_teacher_states():
+def test_real_training_batch_uses_one_target_forward_and_no_sampling():
+    from specforge.legacy.dspark_training.trainer import _forward_dspark_data_batch
+
     torch.manual_seed(31)
     model, target = make_model()
     ids = torch.randint(0, 15, (2, 12))
-    result = model(
+    data = dict(
         input_ids=ids,
-        hidden_states=torch.randn(2, 12, 16),
-        loss_mask=torch.ones(2, 12),
         attention_mask=torch.ones_like(ids),
+        loss_mask=torch.ones(2, 12),
+        sample_id=torch.arange(2),
+        source_id=torch.zeros(2),
     )
+    args = SimpleNamespace(
+        seed=42,
+        multi_teacher_oracle_export_dir=None,
+        multi_teacher_oracle_cache=None,
+        step_seeded_rollouts=False,
+    )
+    with (
+        patch("torch.multinomial", side_effect=AssertionError("must not sample")),
+        patch("specforge.legacy.dspark_training.trainer.dist.get_rank", return_value=0),
+        patch.object(
+            target, "generate_dflash_data", wraps=target.generate_dflash_data
+        ) as capture,
+    ):
+        result = _forward_dspark_data_batch(
+            data,
+            args,
+            torch.device("cpu"),
+            target,
+            model,
+            True,
+            1,
+        )
+        result[0].backward()
+        capture.assert_called_once()
     assert len(result) == 6
     loss, _, _, _, _, metrics = result
     assert 0 <= loss.item() <= 1
     torch.testing.assert_close(loss.detach(), metrics["tv_acceptance_loss"])
-    assert target.requests
-    loss.backward()
+    assert target.requests == ids.tolist()
     assert any(
         p.grad is not None and p.grad.abs().sum() > 0
         for p in model.draft_model.layers.parameters()
@@ -326,8 +337,8 @@ def test_distributed_gradient_scaling_uses_global_block_count(empty_rank):
     valid = torch.tensor([[[1, 1, 1], [1, 1, 0]]]).bool()
     if empty_rank:
         valid.zero_()
-    sampled = torch.tensor([[8, 9, 10], [11, 12, 13]])
-    previous = torch.tensor([[2, 8, 9], [4, 11, 12]])
+    teacher_states = torch.randn(1, 7, 16)
+    previous = torch.tensor([[[2, 3, 4], [4, 5, 6]]])
     global_blocks = 1 if empty_rank else 3
     calls = []
 
@@ -337,24 +348,18 @@ def test_distributed_gradient_scaling_uses_global_block_count(empty_rank):
             tensor[2] = global_blocks
 
     with (
-        patch(
-            "specforge.core.tv_acceptance.sample_fixed_candidates",
-            return_value=(sampled, previous, valid.reshape(2, 3)),
-        ),
         patch("specforge.core.tv_acceptance.dist.is_initialized", return_value=True),
         patch("specforge.core.tv_acceptance.dist.get_world_size", return_value=2),
         patch("specforge.core.tv_acceptance.dist.all_reduce", side_effect=all_reduce),
     ):
-        loss = candidate_tv_forward(
-            model, ids, torch.ones_like(ids), anchors, hidden, valid
+        loss = teacher_forced_tv_forward(
+            model, ids, torch.ones_like(ids), anchors, hidden, valid, teacher_states
         )[0]
         loss.backward()
     assert calls == [(3,), (3, 3)]
     actual = hidden.grad.clone()
     hidden.grad = None
-    teacher = model.tv_candidate_verifier(
-        ids, torch.ones_like(ids), anchors, sampled.reshape(1, 2, 3), valid, 16
-    )
+    teacher = torch.stack([teacher_states[:, 1:4], teacher_states[:, 3:6]], dim=1)
     logits = model.draft_model.markov_head.apply_block_logits(
         model.lm_head(hidden),
         token_ids=previous.reshape(1, 2, 3),
@@ -369,14 +374,15 @@ def test_distributed_gradient_scaling_uses_global_block_count(empty_rank):
 
 def test_all_empty_ranks_and_unsupported_head_fail_explicitly():
     model, _ = make_model()
-    with pytest.raises(ValueError, match="no valid candidate blocks"):
-        candidate_tv_forward(
+    with pytest.raises(ValueError, match="no valid blocks"):
+        teacher_forced_tv_forward(
             model,
             torch.tensor([[1, 2, 3]]),
             torch.ones(1, 3).long(),
             torch.tensor([[0]]),
             torch.randn(1, 1, 2, 16),
             torch.zeros(1, 1, 2),
+            torch.randn(1, 3, 16),
         )
     model.draft_model.markov_head.markov_head_type = "carh"
     with pytest.raises(ValueError, match="vanilla"):
@@ -384,8 +390,23 @@ def test_all_empty_ranks_and_unsupported_head_fail_explicitly():
             model,
             temperature=1,
             chunk_blocks=1,
-            verifier=model.tv_candidate_verifier,
             eos_token_ids=[],
+        )
+
+
+@pytest.mark.parametrize("target_shape", [None, (1, 2, 16), (1, 3, 8)])
+def test_teacher_forced_tv_requires_aligned_target_states(target_shape):
+    model, _ = make_model()
+    states = torch.randn(target_shape) if target_shape else None
+    with pytest.raises(ValueError, match="hidden states"):
+        teacher_forced_tv_forward(
+            model,
+            torch.tensor([[1, 2, 3]]),
+            torch.ones(1, 3),
+            torch.tensor([[0]]),
+            torch.randn(1, 1, 2, 16),
+            torch.ones(1, 1, 2),
+            states,
         )
 
 
@@ -398,10 +419,11 @@ def test_anchor_sampler_keeps_partial_tail_and_empty_rank_placeholder():
     assert anchors.tolist() == [[3], [0]]
     assert keep.tolist() == [[True], [False]]
     model, _ = make_model()
-    with pytest.raises(ValueError, match="no valid candidate blocks"):
+    with pytest.raises(ValueError, match="no valid blocks"):
         model(
             input_ids=torch.ones(1, 8).long(),
             hidden_states=torch.randn(1, 8, 16),
+            last_hidden_states=torch.randn(1, 8, 16),
             loss_mask=torch.zeros(1, 8),
             attention_mask=torch.ones(1, 8).long(),
         )
@@ -467,6 +489,7 @@ def test_checkpoint_post_training_preserves_weights_and_takes_tv_step(
     loss, *_ = model(
         input_ids=ids,
         hidden_states=torch.randn(1, 12, 16),
+        last_hidden_states=torch.randn(1, 12, 16),
         loss_mask=torch.ones(1, 12),
         attention_mask=torch.ones_like(ids),
     )

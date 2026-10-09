@@ -5895,7 +5895,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ``[B, S, len(target_layer_ids)*hidden]`` (the draft model applies its
         ``fc``/``hidden_norm`` internally). ``last_hidden_states`` is the target
         model's final hidden state ``[B, S, hidden]`` (needed by distributional
-        L1, confidence, and offline acceptance-aligned objectives).
+        L1, confidence, teacher-forced TV, and offline acceptance objectives).
 
         Returns ``(loss, accuracy, loss_per_position, acc_per_position,
         count_per_position, loss_components)``. ``loss`` is the configured
@@ -6029,11 +6029,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_before_summary = hidden_4d
         hidden_4d = self.draft_model.apply_block_summary(hidden_4d)
         if getattr(self, "tv_acceptance_enabled", False):
-            from specforge.core.tv_acceptance import candidate_tv_forward
+            from specforge.core.tv_acceptance import teacher_forced_tv_forward
 
-            return candidate_tv_forward(
-                self, input_ids, attention_mask, anchor_positions, hidden_4d,
+            return teacher_forced_tv_forward(
+                self,
+                input_ids,
+                attention_mask,
+                anchor_positions,
+                hidden_4d,
                 eval_bool,
+                last_hidden_states,
             )
         reference_num = reference_cosine_num = reference_mse_num = reference_ratio_num = local_den.new_zeros(())
         if self.carh_reference_calibration_alpha > 0:

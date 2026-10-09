@@ -151,10 +151,11 @@ def _forward_dspark_data_batch(
         last_hidden_states = last_hidden_states.to(device, non_blocking=True)
     elif needs_target_hidden:
         raise RuntimeError(
-            "DSpark L1/confidence losses are enabled but the target backend "
+            "The selected DSpark objective requires target final hidden states, "
+            "but the target backend "
             f"({args.target_model_backend}) did not surface last_hidden_states. "
-            "Use --target-model-backend hf, or run CE-only with "
-            "--l1-loss-alpha 0 --no-confidence-head."
+            "Use a backend that returns final hidden states, such as "
+            "--target-model-backend hf."
         )
     if args.step_seeded_rollouts:
         torch.manual_seed(rollout_seed)
@@ -260,7 +261,8 @@ def run_training(args):
     device_type = device.type
 
     needs_target_hidden = (
-        (args.offline_acceptance_objective != "none")
+        (args.dspark_loss_type == "tv-acceptance")
+        or (args.offline_acceptance_objective != "none")
         or (args.bv_loss_alpha > 0)
         or (args.carh_predecessor_diagnostics_interval > 0)
         or (args.l1_loss_alpha > 0)
@@ -831,7 +833,7 @@ def run_training(args):
         value_clip=args.multi_teacher_oracle_value_clip,
         loss_budget=args.multi_teacher_oracle_loss_budget,
     )
-    configure_objective(dspark_model, target_model, tokenizer, args)
+    configure_objective(dspark_model, tokenizer, args)
 
     trajectory_writer = None
     if args.multi_teacher_oracle_export_dir:

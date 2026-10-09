@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""Train DSpark with the legacy CE/L1 or sampled-prefix TV acceptance objective."""
+"""Train DSpark with the legacy CE/L1 or teacher-forced TV acceptance objective."""
 
 from specforge.legacy.dspark_training.arguments import parse_args
 

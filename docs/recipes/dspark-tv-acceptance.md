@@ -1,4 +1,4 @@
-# DSpark TV 接收长度代理目标
+# DSpark ground-truth 前缀 TV 接收长度代理目标
 
 使用恢复的 `scripts/train_dspark.py` 入口：
 
@@ -12,9 +12,8 @@ block size 7 和 512 anchors，输出到独立的 `qwen3-8b-dspark-tv-acceptance
 
 ```bash
 --dspark-loss-type tv-acceptance \
---tv-sampling-temperature 1.0 \
---tv-objective-chunk-blocks 8 \
---tv-verification-batch-size 4
+--tv-temperature 1.0 \
+--tv-objective-chunk-blocks 8
 ```
 
 ## 从已有 DSpark checkpoint 后训练
@@ -46,7 +45,8 @@ bash examples/run_qwen3_8b_dspark_tv_acceptance.sh 8 flex_attention sglang \
 
 ## 数学与前缀语义
 
-在实际 draft 候选前缀下，使用完整词表分布
+在 target 生成的训练序列上随机选取 anchors。每个 block 使用该序列的
+ground-truth 前缀，不采样新的 draft token。使用完整词表分布
 `p = softmax(target_logits / T)`、`q = softmax(draft_logits / T)`，
 `a_i = 1 - 0.5 * sum_v |p_iv - q_iv|`，计算
 
@@ -59,17 +59,22 @@ loss = sum_valid_blocks L_block / number_of_valid_blocks
 实现借鉴 [D-PACE](https://arxiv.org/abs/2605.18810) 的前缀连乘信用分配思想，
 以 TV 分布重叠替换 gold-token confidence，并直接反传整个连乘表达式。
 它没有 detached position weights、额外 PACE smoothing 或 log-loss 替换。
-固定采样 token 后求这个代理目标的梯度，不包含采样分布的 score-function 项，
-不声称是真实期望接收长度的无偏梯度。
+这是训练数据路径上的接收长度代理目标，不声称是真实推理期望接收长度
+的无偏估计。保留原有 block 连乘公式，不改成逐 token TV 的简单平均。
 
-每个 anchor 单独构造原上下文和候选序列：对于 anchor `s` 和有效长度 `K`，
-target 输入为 `input_ids[:s+1] + sampled_tokens[:K-1]`；
-最终 hidden state 的 `s..s+K-1` 行预测这 K 个候选。
-不同 block 相互独立。原始答案后缀的 hidden states 不用于这个目标。
-draft 的 vanilla Markov head 使用上一步实际采样 token，采样与损失均使用相同温度。
+target 对原始 batch 只 forward 一次，所有 anchors 复用其 hidden states。
+对于 anchor `s`，block 槽位 `j=0..K-1` 的对齐关系为：
 
-首个无效 mask 位置截断 block；EOS 本身计入，EOS 后续位置不计入。
-`K` 是截断后的有效候选数，空 block 不计入均值。
+- 预测 token：`input_ids[s+j+1]`。
+- Markov head 前驱：ground-truth `input_ids[s+j]`。
+- target 分布：原始序列的 `last_hidden_states[s+j]` 经冻结的 LM head 得到。
+
+draft 的预测与 ground truth 不一致时也不替换前驱；差异由 TV loss 惩罚。
+target 的最终 hidden states 已经经过模型的 final norm，不重复归一化。
+代码按 block 分块投影词表 logits，避免一次保留所有位置的完整词表分布。
+
+首个无效 mask、padding 或序列尾部截断 block；ground-truth EOS 本身计入，
+EOS 后续位置不计入。`K` 是截断后的有效预测位置数，空 block 不计入均值。
 不包含 target 的额外 bonus token。FP16/BF16 的 softmax、TV 和连乘使用 FP32。
 
 ## 实现范围与开销
@@ -78,24 +83,30 @@ draft 的 vanilla Markov head 使用上一步实际采样 token，采样与损�
   `--loss-decay-gamma`、CE/L1/confidence 权重和 PACE 权重不参与新 loss。
   confidence head 冻结，target 始终不接收梯度。
 - 当前支持给定配置的 vanilla Markov head（或关闭 Markov），`T > 0`，
-  全词表采样；不包含 greedy、top-k、top-p 或实验性 CARH/selector/refiner。
+  全词表 softmax；不包含实验性 CARH/selector/refiner。
 - 当前要求 `--tp-size 1`、`--accumulation-steps 1`、`--micro-batch-size 0`。
   支持 torchrun/FSDP 数据并行，按所有 rank 的有效 block 总数归一化。
   全部 rank 都没有有效 block 时明确报错。
-- sampling 和 target capture 在 checkpoint 之外执行一次，反向只重算
-  确定性的 logits/loss。`--tv-objective-chunk-blocks` 控制词表张量峰值；
-  `--tv-verification-batch-size` 控制 target 重算批量。
-- 每个有效 anchor 需要独立 target prefill。batch 4、512 anchors 最多产生
-  2048 个验证请求/rank/step，代价明显高于 teacher forcing；chunk 仅限制峰值，
-  不减少这些请求。首次远程验证可以用更少 anchors 和 `--max-steps` 做 smoke test。
+- target capture 在 checkpoint 之外执行一次，反向只重算确定性的 logits/loss。
+  `--tv-objective-chunk-blocks` 控制词表张量峰值，显存允许时可测试 32/64
+  以减少小批量调用。它不改变代理目标，可以在同一模式下 resume 时调整。
+- batch 4、512 anchors 仍只需要原始 4 条训练序列的一次 target 批量 forward，
+  不再产生额外 2048 个候选验证请求。draft 的 block 计算和完整词表 TV
+  仍有开销，实际吞吐需在服务器测量。
+- `--tv-temperature` 是 target/draft 的共同 softmax 温度；旧参数
+  `--tv-sampling-temperature` 作为别名保留，但不再进行采样。
+  `--tv-verification-batch-size` 为兼容旧命令继续接受，启动时提示已忽略。
 
 日志：`tv_acceptance_loss`、`tv_acceptance_length_proxy`、`tv_mean_overlap`、
 `tv_valid_blocks`、`tv_mean_valid_length`。代理长度不是 SGLang 实测接收长度。
-原有 `accuracy` 日志在此模式表示候选前缀上 draft/target 的 argmax 一致率；
+原有 `accuracy` 日志在此模式表示 ground-truth 前缀上 draft/target 的 argmax 一致率；
 position loss 是对应位置的 TV。
 
-改变 objective 或采样配置不能静默恢复 optimizer 状态。
-从旧 checkpoint 切换 loss 应使用 `--init-draft-model-path`，开始新的训练目录。
+改变 objective 或 TV 温度不能静默恢复 optimizer 状态。新 checkpoint 的
+训练参数保存 `tv_prefix_mode=teacher-forced`；旧的 sampled-prefix TV
+checkpoint（没有这个标记）不能直接 `--resume` 到新语义。
+从旧 CE/L1 或 sampled-prefix TV checkpoint 切换时使用
+`--init-draft-model-path`，开始新的训练目录和 optimizer/scheduler。
 
 ## 源码兼容与验证
 
@@ -111,8 +122,8 @@ SGLang in-process backend 也来自 AQ；远程需要其对应的 SGLang 环境�
 - `scripts/train_dspark.py`：解析参数并启动训练；`--help` 不加载 GPU 训练依赖。
 - `specforge/legacy/dspark_training/`：参数声明、配置合并、模型/数据构建、
   checkpoint 导出与训练循环；`objective.py` 集中处理 TV 参数、resume 检查和启用逻辑。
-- `specforge/core/tv_acceptance.py`：候选采样、TV 公式、checkpoint 分块和全局归约。
-- `specforge/inference/target_engine/candidate_verifier.py`：独立前缀构造、批量 target 验证和 hidden 对齐。
+- `specforge/core/tv_acceptance.py`：ground-truth 前驱与 target hidden 对齐、
+  TV 公式、checkpoint 分块和全局归约。
 
 CPU 测试：
 
@@ -121,5 +132,7 @@ python -m pytest -q tests/test_utils/test_tv_acceptance.py tests/test_scripts/te
 ```
 
 覆盖公式、梯度有限差分、空 block、mask 截断、EOS、温度、低精度，
-候选前缀和 target hidden 对齐，checkpoint 重算一致性，以及真实小型 DSpark
-的前向反向。远程 8 卡 FSDP/SGLang 吞吐和显存仍需服务器 smoke test。
+多 batch/anchor 的 target hidden 对齐、真实前驱、checkpoint 梯度一致性，
+以及真实小型 DSpark 的前向反向。训练 batch 测试检查 target 只调用一次、
+反向不重跑 target、前后向都不采样 token。远程 8 卡 FSDP/SGLang 吞吐和显存
+仍需服务器 smoke test。

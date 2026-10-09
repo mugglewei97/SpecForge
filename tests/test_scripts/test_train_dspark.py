@@ -58,6 +58,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         check=True,
     )
     assert "--tv-sampling-temperature" in result.stdout
+    assert "--tv-temperature" in result.stdout
     assert "--sglang-mem-fraction-static" in result.stdout
 
 
@@ -83,7 +84,22 @@ def test_training_cli_and_objective_defaults_remain_compatible():
     assert (args.block_size, args.num_anchors, args.batch_size) == (7, 512, 4)
     assert args.tv_sampling_temperature == 1.0
     assert args.tv_objective_chunk_blocks == 8
-    assert args.tv_verification_batch_size == 4
+    assert args.tv_verification_batch_size is None
+    assert args.tv_prefix_mode == "teacher-forced"
+
+
+@pytest.mark.parametrize("flag", ["--tv-temperature", "--tv-sampling-temperature"])
+def test_temperature_alias_and_obsolete_verification_option(flag):
+    args = training_args(
+        "--dspark-loss-type",
+        "tv-acceptance",
+        flag,
+        "0.7",
+        "--tv-verification-batch-size",
+        "4",
+    )
+    validate_objective_args(args)
+    assert args.tv_sampling_temperature == 0.7
 
 
 @pytest.mark.parametrize(
@@ -92,7 +108,7 @@ def test_training_cli_and_objective_defaults_remain_compatible():
         ("--tv-sampling-temperature", "nan", "temperature"),
         ("--tv-sampling-temperature", "0", "temperature"),
         ("--tv-objective-chunk-blocks", "0", "chunk"),
-        ("--tv-verification-batch-size", "-1", "chunk"),
+        ("--tv-temperature", "-1", "temperature"),
         ("--tp-size", "2", "tp-size"),
         ("--accumulation-steps", "2", "normalization"),
         ("--micro-batch-size", "1", "normalization"),
@@ -114,11 +130,23 @@ def test_resume_accepts_saved_args_and_rejects_objective_changes(as_namespace):
     for key, value in (
         ("dspark_loss_type", "ce-l1"),
         ("tv_sampling_temperature", 0.7),
-        ("tv_objective_chunk_blocks", 2),
-        ("tv_verification_batch_size", 2),
+        ("tv_prefix_mode", "sampled"),
     ):
         with pytest.raises(ValueError, match=key):
             validate_objective_resume(wrap({**saved, key: value}), args)
+    saved.pop("tv_prefix_mode")
+    with pytest.raises(ValueError, match="tv_prefix_mode"):
+        validate_objective_resume(wrap(saved), args)
+
+
+def test_teacher_forced_resume_allows_memory_tuning():
+    args = training_args("--dspark-loss-type", "tv-acceptance")
+    saved = {
+        **vars(args),
+        "tv_objective_chunk_blocks": 32,
+        "tv_verification_batch_size": 4,
+    }
+    validate_objective_resume(saved, args)
 
 
 def test_config_preserves_checkpoint_values_and_explicit_cli_overrides():

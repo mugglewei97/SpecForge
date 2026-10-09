@@ -7,26 +7,39 @@ OBJECTIVE_DEFAULTS = {
     "dspark_loss_type": "ce-l1",
     "tv_sampling_temperature": 1.0,
     "tv_objective_chunk_blocks": 8,
-    "tv_verification_batch_size": 4,
 }
+TV_PREFIX_MODE = "teacher-forced"
 
 
 def add_objective_args(group):
+    # Saved with training args to distinguish old sampled-prefix checkpoints.
+    group.set_defaults(tv_prefix_mode=TV_PREFIX_MODE)
     group.add_argument(
         "--dspark-loss-type",
         choices=["ce-l1", "tv-acceptance"],
         default=OBJECTIVE_DEFAULTS["dspark_loss_type"],
-        help="tv-acceptance: normalized accepted-length proxy on draft-sampled prefixes.",
+        help="tv-acceptance: accepted-length proxy on ground-truth prefixes; reuse one target forward.",
     )
-    for name in (
-        "tv_sampling_temperature",
-        "tv_objective_chunk_blocks",
-        "tv_verification_batch_size",
-    ):
-        default = OBJECTIVE_DEFAULTS[name]
-        group.add_argument(
-            "--" + name.replace("_", "-"), type=type(default), default=default
-        )
+    group.add_argument(
+        "--tv-temperature",
+        "--tv-sampling-temperature",
+        dest="tv_sampling_temperature",
+        type=float,
+        default=OBJECTIVE_DEFAULTS["tv_sampling_temperature"],
+        help="Shared target/draft softmax temperature. The old sampling name is an alias; no tokens are sampled.",
+    )
+    group.add_argument(
+        "--tv-objective-chunk-blocks",
+        type=int,
+        default=OBJECTIVE_DEFAULTS["tv_objective_chunk_blocks"],
+        help="Blocks per checkpointed vocabulary-loss chunk; bounds peak memory.",
+    )
+    group.add_argument(
+        "--tv-verification-batch-size",
+        type=int,
+        default=None,
+        help="Deprecated and ignored: teacher-forced TV does not run candidate verification.",
+    )
 
 
 def validate_objective_args(args):
@@ -36,9 +49,9 @@ def validate_objective_args(args):
         not math.isfinite(args.tv_sampling_temperature)
         or args.tv_sampling_temperature <= 0
     ):
-        raise ValueError("--tv-sampling-temperature must be finite and positive")
-    if min(args.tv_objective_chunk_blocks, args.tv_verification_batch_size) < 1:
-        raise ValueError("TV objective and verification chunk sizes must be positive")
+        raise ValueError("--tv-temperature must be finite and positive")
+    if args.tv_objective_chunk_blocks < 1:
+        raise ValueError("TV objective chunk size must be positive")
     if args.tp_size != 1:
         raise ValueError("tv-acceptance currently requires --tp-size 1")
     if args.accumulation_steps != 1 or args.micro_batch_size:
@@ -63,7 +76,20 @@ def validate_objective_args(args):
 
 def validate_objective_resume(saved_args, args):
     saved = saved_args if isinstance(saved_args, Mapping) else vars(saved_args)
-    for name, default in OBJECTIVE_DEFAULTS.items():
+    if (
+        args.dspark_loss_type == "tv-acceptance"
+        and saved.get("dspark_loss_type") == "tv-acceptance"
+        and saved.get("tv_prefix_mode", "sampled") != TV_PREFIX_MODE
+    ):
+        raise ValueError(
+            "Cannot resume TV with changed tv_prefix_mode: this checkpoint uses "
+            "sampled or unknown prefixes, but training now uses teacher-forced "
+            "prefixes. Use --init-draft-model-path with a new output directory."
+        )
+    # Chunk size and the obsolete verification batch size do not change the
+    # teacher-forced objective or consume sampling RNG, so they may be retuned.
+    for name in ("dspark_loss_type", "tv_sampling_temperature"):
+        default = OBJECTIVE_DEFAULTS[name]
         if saved.get(name, default) != getattr(args, name):
             raise ValueError(
                 f"Cannot resume with changed {name}; "
@@ -71,16 +97,13 @@ def validate_objective_resume(saved_args, args):
             )
 
 
-def configure_objective(model, target_model, tokenizer, args):
-    """Attach the live verifier and freeze unused heads before FSDP wrapping."""
+def configure_objective(model, tokenizer, args):
+    """Enable target-state reuse and freeze unused heads before FSDP wrapping."""
     if args.dspark_loss_type != "tv-acceptance":
         return
     from transformers import AutoConfig
 
     from specforge.core.tv_acceptance import configure_tv_acceptance
-    from specforge.inference.target_engine.candidate_verifier import (
-        CandidatePrefixVerifier,
-    )
     from specforge.utils import print_on_rank0
 
     config = AutoConfig.from_pretrained(
@@ -96,14 +119,16 @@ def configure_objective(model, target_model, tokenizer, args):
         temperature=args.tv_sampling_temperature,
         chunk_blocks=args.tv_objective_chunk_blocks,
         eos_token_ids=eos_ids,
-        verifier=CandidatePrefixVerifier(
-            target_model,
-            batch_size=args.tv_verification_batch_size,
-            pad_token_id=tokenizer.pad_token_id or 0,
-        ),
     )
+    if args.tv_verification_batch_size is not None:
+        print_on_rank0(
+            "--tv-verification-batch-size is deprecated and ignored: "
+            "teacher-forced TV reuses the original target forward."
+        )
     print_on_rank0(
-        "TV acceptance: fixed sampled prefixes, full-vocabulary softmax, "
+        "TV acceptance: teacher-forced ground-truth prefixes, "
+        "one target forward reused across anchors, no candidate sampling/verification, "
+        "full-vocabulary softmax, "
         "loss=mean_blocks(1-sum(cumprod(1-TV))/K). "
         "CE/L1/confidence weights, PACE weights and loss-decay-gamma are unused."
     )
