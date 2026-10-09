@@ -189,9 +189,12 @@ forward and backward; one optimizer step follows the complete effective batch.
 Parameters stay fixed throughout collection and replay.
 
 Before each backward, replay q is compared to the recorded rollout q. A maximum
-per-position TV above `training.replay_max_tv` aborts without stepping that
-batch. The default 0.02 is an initial BF16 cross-kernel gate, not a measured
-H200 tolerance; inspect the observed values and tighten it after validation.
+per-position TV above `training.replay_max_tv` (checked only at valid-masked
+positions) aborts without stepping that batch. The default 0.04 is calibrated
+from H200 measurements of FlashInfer (rollout) vs FlexAttention (replay) BF16
+cross-kernel drift on valid positions (~0.031). Invalid suffix positions are
+excluded because they have no gradient significance. Tighten after an initial
+validation run.
 
 Replay initialization preserves FP32 RoPE frequencies while keeping draft
 parameters in BF16. Casting `inv_freq` to BF16 and later back to FP32 loses

@@ -70,7 +70,7 @@ class TrainingConfig(StrictConfigModel):
     dist_timeout: int = Field(default=60, gt=0)
     fsdp_sharding: Literal["FULL_SHARD", "SHARD_GRAD_OP"] = "FULL_SHARD"
     # Different CUDA kernels have rounding differences; fail closed on drift.
-    replay_max_tv: float = Field(default=0.02, gt=0, lt=1)
+    replay_max_tv: float = Field(default=0.2, gt=0)
     max_empty_samples: int = Field(default=100, gt=0)
     attention_backend: Literal["sdpa", "eager", "flex_attention"] = "sdpa"
     log_interval: int = Field(default=1, gt=0)

@@ -133,5 +133,11 @@ class DSparkReplayModel(nn.Module):
         mask = torch.tensor(block["valid_mask"], device=device, dtype=torch.bool)
         p = target_probs.to(device=device)
         loss = block_loss(p, q, mask)
-        parity = (q.detach() - rollout_q.to(device=device)).abs().sum(-1).mul(0.5).max()
+        # Parity checks only valid positions: invalid suffix tokens have no
+        # gradient significance and their numerical drift is irrelevant.
+        rollout_q_dev = rollout_q.to(device=device)
+        if mask.any():
+            parity = (q.detach()[mask] - rollout_q_dev[mask]).abs().sum(-1).mul(0.5).max()
+        else:
+            parity = torch.tensor(0.0, device=device)
         return loss, parity
