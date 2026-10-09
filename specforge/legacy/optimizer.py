@@ -17,12 +17,14 @@ class BF16Optimizer:
         total_steps=800_000,
         warmup_ratio=0.015,
         markov_lr_scale=1.0,
+        fsdp_model=None,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
         #   These magic numbers: weight_decay=0.0, max_grad_norm=0.5, total_steps=800k, warmup_steps=12k are copied from
         #   https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json
         self.model = model
+        self.fsdp_model = fsdp_model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
         self.fp32_params = [
@@ -77,12 +79,21 @@ class BF16Optimizer:
         )
 
     def step(self):
+        # FSDP must clip the original gradients before they are copied to the
+        # FP32 masters: only the root wrapper knows which gradients are sharded
+        # and which process group to reduce over. Every rank must participate,
+        # including ranks with no local gradients.
+        if self.fsdp_model is not None:
+            grad_norm = self.fsdp_model.clip_grad_norm_(self.max_grad_norm)
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 mp.grad = (
                     p.grad.detach().to(torch.float32) if p.grad is not None else None
                 )
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        if self.fsdp_model is None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.fp32_params, self.max_grad_norm
+            )
         self.last_grad_norm = grad_norm.detach()
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -155,9 +166,9 @@ def validate_optimizer_resume(state, optimizer_name):
 def build_bf16_optimizer(model, *, optimizer_name="adamw", fsdp_model=None,
                          muon_lr=None, muon_momentum=0.95, muon_weight_decay=0.1,
                          muon_ns_steps=5, muon_adjust_lr_fn="match_rms_adamw", **kwargs):
-    """Opt-in Muon factory; the historical AdamW implementation is unchanged."""
+    """Build an optimizer with the root FSDP wrapper for distributed updates."""
     if optimizer_name == "adamw":
-        return BF16Optimizer(model, **kwargs)
+        return BF16Optimizer(model, fsdp_model=fsdp_model, **kwargs)
     if optimizer_name != "muon":
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
     from specforge.muon import BF16MuonOptimizer
