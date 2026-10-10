@@ -68,6 +68,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+
 from specforge.distributed import get_tp_group
 from specforge.sampling import processed_log_probs
 
@@ -140,20 +143,50 @@ class SGLangCaptureBackend:
         )
 
         tp_rank = dist.get_rank(get_tp_group())
-        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+            compute_dp_attention_world_info(
+                server_args.enable_dp_attention,
+                tp_rank,
+                server_args.tp_size,
+                server_args.dp_size,
+                server_args.attn_cp_size,
+            )
+        )
+        attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+        moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
+        moe_ep_rank = (
+            tp_rank
+            % (server_args.tp_size // server_args.moe_dp_size)
+            // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
+        )
+        gpu_id = torch.cuda.current_device()
+        parallel_state = ParallelState(
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=server_args.dp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=server_args.attn_cp_size,
+            attn_dcp_rank=tp_rank % server_args.dcp_size,
+            attn_dcp_size=server_args.dcp_size,
+            attn_dp_rank=attn_dp_rank,
+            attn_dp_size=attn_dp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            moe_dp_rank=moe_dp_rank,
+            moe_dp_size=server_args.moe_dp_size,
+            gpu_id=gpu_id,
+        )
         model_config = ModelConfig.from_server_args(server_args)
-        # - Added is_draft_worker=False parameter (new in 0.5.9)
-        # - Other new parameters (dp_rank, attn_cp_rank, moe_dp_rank, etc.) use defaults
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=torch.cuda.current_device(),
-            tp_rank=dist.get_rank(get_tp_group()),
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=0,
-            pp_size=1,
+            gpu_id=gpu_id,
+            ps=parallel_state,
             server_args=server_args,
             nccl_port=None,
             is_draft_worker=False,
@@ -278,7 +311,12 @@ class SGLangCaptureBackend:
         # 0.5.13+ dropped ModelWorkerBatch; ForwardBatch.init_new reads
         # capture_hidden_mode off the ScheduleBatch, so set it first.
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         output = self.model_runner.forward(forward_batch)
         return output.logits_output if hasattr(output, "logits_output") else output

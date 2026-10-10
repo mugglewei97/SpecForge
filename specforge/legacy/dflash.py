@@ -471,6 +471,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 nn.SiLU(),
                 nn.Linear(self.emb_dim, config.vocab_size, bias=False),
             )
+        elif self.projector_type == "dspark":
+            # DSpark projector heads (Markov, confidence) are created by
+            # DSparkDraftModel.__init__ after super().__init__() returns.
+            pass
         elif self.projector_type is not None:
             raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
 
