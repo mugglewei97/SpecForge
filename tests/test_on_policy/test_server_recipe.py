@@ -38,7 +38,7 @@ class ServerRecipeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             TrainingConfig(output_dir="unused", max_steps=10, num_epochs=6)
 
-    def test_server_recipe_preserves_original_budget_and_caps_whole_sequence(self):
+    def test_server_recipe_preserves_batch_and_packs_replay_with_current_lengths(self):
         cfg = OnPolicyConfig.from_file("examples/on_policy/qwen3-8b-dspark-tv.yaml")
         self.assertEqual(cfg.training.num_epochs, 6)
         self.assertIsNone(cfg.training.max_steps)
@@ -47,25 +47,36 @@ class ServerRecipeTests(unittest.TestCase):
         self.assertEqual(cfg.training.warmup_ratio, 0.04)
         self.assertEqual(cfg.training.max_grad_norm, 1.0)
         self.assertEqual(cfg.training.attention_backend, "flex_attention")
-        self.assertEqual(cfg.training.log_interval, 50)
-        self.assertEqual(cfg.training.save_interval, 2000)
+        self.assertEqual(cfg.training.log_interval, 10)
+        self.assertEqual(cfg.training.save_interval, 1000)
+        self.assertEqual(cfg.training.replay_blocks_per_forward, 64)
         self.assertEqual(cfg.rollout.mem_fraction_static, 0.3)
         self.assertEqual(cfg.rollout.placement, "colocated")
         self.assertEqual(cfg.rollout.cuda_devices, list(range(8)))
         validate_topology(cfg, "0,1,2,3,4,5,6,7", 8, 8)
         self.assertEqual(cfg.data.chat_template, "qwen")
         self.assertEqual(cfg.data.chat_template_kwargs, {})
-        self.assertEqual(cfg.sequence_limit, 3072)
-        self.assertEqual(cfg.data.prompt_limit, 3070)
-        for length in (10, 1000, 3070):
+        self.assertEqual(cfg.sequence_limit, 8192)
+        self.assertEqual(cfg.data.prompt_limit, 4096)
+        for length in (10, 1000, 4096):
             sampling = cfg.sampling_for_prompt(length)
-            self.assertEqual(length + sampling["max_new_tokens"], 3072)
+            self.assertEqual(sampling["max_new_tokens"], 4096)
+            self.assertLessEqual(length + sampling["max_new_tokens"], 8192)
+        self.assertEqual(cfg.sampling_for_prompt(8190)["max_new_tokens"], 2)
         with self.assertRaisesRegex(ValueError, "no budget"):
-            cfg.sampling_for_prompt(3071)
+            cfg.sampling_for_prompt(8191)
         # Resolving a request must not mutate later requests' generation budget.
-        self.assertEqual(cfg.sampling.max_new_tokens, 3072)
+        self.assertEqual(cfg.sampling.max_new_tokens, 4096)
         draft = json.loads(Path(cfg.model.draft_model_config).read_text())
         self.assertEqual(draft["block_size"], 7)
+
+    def test_replay_group_size_defaults_to_scalar_and_requires_positive_integer(self):
+        self.assertEqual(
+            TrainingConfig(output_dir="unused").replay_blocks_per_forward, 1
+        )
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                TrainingConfig(output_dir="unused", replay_blocks_per_forward=value)
 
     def test_topology_rejects_partial_colocation_and_preserves_dedicated_mode(self):
         cfg = OnPolicyConfig.from_file("examples/on_policy/qwen3-8b-dspark-tv.yaml")

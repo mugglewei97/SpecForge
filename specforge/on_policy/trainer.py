@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import nullcontext
 from datetime import timedelta
@@ -42,11 +43,22 @@ def _leader_call(action, rank, control_group=None):
 
 
 def replay_schedule(traces, rank, world_size):
-    """Equal collective counts despite unequal numbers of blocks per sample.
+    """Original scalar schedule, also used by single-block replay audits."""
+    return [
+        (trace, indices[0], weight)
+        for trace, indices, weight in replay_group_schedule(traces, rank, world_size, 1)
+    ]
+
+
+def replay_group_schedule(traces, rank, world_size, blocks_per_forward):
+    """Equal collective counts despite unequal numbers of groups per sample.
 
     FSDP averages over ranks. Each real block therefore gets weight W/(N*M).
-    Empty slots execute a real block with zero loss to join all collectives.
+    A packed forward returns the SUM of its block losses, including short tails.
+    Empty slots execute one real block with zero loss to join all collectives.
     """
+    if blocks_per_forward < 1:
+        raise ValueError("replay blocks per forward must be positive")
     valid = [
         trace for trace in traces if any(any(b["valid_mask"]) for b in trace["blocks"])
     ]
@@ -59,34 +71,63 @@ def replay_schedule(traces, rank, world_size):
             for index, block in enumerate(trace["blocks"])
             if any(block["valid_mask"])
         ]
-        for index in blocks:
+        for start in range(0, len(blocks), blocks_per_forward):
             per_rank[sample_index % world_size].append(
-                (trace, index, world_size / len(valid) / len(blocks))
+                (
+                    trace,
+                    blocks[start : start + blocks_per_forward],
+                    world_size / len(valid) / len(blocks),
+                )
             )
     slots = max(map(len, per_rank))
     exemplar = next(items[0] for items in per_rank if items)
-    return per_rank[rank] + [(exemplar[0], exemplar[1], 0.0)] * (
+    return per_rank[rank] + [(exemplar[0], exemplar[1][:1], 0.0)] * (
         slots - len(per_rank[rank])
     )
 
 
 def train_effective_batch(
-    backend, traces, tensor_loader, rank, world_size, replay_max_tv
+    backend,
+    traces,
+    tensor_loader,
+    rank,
+    world_size,
+    replay_max_tv,
+    replay_blocks_per_forward=1,
 ):
-    schedule = replay_schedule(traces, rank, world_size)
-    metrics = torch.zeros(2, device=next(backend.module.parameters()).device)
-    for slot, (trace, index, weight) in enumerate(schedule):
-        block = trace["blocks"][index]
+    schedule = replay_group_schedule(
+        traces, rank, world_size, replay_blocks_per_forward
+    )
+    device = next(backend.module.parameters()).device
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    metrics = torch.zeros(2, device=device)
+    real_blocks = sum(len(indices) for _, indices, weight in schedule if weight)
+    padding_forwards = sum(weight == 0 for _, _, weight in schedule)
+    for slot, (trace, indices, weight) in enumerate(schedule):
+        blocks = [trace["blocks"][index] for index in indices]
         data = tensor_loader(trace)
+        context_hidden = data["context_hidden"][
+            : max(b["context_length"] for b in blocks)
+        ]
+        if replay_blocks_per_forward == 1:
+            block = blocks[0]
+            target_probs, rollout_q = data[f"p_{indices[0]}"], data[f"q_{indices[0]}"]
+        else:
+            block = blocks
+            target_probs = torch.stack([data[f"p_{index}"] for index in indices])
+            rollout_q = torch.stack([data[f"q_{index}"] for index in indices])
         boundary = slot == len(schedule) - 1
         # no_sync must enclose FORWARD as well as backward (FSDP/DDP contract).
         context = nullcontext() if boundary else backend.module.no_sync()
         with context:
             loss, parity = backend.module(
                 block,
-                data["context_hidden"][: block["context_length"]],
-                data[f"p_{index}"],
-                data[f"q_{index}"],
+                context_hidden,
+                target_probs,
+                rollout_q,
             )
             error = parity.detach().clone()
             if dist.is_initialized():
@@ -98,11 +139,46 @@ def train_effective_batch(
             backend.backward(loss * weight, is_boundary=True)
         metrics[0] += loss.detach() * weight / world_size
         metrics[1] = torch.maximum(metrics[1], parity)
+        # Do not retain the preceding group's stacked full-vocabulary tensors
+        # while allocating the next group or publishing updated weights.
+        del loss, parity, error, target_probs, rollout_q, context_hidden, data
     if dist.is_initialized():
         dist.all_reduce(metrics[0], op=dist.ReduceOp.SUM)
         dist.all_reduce(metrics[1], op=dist.ReduceOp.MAX)
     backend.step()  # exactly once, after the whole effective batch
-    return {"loss": metrics[0].item(), "replay_max_tv": metrics[1].item()}
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    stats = torch.tensor(
+        [
+            time.perf_counter() - started,
+            torch.cuda.max_memory_allocated(device) / 2**30
+            if device.type == "cuda"
+            else 0,
+            torch.cuda.max_memory_reserved(device) / 2**30
+            if device.type == "cuda"
+            else 0,
+            real_blocks,
+            padding_forwards,
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    if dist.is_initialized():
+        dist.all_reduce(stats[:3], op=dist.ReduceOp.MAX)
+        dist.all_reduce(stats[3:], op=dist.ReduceOp.SUM)
+    elapsed, allocated, reserved, real_blocks, padding_forwards = stats.tolist()
+    return {
+        "loss": metrics[0].item(),
+        "replay_max_tv": metrics[1].item(),
+        "replay_blocks_per_forward": replay_blocks_per_forward,
+        "replay_forwards_per_rank": len(schedule),
+        "replay_blocks": int(real_blocks),
+        "replay_padding_forwards": int(padding_forwards),
+        "replay_seconds": elapsed,
+        # Trainer allocator peaks only; the colocated engine is another process.
+        "replay_peak_allocated_gib": allocated,
+        "replay_peak_reserved_gib": reserved,
+    }
 
 
 def _publish_weights(backend, draft_config, root, version, rank, control_group=None):
@@ -374,7 +450,13 @@ def _run(cfg, control_group):
                 return cached_tensors
 
             metrics = train_effective_batch(
-                backend, traces, tensor_loader, rank, world, cfg.training.replay_max_tv
+                backend,
+                traces,
+                tensor_loader,
+                rank,
+                world,
+                cfg.training.replay_max_tv,
+                cfg.training.replay_blocks_per_forward,
             )
             _publish_weights(backend, draft_config, root, step + 1, rank, control_group)
             _prepare_rollout_phase(control_group)

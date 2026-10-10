@@ -9,21 +9,25 @@ from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.on_policy.replay import DSparkReplayModel, replay_inputs
 
 
-def tiny_model(head="vanilla"):
+def tiny_model(head="vanilla", *, attention_mode="gqa", layer_types=None):
+    layer_types = layer_types or ["full_attention"]
     config = Qwen3Config(
         vocab_size=16,
         hidden_size=16,
         intermediate_size=32,
-        num_hidden_layers=1,
+        num_hidden_layers=len(layer_types),
         num_attention_heads=4,
-        num_key_value_heads=2,
+        num_key_value_heads=4 if attention_mode == "mha" else 2,
         head_dim=4,
-        layer_types=["full_attention"],
+        layer_types=layer_types,
+        use_sliding_window="sliding_attention" in layer_types,
+        sliding_window=4 if "sliding_attention" in layer_types else None,
         attention_dropout=0.0,
     )
     config.block_size = 3
     config.num_target_layers = 4
     config.dflash_config = {
+        "attention_mode": attention_mode,
         "target_layer_ids": [0, 1],
         "mask_token_id": 15,
         "projector_type": "dspark",

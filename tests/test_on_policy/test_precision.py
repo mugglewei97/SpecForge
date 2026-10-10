@@ -15,7 +15,7 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from tests.test_on_policy.test_replay import tiny_model
 
 
-def check_bf16_replay_precision(device):
+def check_bf16_replay_precision(device, *, packed=False):
     """Shared CPU and two-GPU gate: real DSpark replay with BF16 FSDP."""
     model = tiny_model().to(device=device, dtype=torch.bfloat16)
     model.draft_model.config.architectures = ["DSparkDraftModel"]
@@ -32,6 +32,10 @@ def check_bf16_replay_precision(device):
         "valid_mask": [True, True, True],
         "sampling": {"temperature": 1.0},
     }
+    if packed:
+        block = [block, {**block, "anchor": 3, "proposal": [4, 5, 6]}]
+        target = torch.stack([target, target])
+        rollout_q = torch.stack([rollout_q, rollout_q])
     with torch.no_grad():
         expected_loss, expected_parity = model(block, features, target, rollout_q)
 
@@ -114,3 +118,6 @@ class PrecisionTests(unittest.TestCase):
 
     def test_bf16_fsdp_preserves_replay_probabilities_and_gradients(self):
         check_bf16_replay_precision(torch.device("cpu"))
+
+    def test_packed_bf16_fsdp_preserves_fp32_probabilities_and_gradients(self):
+        check_bf16_replay_precision(torch.device("cpu"), packed=True)

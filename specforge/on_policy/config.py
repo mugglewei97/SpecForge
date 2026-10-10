@@ -71,6 +71,9 @@ class TrainingConfig(StrictConfigModel):
     fsdp_sharding: Literal["FULL_SHARD", "SHARD_GRAD_OP"] = "FULL_SHARD"
     # Different CUDA kernels have rounding differences; fail closed on drift.
     replay_max_tv: float = Field(default=0.02, gt=0, lt=1)
+    # Pack consecutive valid blocks from one trajectory, sharing context work.
+    # One keeps the original scalar replay path; optimizer batch size is unchanged.
+    replay_blocks_per_forward: int = Field(default=1, ge=1, strict=True)
     max_empty_samples: int = Field(default=100, gt=0)
     attention_backend: Literal["sdpa", "eager", "flex_attention"] = "sdpa"
     log_interval: int = Field(default=1, gt=0)

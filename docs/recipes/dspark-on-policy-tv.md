@@ -81,8 +81,9 @@ new run may warm-start from any of these; it starts a fresh optimizer.
 `examples/on_policy/qwen3-8b-dspark-tv.yaml` preserves the supplied job's target
 and dataset paths, draft architecture config, output directory, learning rate
 `6e-4`, six epochs, warmup ratio `0.04`, gradient norm `1.0`, total sequence limit
-3072, Qwen template, block size 7, trainer FlexAttention, log interval 50, save
-interval 2000 and SGLang memory fraction `0.3`. It warm-starts from:
+8192 (prompt cap 4096, generation cap 4096), Qwen template, block size 7,
+trainer FlexAttention, log interval 10, save interval 1000 and SGLang memory
+fraction `0.3`. It warm-starts from:
 
 ```
 /mnt/amed-s1/common/ckpt/gaochang/EagleModel/outputs/qwen3-8b-dspark-120w-mix/epoch_6_step_228768
@@ -100,13 +101,14 @@ The launcher restores eight FSDP ranks on physical GPUs 0–7. Each of those
 same GPUs also hosts one TP=1 SGLang rollout engine (eight engines total), with
 `mem_fraction_static: 0.3` per engine. Rank 0 coordinates the engine subprocesses.
 The original per-GPU batch size 4 on eight ranks is **global batch size 32** in
-this entrypoint. Full batches assign four samples per FSDP rank; replay
-accumulates their block gradients before the single optimizer step.
+this entrypoint. Full batches assign four samples per FSDP rank; replay packs
+up to 64 consecutive valid blocks of the same sample per forward and accumulates
+all groups' gradients before the single optimizer step.
 Rollout and replay execute in separate phases. Trainers use a CPU/Gloo group
 to wait for rollout and all-worker weight synchronization, keeping NCCL waits
 off the shared GPUs. Both processes release unused CUDA allocator blocks at
 phase boundaries; live model weights and the SGLang KV pool remain resident.
-The launcher keeps `SPECFORGE_DATA_NUM_PROC=32` for CPU prompt tokenization and
+The launcher keeps `SPECFORGE_DATA_NUM_PROC=100` for CPU prompt tokenization and
 `FLASHINFER_DISABLE_VERSION_CHECK=1`.
 
 In epoch mode, each length-eligible prompt is visited exactly once per epoch,
@@ -118,11 +120,11 @@ before an optimizer update. `schedule.json`, batch prompt IDs and metric sample
 counts expose these boundaries. Set either `num_epochs` or `max_steps`, never
 both. The old step-budget recipe remains supported.
 
-`data.max_length: 3072` bounds prompt **plus** generated tokens. Per-request
-generation is capped to `3072 - prompt_length`; prompts longer than 3070 are
-filtered because they leave no anchor/candidate budget. Engine context 3088
-includes scratch space for full speculative verification; it does not raise
-the 3072 visible-token limit. The Qwen default system message is inserted only
+`data.max_length: 8192` bounds prompt **plus** generated tokens. Per-request
+generation is capped to `min(4096, 8192 - prompt_length)`; prompts longer than
+4096 are filtered by `max_prompt_length`. Engine context 10000 includes scratch
+space for full speculative verification; it does not raise the 8192 visible-token
+limit. The Qwen default system message is inserted only
 when the data has no system message. The tokenizer's thinking default is kept.
 
 The new stochastic sampling settings are temperature 1, no top-k/top-p
@@ -132,7 +134,7 @@ objective: equal block means replace decay weighting, and native rollout
 blocks replace sampled offline anchors. They are intentionally absent.
 
 Full draft weights are still published and acknowledged **every step**.
-`save_interval: 2000` controls retention: initial, every 2000th and latest/final
+`save_interval: 1000` controls retention: initial, every 1000th and latest/final
 weights remain; superseded intermediate sync snapshots are removed only after
 the next all-worker ACK. All trajectory JSON remains, including complete
 rejected proposals. This long-run recipe sets `retain_replay_tensors: false`
@@ -140,6 +142,69 @@ to release full-vocabulary p/q and target features after the batch's completed
 update and synchronization. Set it to true for a short full-replay audit.
 The existing output directory may contain older offline checkpoints, but an
 existing on-policy `run.json` or `weights/` makes the launcher refuse reuse.
+
+## Packed replay and memory tuning
+
+`training.replay_blocks_per_forward` is a positive integer. Its schema default
+is **1**, which keeps the original scalar replay path; the eight-GPU Qwen3-8B
+recipe sets **64**. Try 32/64/128 according to measured peak memory and throughput.
+Groups never cross a trajectory boundary and the final group can be smaller.
+Setting the limit above a trajectory's valid block count packs that whole
+trajectory, but there is no automatic OOM retry or memory-based sizing.
+
+The packed backbone projects the longest required committed prefix once, with
+one differentiable context K/V projection per layer. Every query block keeps
+its recorded absolute positions and sees only its own original prefix and its
+own draft tokens. Full/sliding masks exclude future context and other blocks'
+draft tokens. The Markov head receives an explicit block axis, so vanilla/gated
+heads preserve previous-token conditioning and RNN states restart per block.
+Length-dependent dynamic/LongRoPE variants require scalar replay; their
+frequencies can change when multiple prefix lengths share a forward.
+
+TV products and valid-token denominators remain independent per block. A group
+returns the **sum** of its block losses, weighted by the original `W/(N*M_n)`;
+short groups therefore do not get extra weight. All valid blocks are trained,
+without subsampling or policy updates between groups. FSDP ranks execute equal
+numbers of forwards; missing groups use a single-block zero-weight forward.
+Replay parity still checks every position before each backward, including
+proposal suffix positions excluded from the loss. No rollout or weight-sync
+behavior changes are needed, and the existing SGLang patch is unchanged.
+
+Packing reduces repeated prefix computation, transfer, and FSDP calls, but
+increases simultaneous query activations and full-vocabulary logits/probabilities.
+Sharing is within a group, not across optimizer updates. Full p/q capture and
+trajectory disk IO remain unchanged. CUDA kernels and BF16 reduction order can
+differ from scalar replay; do not disable the existing parity gate to tune speed.
+
+Per-step metrics now include:
+
+- `replay_blocks_per_forward`: configured maximum group size.
+- `replay_forwards_per_rank`: equal forward/backward count on each rank,
+  including padding; compare this with scalar replay on the same trajectories.
+- `replay_blocks`: total real supervised blocks across ranks.
+- `replay_padding_forwards`: total zero-weight padding forwards across ranks.
+- `replay_seconds`: maximum rank time for tensor loading, replay, and the
+  optimizer update; excludes rollout and weight publication/synchronization.
+- `replay_peak_allocated_gib` / `replay_peak_reserved_gib`: maximum trainer CUDA
+  allocator peak across ranks, reset immediately before replay. These include
+  resident trainer state but **exclude the separate SGLang processes**; also
+  inspect total device memory when selecting the group size.
+
+The same launch script picks up the new recipe setting on the next launch.
+An already running job is unaffected. Use a fresh output directory; warming
+from an exported draft still starts a fresh optimizer, as before.
+
+After CPU checks, run the CUDA gate on two available server GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 SPECFORGE_RUN_H200_GATE=1 \
+  python -m unittest tests.test_on_policy.test_fsdp_cuda -v
+```
+
+This includes a 64-block BF16 FlexAttention comparison against scalar SDPA,
+plus a real two-rank packed DSpark update with a short tail and padding under
+FULL_SHARD and SHARD_GRAD_OP. It validates a tiny model; server-scale memory,
+native rollout parity, and throughput still need a short real training run.
 
 ## Objective and trajectory contract
 
@@ -183,8 +248,8 @@ empty batch stops before an optimizer update.
 
 Each sample's valid blocks have equal weight, and valid samples have equal
 weight. For world size W the per-block backward weight is `W/(N*M_n)`, because
-FSDP averages gradients across ranks. Ranks with fewer blocks execute zero-loss
-padding forwards, so all ranks enter the same collectives. `no_sync` encloses
+FSDP averages gradients across ranks. Ranks with fewer replay groups execute
+zero-loss padding forwards, so all ranks enter the same collectives. `no_sync` encloses
 forward and backward; one optimizer step follows the complete effective batch.
 Parameters stay fixed throughout collection and replay.
 
@@ -263,7 +328,8 @@ python -m unittest discover -s tests/test_on_policy -t . -v
 ```
 
 These tests cover analytic loss/gradients, EOS/padding, real tiny DSpark replay
-for all three Markov heads, a three-rank Gloo gradient-equivalence case with an
+and packed/scalar gradient equivalence for all three Markov heads, GQA/MHA,
+full/sliding masks, a three-rank Gloo gradient-equivalence case with an
 empty rank, discarded-proposal preservation, synchronization and failure gates.
 CUDA/SGLang kernel parity and improvement in actual acceptance must be checked
 on H200; passing CPU checks does not establish either.

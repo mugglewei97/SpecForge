@@ -21,6 +21,9 @@ training:
   log_interval: 10
   save_interval: 1000
   fsdp_sharding: FULL_SHARD
+  # Share context projections across 64 blocks; tune 32/64/128 to peak memory.
+  # Set 1 to use the original single-block replay for comparisons.
+  replay_blocks_per_forward: 64
   # Keep all proposal/context/acceptance JSON. Release p/q/features after the
   # synchronized update; retaining full-vocabulary tensors for 6 epochs is huge.
   retain_replay_tensors: false
@@ -28,12 +31,12 @@ rollout:
   placement: colocated
   cuda_devices: [0, 1, 2, 3, 4, 5, 6, 7]
   mem_fraction_static: 0.3
-  context_length: 10000  # 3072 visible tokens + verification scratch space.
+  context_length: 10000  # 8192 visible tokens + verification scratch space.
   attention_backend: flashinfer
 sampling:
   # New on-policy sampling choices; the old supervised command had no sampler.
   temperature: 1.0
   top_k: -1
   top_p: 1.0
-  max_new_tokens: 4096  # Per request, capped to 3072 - prompt_length.
+  max_new_tokens: 4096  # Per request, capped to 8192 - prompt_length.
   ignore_eos: false

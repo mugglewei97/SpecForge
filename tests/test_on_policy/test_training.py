@@ -11,6 +11,7 @@ from torch.nn.parallel import DistributedDataParallel
 from specforge.on_policy.trainer import (
     _leader_call,
     replay_schedule,
+    replay_group_schedule,
     train_effective_batch,
 )
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -58,7 +59,9 @@ class ToyReplay(nn.Module):
 
     def forward(self, block, *_args):
         self.forward_sync_states.append(self.in_no_sync)
-        return self.weight.square() * block["coefficient"], torch.tensor(self.parity)
+        blocks = block if isinstance(block, list) else [block]
+        coefficient = sum(b["coefficient"] for b in blocks)
+        return self.weight.square() * coefficient, torch.tensor(self.parity)
 
 
 class CountingSGD:
@@ -92,21 +95,62 @@ def _distributed_worker(rank, directory):
             pass
         else:
             raise AssertionError("coordinator failure was not propagated")
-        module = DistributedDataParallel(ToyReplay())
-        backend = FSDPTrainingBackend(ParallelConfig())
-        backend.prepare_model(module, wrap=False)
-        optimizer = CountingSGD(module)
-        backend.set_optimizer(optimizer)
-        metrics = train_effective_batch(backend, traces(), tensors, rank, 3, 0.02)
-        # Mean of sample means: (2 + (3+4+8)/3)/2 = 3.5; grad = 7.
-        torch.testing.assert_close(module.module.weight, torch.tensor(0.3))
-        assert optimizer.calls == 1
-        assert abs(metrics["loss"] - 3.5) < 1e-6
+        for group_size in (1, 2, 8):
+            module = DistributedDataParallel(ToyReplay())
+            backend = FSDPTrainingBackend(ParallelConfig())
+            backend.prepare_model(module, wrap=False)
+            optimizer = CountingSGD(module)
+            backend.set_optimizer(optimizer)
+            metrics = train_effective_batch(
+                backend, traces(), tensors, rank, 3, 0.02, group_size
+            )
+            # Mean of sample means: (2 + (3+4+8)/3)/2 = 3.5; grad = 7.
+            torch.testing.assert_close(module.module.weight, torch.tensor(0.3))
+            assert optimizer.calls == 1
+            assert abs(metrics["loss"] - 3.5) < 1e-6
+            assert metrics["replay_blocks"] == 4
     finally:
         dist.destroy_process_group()
 
 
 class TrainingTests(unittest.TestCase):
+    def test_groups_preserve_block_weights_and_pad_only_one_block(self):
+        plans = [replay_group_schedule(traces(), r, 3, 2) for r in range(3)]
+        self.assertEqual([len(p) for p in plans], [2, 2, 2])
+        self.assertEqual([(ids, w) for _, ids, w in plans[0]], [([0], 1.5), ([0], 0)])
+        self.assertEqual(
+            [(ids, w) for _, ids, w in plans[1]], [([0, 1], 0.5), ([2], 0.5)]
+        )
+        self.assertEqual([(ids, w) for _, ids, w in plans[2]], [([0], 0), ([0], 0)])
+
+    def test_packed_tail_matches_scalar_update_and_one_optimizer_step(self):
+        for group_size in (2, 64):
+            model = ToyReplay()
+            backend = FSDPTrainingBackend(ParallelConfig())
+            backend.prepare_model(model, wrap=False)
+            optimizer = CountingSGD(model)
+            backend.set_optimizer(optimizer)
+            metrics = train_effective_batch(
+                backend, traces(), tensors, 0, 1, 0.02, group_size
+            )
+            self.assertEqual(optimizer.calls, 1)
+            torch.testing.assert_close(model.weight, torch.tensor(0.3))
+            self.assertAlmostEqual(metrics["loss"], 3.5)
+            count = 3 if group_size == 2 else 2
+            self.assertEqual(metrics["replay_forwards_per_rank"], count)
+            self.assertEqual(model.forward_sync_states, [True] * (count - 1) + [False])
+
+    def test_packed_parity_failure_prevents_optimizer_step(self):
+        model = ToyReplay(parity=0.5)
+        backend = FSDPTrainingBackend(ParallelConfig())
+        backend.prepare_model(model, wrap=False)
+        optimizer = CountingSGD(model)
+        backend.set_optimizer(optimizer)
+        with self.assertRaisesRegex(RuntimeError, "optimizer was not stepped"):
+            train_effective_batch(backend, traces(), tensors, 0, 1, 0.02, 64)
+        self.assertEqual(optimizer.calls, 0)
+        self.assertEqual(model.weight.item(), 1)
+
     def test_eight_rank_full_batch_assigns_four_samples_per_rank(self):
         batch = [
             {"request_id": str(i), "blocks": [{"valid_mask": [True]}]}
