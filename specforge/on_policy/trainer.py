@@ -35,23 +35,24 @@ def _leader_call(action, rank, control_group=None):
     status = torch.tensor(int(error is None), device=device)
     dist.broadcast(status, src=0, group=control_group)
     if not status.item():
-        if error is not None:
-            # Broadcast the error message so every rank can see the true cause.
-            msg_buf = torch.zeros(2048, dtype=torch.uint8, device=device)
-            if rank == 0:
-                encoded = f"{type(error).__name__}: {error}"[:2047].encode()
-                msg_buf[: len(encoded)] = torch.tensor(
-                    list(encoded), dtype=torch.uint8
+        # Broadcast the error message so every rank can see the true cause.
+        # All ranks must participate in this collective; only rank0 writes.
+        msg_buf = torch.zeros(2048, dtype=torch.uint8, device=device)
+        if rank == 0:
+            encoded = f"{type(error).__name__}: {error}"[:2047].encode()
+            msg_buf[: len(encoded)] = torch.tensor(
+                list(encoded), dtype=torch.uint8
+            )
+        dist.broadcast(msg_buf, src=0, group=control_group)
+        if rank != 0:
+            decoded = msg_buf[: (msg_buf == 0).long().argmax().item()]
+            if decoded.numel():
+                remote_msg = bytes(decoded.tolist()).decode(errors="replace")
+                raise RuntimeError(
+                    f"on-policy coordinator failed ({remote_msg}); "
+                    f"the batch cannot continue"
                 )
-            dist.broadcast(msg_buf, src=0, group=control_group)
-            if rank != 0:
-                decoded = msg_buf[: (msg_buf == 0).long().argmax().item()]
-                if decoded.numel():
-                    remote_msg = bytes(decoded.tolist()).decode(errors="replace")
-                    raise RuntimeError(
-                        f"on-policy coordinator failed ({remote_msg}); "
-                        f"the batch cannot continue"
-                    )
+        if error is not None:
             raise error
         raise RuntimeError("on-policy coordinator failed; the batch cannot continue")
     return result

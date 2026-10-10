@@ -12,7 +12,7 @@ data:
   chat_template_kwargs:
     enable_thinking: false
 training:
-  output_dir: /personal/checkpoints/specforge/onpolicy/
+  output_dir: /ossfs/workspace/opd
   num_epochs: 1
   batch_size: 32  # Original per-GPU batch 4 * 8 GPUs; global in this entrypoint.
   learning_rate: 6e-4
