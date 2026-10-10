@@ -184,16 +184,25 @@ class PackedReplayTests(unittest.TestCase):
         modified = model.packed_draft_probabilities(changed, future)
         torch.testing.assert_close(modified[0], original[0], atol=0, rtol=0)
 
-    def test_packed_parity_still_checks_positions_outside_loss_mask(self):
+    def test_packed_parity_matches_scalar_valid_position_check(self):
         model = tiny_model()
         blocks = replay_blocks()
         features = torch.randn(17, 32)
         with torch.no_grad():
             recorded = model.packed_draft_probabilities(blocks, features)
         p = recorded.clone()
-        recorded[2, 2, 0] += 0.2  # This position is invalid for loss, but audited.
+        # Invalid suffix drift is excluded, as in scalar replay.
+        recorded[2, 2, 0] += 0.2
+        _, parity = model(blocks, features, p, recorded)
+        torch.testing.assert_close(parity, torch.tensor(0.0))
+        recorded[1, 1, 0] += 0.2  # Valid drift must still trigger the gate.
         _, parity = model(blocks, features, p, recorded)
         torch.testing.assert_close(parity, torch.tensor(0.1))
+        scalar_parities = [
+            model(block, features[: block["context_length"]], p[i], recorded[i])[1]
+            for i, block in enumerate(blocks)
+        ]
+        torch.testing.assert_close(parity, torch.stack(scalar_parities).max())
 
     def test_batched_loss_preserves_masked_nans_and_independent_denominators(self):
         p = torch.randn(3, 3, 16).softmax(-1)

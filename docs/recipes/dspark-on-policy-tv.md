@@ -78,12 +78,13 @@ new run may warm-start from any of these; it starts a fresh optimizer.
 
 ## Converted Qwen3-8B eight-GPU server job
 
-`examples/on_policy/qwen3-8b-dspark-tv.yaml` preserves the supplied job's target
-and dataset paths, draft architecture config, output directory, learning rate
-`6e-4`, six epochs, warmup ratio `0.04`, gradient norm `1.0`, total sequence limit
-8192 (prompt cap 4096, generation cap 4096), Qwen template, block size 7,
-trainer FlexAttention, log interval 10, save interval 1000 and SGLang memory
-fraction `0.3`. It warm-starts from:
+`examples/on_policy/qwen3-8b-dspark-tv.yaml` uses the supplied job's target
+and dataset paths and draft architecture config. The current server settings
+are output directory `/ossfs/workspace/opd`, learning rate `6e-4`, one epoch,
+warmup ratio `0.04`, gradient norm `1.0`, total sequence limit 8192 (prompt cap
+4096, generation cap 4096), Qwen template with thinking disabled, block size 7,
+trainer SDPA with SHARD_GRAD_OP, log interval 10, save interval 100 and SGLang
+memory fraction `0.3`. It warm-starts from:
 
 ```
 /mnt/amed-s1/common/ckpt/gaochang/EagleModel/outputs/qwen3-8b-dspark-120w-mix/epoch_6_step_228768
@@ -113,7 +114,7 @@ The launcher keeps `SPECFORGE_DATA_NUM_PROC=100` for CPU prompt tokenization and
 
 In epoch mode, each length-eligible prompt is visited exactly once per epoch,
 with a deterministic shuffle for each epoch. The final batch of each epoch may
-be smaller. The scheduler horizon is `6 * ceil(eligible_prompts / 32)`; its
+be smaller. The scheduler horizon is `num_epochs * ceil(eligible_prompts / 32)`; its
 warmup uses the original 0.04 ratio. Immediate-EOS rollouts have no candidate
 loss and are excluded from that batch's mean. An entirely empty batch fails
 before an optimizer update. `schedule.json`, batch prompt IDs and metric sample
@@ -125,7 +126,7 @@ generation is capped to `min(4096, 8192 - prompt_length)`; prompts longer than
 4096 are filtered by `max_prompt_length`. Engine context 10000 includes scratch
 space for full speculative verification; it does not raise the 8192 visible-token
 limit. The Qwen default system message is inserted only
-when the data has no system message. The tokenizer's thinking default is kept.
+when the data has no system message. Thinking is explicitly disabled.
 
 The new stochastic sampling settings are temperature 1, no top-k/top-p
 filtering, and EOS stopping. The original supervised job did not specify these
@@ -134,7 +135,7 @@ objective: equal block means replace decay weighting, and native rollout
 blocks replace sampled offline anchors. They are intentionally absent.
 
 Full draft weights are still published and acknowledged **every step**.
-`save_interval: 1000` controls retention: initial, every 1000th and latest/final
+`save_interval: 100` controls retention: initial, every 100th and latest/final
 weights remain; superseded intermediate sync snapshots are removed only after
 the next all-worker ACK. All trajectory JSON remains, including complete
 rejected proposals. This long-run recipe sets `retain_replay_tensors: false`
@@ -166,15 +167,19 @@ returns the **sum** of its block losses, weighted by the original `W/(N*M_n)`;
 short groups therefore do not get extra weight. All valid blocks are trained,
 without subsampling or policy updates between groups. FSDP ranks execute equal
 numbers of forwards; missing groups use a single-block zero-weight forward.
-Replay parity still checks every position before each backward, including
-proposal suffix positions excluded from the loss. No rollout or weight-sync
-behavior changes are needed, and the existing SGLang patch is unchanged.
+Replay parity checks valid positions before each backward, matching the scalar
+path; proposal suffix positions excluded from the loss are not audited. No
+rollout or weight-sync behavior changes are needed, and the existing SGLang
+patch is unchanged.
 
 Packing reduces repeated prefix computation, transfer, and FSDP calls, but
 increases simultaneous query activations and full-vocabulary logits/probabilities.
 Sharing is within a group, not across optimizer updates. Full p/q capture and
 trajectory disk IO remain unchanged. CUDA kernels and BF16 reduction order can
-differ from scalar replay; do not disable the existing parity gate to tune speed.
+differ from scalar replay. The current server recipe retains `replay_max_tv: 10.0`,
+which exceeds the TV range [0, 1] and effectively disables the finite-drift gate;
+the non-finite check remains active. Use a measured tolerance below 1 when
+validating rollout/replay agreement.
 
 Per-step metrics now include:
 
@@ -219,8 +224,8 @@ Input records are JSON arrays or JSONL with `messages` or ShareGPT
 `conversations`. A record must end with an assistant turn; that turn is removed
 before applying the target tokenizer's generation chat template. Earlier
 assistant turns remain. Overlong prompts are filtered, not silently truncated.
-The Qwen3-4B smoke recipe disables Qwen thinking explicitly. The converted
-Qwen3-8B recipe preserves the tokenizer default from the original Qwen job.
+Both the Qwen3-4B smoke recipe and the Qwen3-8B server recipe disable Qwen
+thinking explicitly.
 
 SGLang performs the real proposal, target verification, accept/reject walk and
 residual correction/bonus sampling. The hooks preserve the complete proposal,
@@ -254,9 +259,11 @@ forward and backward; one optimizer step follows the complete effective batch.
 Parameters stay fixed throughout collection and replay.
 
 Before each backward, replay q is compared to the recorded rollout q. A maximum
-per-position TV above `training.replay_max_tv` aborts without stepping that
-batch. The default 0.02 is an initial BF16 cross-kernel gate, not a measured
-H200 tolerance; inspect the observed values and tighten it after validation.
+per-position TV above `training.replay_max_tv` (checked only at valid-masked
+positions) aborts without stepping that batch. The schema default is 0.2;
+the Qwen3-8B server recipe overrides it with 10.0, as described above. Invalid
+suffix positions are excluded because they have no gradient significance.
+Calibrate the tolerance using the actual rollout/replay backends and precision.
 
 Replay initialization preserves FP32 RoPE frequencies while keeping draft
 parameters in BF16. Casting `inv_freq` to BF16 and later back to FP32 loses

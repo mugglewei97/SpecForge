@@ -138,3 +138,33 @@ class ReplayTests(unittest.TestCase):
             base, token_ids=previous, hidden_states=hidden
         )
         torch.testing.assert_close(logits, replay)
+
+    def test_parity_ignores_invalid_suffix_positions(self):
+        """The TV parity check must only consider valid-masked positions."""
+        model = tiny_model("vanilla").eval()
+        block = {
+            "context_length": 4,
+            "anchor": 2,
+            "proposal": [3, 4, 5],
+            "valid_mask": [True, True, False],
+            "sampling": {"temperature": 1.0},
+        }
+        features = torch.randn(4, 32)
+        target = torch.softmax(torch.randn(3, 16), -1)
+        with torch.no_grad():
+            q = model.draft_probabilities(block, features)
+        # Construct rollout_q identical at valid positions but divergent at
+        # the invalid position. If the parity check ignores the suffix, the
+        # TV should be approximately zero.
+        rollout_q = q.clone()
+        rollout_q[2] = torch.softmax(torch.randn(16), -1)
+        mask = torch.tensor([True, True, False])
+        # Sanity check: the invalid position has large TV.
+        tv_invalid = (q[2] - rollout_q[2]).abs().sum().mul(0.5).item()
+        self.assertGreater(tv_invalid, 0.1)
+        # The valid positions match exactly.
+        tv_valid = (q[mask] - rollout_q[mask]).abs().sum(-1).mul(0.5).max().item()
+        self.assertAlmostEqual(tv_valid, 0.0, places=6)
+        with torch.no_grad():
+            _, parity = model(block, features, target, rollout_q)
+        self.assertAlmostEqual(parity.item(), 0.0, places=6)

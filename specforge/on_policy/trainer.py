@@ -36,6 +36,21 @@ def _leader_call(action, rank, control_group=None):
     status = torch.tensor(int(error is None), device=device)
     dist.broadcast(status, src=0, group=control_group)
     if not status.item():
+        # Broadcast the error message so every rank can see the true cause.
+        # All ranks must participate in this collective; only rank0 writes.
+        msg_buf = torch.zeros(2048, dtype=torch.uint8, device=device)
+        if rank == 0:
+            encoded = f"{type(error).__name__}: {error}"[:2047].encode()
+            msg_buf[: len(encoded)] = torch.tensor(list(encoded), dtype=torch.uint8)
+        dist.broadcast(msg_buf, src=0, group=control_group)
+        if rank != 0:
+            decoded = msg_buf[: (msg_buf == 0).long().argmax().item()]
+            if decoded.numel():
+                remote_msg = bytes(decoded.tolist()).decode(errors="replace")
+                raise RuntimeError(
+                    f"on-policy coordinator failed ({remote_msg}); "
+                    f"the batch cannot continue"
+                )
         if error is not None:
             raise error
         raise RuntimeError("on-policy coordinator failed; the batch cannot continue")
@@ -132,6 +147,12 @@ def train_effective_batch(
             error = parity.detach().clone()
             if dist.is_initialized():
                 dist.all_reduce(error, op=dist.ReduceOp.MAX)
+            logger.info(
+                "rollout/replay q TV=%.6f (threshold=%.4f, ratio=%.1f%%)",
+                error.item(),
+                replay_max_tv,
+                error.item() / replay_max_tv * 100 if replay_max_tv > 0 else 0,
+            )
             if not torch.isfinite(error) or error.item() > replay_max_tv:
                 raise RuntimeError(
                     f"rollout/replay q TV={error.item():.6f} exceeds {replay_max_tv}; optimizer was not stepped"

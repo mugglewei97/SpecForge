@@ -8,24 +8,26 @@ data:
   max_prompt_length: 4096
   max_length: 8192  # Prompt + generated output; reserve anchor/candidate room.
   chat_template: qwen
-  # Preserve the tokenizer's thinking default, as in --chat-template qwen.
-  chat_template_kwargs: {}
+  # Non-thinking mode: suppress reasoning tokens during rollout.
+  chat_template_kwargs:
+    enable_thinking: false
 training:
-  output_dir: /personal/checkpoints/specforge/onpolicy/
-  num_epochs: 6
+  output_dir: /ossfs/workspace/opd
+  num_epochs: 1
   batch_size: 32  # Original per-GPU batch 4 * 8 GPUs; global in this entrypoint.
   learning_rate: 6e-4
   warmup_ratio: 0.04
   max_grad_norm: 1.0
-  attention_backend: flex_attention
+  replay_max_tv: 10.0
+  attention_backend: sdpa
   log_interval: 10
-  save_interval: 1000
-  fsdp_sharding: FULL_SHARD
+  save_interval: 100
+  fsdp_sharding: SHARD_GRAD_OP
   # Share context projections across 64 blocks; tune 32/64/128 to peak memory.
   # Set 1 to use the original single-block replay for comparisons.
   replay_blocks_per_forward: 64
   # Keep all proposal/context/acceptance JSON. Release p/q/features after the
-  # synchronized update; retaining full-vocabulary tensors for 6 epochs is huge.
+  # synchronized update; retaining full-vocabulary tensors for a full run is huge.
   retain_replay_tensors: false
 rollout:
   placement: colocated

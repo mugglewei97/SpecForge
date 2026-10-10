@@ -7,6 +7,7 @@ import signal
 import socket
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -224,9 +225,8 @@ class RolloutPool:
                         dict(request, operation="rollout", version=self.version)
                     ).encode()
                 )
-            results = [
-                self._receive(worker) for worker in self.workers[: len(requests)]
-            ]
+            with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+                results = list(pool.map(self._receive, self.workers[: len(requests)]))
             if any(
                 result["request_id"] != request["request_id"]
                 for result, request in zip(results, requests)
@@ -247,9 +247,10 @@ class RolloutPool:
                 connection.send_bytes(
                     json.dumps({"operation": "sync", "version": version}).encode()
                 )
-            for worker in self.workers:
-                if self._receive(worker).get("version") != version:
-                    raise RuntimeError("rollout worker acknowledged a wrong version")
+            with ThreadPoolExecutor(max_workers=len(self.workers)) as pool:
+                responses = list(pool.map(self._receive, self.workers))
+            if any(response.get("version") != version for response in responses):
+                raise RuntimeError("rollout worker acknowledged a wrong version")
             self._check_acks(version)
             self.version = version
         except BaseException:
