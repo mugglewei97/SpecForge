@@ -235,7 +235,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
                 batch_size=args.batch_size,
                 sampler=sampler,
                 collate_fn=collate_token_prompts,
-                num_workers=0,
+                num_workers=args.dataloader_num_workers,
             ),
             None,
         )

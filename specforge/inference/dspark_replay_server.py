@@ -219,9 +219,9 @@ def dispatch(scheduler):
             mapped = _mapped_weights(worker.draft_model, weights)
             params = dict(worker.draft_model.named_parameters())
             for name, value in mapped.items():
-                params[name].copy_(value.to(params[name].device))
-            for name, value in mapped.items():
-                if not torch.equal(params[name].detach().cpu(), value):
+                value_on_device = value.to(params[name].device)
+                params[name].copy_(value_on_device)
+                if not torch.equal(params[name].detach(), value_on_device):
                     raise RuntimeError(f"draft weight readback failed: {name}")
             # These contain concatenated/copied projections, not live views.
             worker.draft_model._fused_kv_write_cache = None

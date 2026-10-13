@@ -1,7 +1,9 @@
 """Strict rollout -> replay -> optimizer -> acknowledged draft sync loop."""
 
+import concurrent.futures
 import itertools
 import json
+import time
 import uuid
 from pathlib import Path
 
@@ -132,6 +134,13 @@ def split_replay_batch(data, size):
         }
 
 
+def _write_trace(path, records):
+    """Write rollout trace records to a JSONL file (called from background thread)."""
+    with path.open("x") as stream:
+        for record in records:
+            stream.write(json.dumps(record) + "\n")
+
+
 def run_replay_training(
     args,
     dataloader,
@@ -173,118 +182,159 @@ def run_replay_training(
         (trace_dir / f"sglang-source-rank-{rank}.json").write_text(
             (backend.directory / "source-audit.json").read_text()
         )
-    step = 0
-    for epoch in range(args.num_epochs):
-        dataloader.sampler.set_epoch(epoch)
-        iterator = iter(dataloader)
-        while True:
-            # Prefetching/tokenizing prompts is harmless; generation occurs only
-            # here, after the previous step's all-rank synchronization barrier.
-            batches = list(itertools.islice(iterator, args.accumulation_steps))
-            if not batches:
-                break
-            prompts = []
-            for index, batch in enumerate(batches):
-                prompts.extend(
-                    prompt_rows(
-                        batch, prefix=f"{run_id}-v{controller.version}-r{rank}-b{index}"
-                    )
-                )
-            records = collective_phase(lambda: controller.collect(prompts), device)
-            args.draft_version = controller.version
 
-            def collate():
-                # Save raw traces before budget subsampling; acceptance lengths
-                # remain telemetry and never determine the replay window.
+    # Background trace writer: one dedicated thread per rank so trace I/O
+    # overlaps with target capture + forward/backward.  Each step confirms
+    # completion (via future.result()) before optimizer.step(), so errors
+    # propagate back and no step's traces are lost.
+    trace_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="trace-writer"
+    )
+    trace_future = None  # the in-flight write, if any
+
+    def _await_trace():
+        """Wait for the previous step's background trace write and propagate errors."""
+        nonlocal trace_future
+        if trace_future is not None:
+            try:
+                trace_future.result()
+            except BaseException:
+                # Re-raise in the main thread so collective_phase can sync
+                # the failure across all ranks.
+                raise
+            finally:
+                trace_future = None
+
+    try:
+        step = 0
+        step_t0 = time.perf_counter()
+        for epoch in range(args.num_epochs):
+            dataloader.sampler.set_epoch(epoch)
+            iterator = iter(dataloader)
+            while True:
+                # Prefetching/tokenizing prompts is harmless; generation occurs only
+                # here, after the previous step's all-rank synchronization barrier.
+                batches = list(itertools.islice(iterator, args.accumulation_steps))
+                if not batches:
+                    break
+                prompts = []
+                for index, batch in enumerate(batches):
+                    prompts.extend(
+                        prompt_rows(
+                            batch, prefix=f"{run_id}-v{controller.version}-r{rank}-b{index}"
+                        )
+                    )
+                records = collective_phase(lambda: controller.collect(prompts), device)
+                args.draft_version = controller.version
+
+                # --- Submit trace write to background thread ---
+                # Serialize records immediately so the background thread owns a
+                # snapshot and never races with later mutations of `records`.
                 path = trace_dir / f"step-{step:08d}-rank-{rank:05d}.jsonl"
-                with path.open("x") as stream:
-                    for record in records:
-                        stream.write(json.dumps(record) + "\n")
-                return ReplayCollator(
-                    draft_version=controller.version,
-                    target_version=args.rollout_target_version,
-                    num_anchors=args.num_anchors,
-                    eos_token_ids=model.tv_eos_token_ids,
-                )(records)
+                trace_future = trace_executor.submit(_write_trace, path, records)
 
-            data = collective_phase(collate, device)
-            count = data["block_keep_mask"].sum().to(device=device, dtype=torch.float32)
-            dist.all_reduce(count)
-            if count.item() <= 0:
-                raise ValueError("rollout batch has no valid replay blocks on any rank")
-            data["tv_global_block_count"] = count
-            step += 1
-            model.set_training_progress(step, total_steps)
-            draft.train()
-            micro_size = args.micro_batch_size or args.batch_size
-            loss_sum = torch.zeros((), device=device)
-            proxy_sum = torch.zeros_like(loss_sum)
-            overlap_sum = torch.zeros_like(loss_sum)
-            correct_sum = torch.zeros_like(loss_sum)
-            position_sum = torch.zeros_like(loss_sum)
-            for index, micro in enumerate(split_replay_batch(data, micro_size)):
-                result = forward_batch(
-                    micro,
-                    args,
-                    device,
-                    backend,
-                    model,
-                    needs_target_hidden,
-                    step,
-                    micro_index=index,
-                )
-                loss = result[0]
-                # Already normalized by the global effective-batch block count.
-                loss.backward()
-                loss_sum += loss.detach()
-                metrics = result[5]
-                positions = result[4].sum()
-                proxy_sum += (
-                    metrics["tv_acceptance_length_proxy"] * metrics["tv_valid_blocks"]
-                )
-                overlap_sum += metrics["tv_mean_overlap"] * positions
-                correct_sum += result[1] * positions
-                position_sum += positions
-            controller.update(optimizer)
-            args.draft_version = controller.version
-            dist.all_reduce(loss_sum)
-            loss_sum /= dist.get_world_size()
-            if step % args.log_interval == 0:
-                tracker.log(
-                    {
-                        "train/loss": loss_sum.item(),
-                        "train/tv_valid_blocks": count.item(),
-                        "train/tv_acceptance_loss": loss_sum.item(),
-                        "train/tv_acceptance_length_proxy": (proxy_sum / count).item(),
-                        "train/tv_mean_overlap": (
-                            overlap_sum / position_sum.clamp_min(1)
-                        ).item(),
-                        "train/tv_mean_valid_length": (position_sum / count).item(),
-                        "train/accuracy": (
-                            correct_sum / position_sum.clamp_min(1)
-                        ).item(),
-                        "train/draft_version": controller.version,
-                        "train/lr": optimizer.get_learning_rate(),
-                    },
-                    step=step,
-                )
-                if rank == 0:
-                    acc_len_proxy = (proxy_sum / count).item()
-                    mean_overlap = (overlap_sum / position_sum.clamp_min(1)).item()
-                    mean_valid_len = (position_sum / count).item()
-                    accuracy = (correct_sum / position_sum.clamp_min(1)).item()
-                    print(
-                        f"Replay step {step}: loss={loss_sum.item():.6f}, blocks={int(count)}, "
-                        f"acc_len={acc_len_proxy:.3f}, overlap={mean_overlap:.3f}, "
-                        f"valid_len={mean_valid_len:.2f}, acc={accuracy:.4f}, "
-                        f"draft V{controller.version}",
-                        flush=True,
+                # --- Collate without blocking on trace I/O ---
+                def collate():
+                    return ReplayCollator(
+                        draft_version=controller.version,
+                        target_version=args.rollout_target_version,
+                        num_anchors=args.num_anchors,
+                        eos_token_ids=model.tv_eos_token_ids,
+                    )(records)
+
+                data = collective_phase(collate, device)
+                count = data["block_keep_mask"].sum().to(device=device, dtype=torch.float32)
+                dist.all_reduce(count)
+                if count.item() <= 0:
+                    raise ValueError("rollout batch has no valid replay blocks on any rank")
+                data["tv_global_block_count"] = count
+                step += 1
+                model.set_training_progress(step, total_steps)
+                draft.train()
+                micro_size = args.micro_batch_size or args.batch_size
+                loss_sum = torch.zeros((), device=device)
+                proxy_sum = torch.zeros_like(loss_sum)
+                overlap_sum = torch.zeros_like(loss_sum)
+                correct_sum = torch.zeros_like(loss_sum)
+                position_sum = torch.zeros_like(loss_sum)
+                for index, micro in enumerate(split_replay_batch(data, micro_size)):
+                    result = forward_batch(
+                        micro,
+                        args,
+                        device,
+                        backend,
+                        model,
+                        needs_target_hidden,
+                        step,
+                        micro_index=index,
                     )
-            if step % args.save_interval == 0:
-                save_checkpoint(args, epoch, step, model, draft, optimizer)
-            if (args.max_steps is not None and step >= args.max_steps) or (
-                args.stop_after_steps is not None and step >= args.stop_after_steps
-            ):
-                save_checkpoint(args, epoch, step, model, draft, optimizer)
-                return
-    save_checkpoint(args, args.num_epochs, step, model, draft, optimizer)
+                    loss = result[0]
+                    # Already normalized by the global effective-batch block count.
+                    loss.backward()
+                    loss_sum += loss.detach()
+                    metrics = result[5]
+                    positions = result[4].sum()
+                    proxy_sum += (
+                        metrics["tv_acceptance_length_proxy"] * metrics["tv_valid_blocks"]
+                    )
+                    overlap_sum += metrics["tv_mean_overlap"] * positions
+                    correct_sum += result[1] * positions
+                    position_sum += positions
+
+                # --- Confirm trace write before optimizer.step() ---
+                _await_trace()
+                controller.update(optimizer)
+                args.draft_version = controller.version
+                dist.all_reduce(loss_sum)
+                loss_sum /= dist.get_world_size()
+                if step % args.log_interval == 0:
+                    tracker.log(
+                        {
+                            "train/loss": loss_sum.item(),
+                            "train/tv_valid_blocks": count.item(),
+                            "train/tv_acceptance_loss": loss_sum.item(),
+                            "train/tv_acceptance_length_proxy": (proxy_sum / count).item(),
+                            "train/tv_mean_overlap": (
+                                overlap_sum / position_sum.clamp_min(1)
+                            ).item(),
+                            "train/tv_mean_valid_length": (position_sum / count).item(),
+                            "train/accuracy": (
+                                correct_sum / position_sum.clamp_min(1)
+                            ).item(),
+                            "train/draft_version": controller.version,
+                            "train/lr": optimizer.get_learning_rate(),
+                        },
+                        step=step,
+                    )
+                    if rank == 0:
+                        acc_len_proxy = (proxy_sum / count).item()
+                        mean_overlap = (overlap_sum / position_sum.clamp_min(1)).item()
+                        mean_valid_len = (position_sum / count).item()
+                        accuracy = (correct_sum / position_sum.clamp_min(1)).item()
+                        elapsed = time.perf_counter() - step_t0
+                        print(
+                            f"Replay step {step}: loss={loss_sum.item():.6f}, blocks={int(count)}, "
+                            f"acc_len={acc_len_proxy:.3f}, overlap={mean_overlap:.3f}, "
+                            f"valid_len={mean_valid_len:.2f}, acc={accuracy:.4f}, "
+                            f"draft V{controller.version}, time={elapsed:.1f}s",
+                            flush=True,
+                        )
+                step_t0 = time.perf_counter()
+                if step % args.save_interval == 0:
+                    save_checkpoint(args, epoch, step, model, draft, optimizer)
+                if (args.max_steps is not None and step >= args.max_steps) or (
+                    args.stop_after_steps is not None and step >= args.stop_after_steps
+                ):
+                    save_checkpoint(args, epoch, step, model, draft, optimizer)
+                    return
+        save_checkpoint(args, args.num_epochs, step, model, draft, optimizer)
+    finally:
+        # Drain the last in-flight trace write (if any) and shut down the
+        # executor cleanly.  Waits up to 30 s; if the write hangs the
+        # process is likely exiting anyway.
+        if trace_future is not None:
+            try:
+                trace_future.result(timeout=30)
+            except BaseException:
+                pass
+        trace_executor.shutdown(wait=False)
