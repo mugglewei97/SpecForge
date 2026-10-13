@@ -149,6 +149,31 @@ def test_teacher_forced_resume_allows_memory_tuning():
     validate_objective_resume(saved, args)
 
 
+def test_replay_cli_accepts_accumulation_and_requires_trace_backend_and_identity():
+    args = training_args(
+        "--anchor-mode",
+        "replay",
+        "--dspark-loss-type",
+        "tv-acceptance",
+        "--target-model-backend",
+        "sglang",
+        "--rollout-target-version",
+        "target-sha",
+        "--accumulation-steps",
+        "2",
+        "--micro-batch-size",
+        "1",
+    )
+    validate_objective_args(args)
+    args.rollout_target_version = None
+    with pytest.raises(ValueError, match="target-version"):
+        validate_objective_args(args)
+    args.rollout_target_version = "target-sha"
+    args.target_model_backend = "hf"
+    with pytest.raises(ValueError, match="SGLang"):
+        validate_objective_args(args)
+
+
 def test_config_preserves_checkpoint_values_and_explicit_cli_overrides():
     config = SimpleNamespace(
         markov_rank=32,

@@ -52,6 +52,52 @@ def sample_tv_anchors(loss_mask, attention_mask, num_anchors):
     return torch.where(keep, anchors, 0), keep
 
 
+@torch.no_grad()
+def select_replay_anchors(anchors, keep, loss_mask, attention_mask, budget):
+    """Validate absolute trace positions and uniformly subsample valid blocks.
+
+    Only the predicted token must be supervised: a prompt's last token can
+    seed a response block. Padding never participates in sampling or attention.
+    """
+    if budget < 1 or loss_mask.ndim != 2 or attention_mask.shape != loss_mask.shape:
+        raise ValueError("invalid replay block budget or sequence masks")
+    if (
+        anchors is None
+        or keep is None
+        or anchors.ndim != 2
+        or anchors.shape != keep.shape
+        or anchors.size(0) != loss_mask.size(0)
+        or anchors.dtype != torch.long
+        or keep.dtype != torch.bool
+    ):
+        raise ValueError("replay requires int64 anchors and boolean keep mask [B, A]")
+    length = loss_mask.size(1)
+    if length < 1 or ((anchors < 0) & keep).any() or ((anchors >= length) & keep).any():
+        raise ValueError("replay anchor outside the complete sequence")
+    anchors = torch.where(keep, anchors, 0).detach()
+    safe_next = (anchors + 1).clamp(max=length - 1)
+    keep = (
+        keep
+        & (anchors + 1 < length)
+        & attention_mask.gather(1, anchors).bool()
+        & attention_mask.gather(1, safe_next).bool()
+        & (loss_mask.gather(1, safe_next) > 0.5)
+    )
+    if anchors.size(1) == 0:
+        return (
+            torch.zeros((anchors.size(0), 1), device=anchors.device, dtype=torch.long),
+            torch.zeros((anchors.size(0), 1), device=anchors.device, dtype=torch.bool),
+        )
+    width = max(1, min(budget, int(keep.sum(-1).max())))
+    # Random priorities give equal inclusion probability, including late rounds.
+    scores = torch.where(keep, torch.rand(anchors.shape, device=anchors.device), 2.0)
+    indices = scores.argsort(-1)[:, :width]
+    selected = anchors.gather(1, indices)
+    selected_keep = keep.gather(1, indices)
+    selected = torch.where(selected_keep, selected, length).sort(-1).values
+    return torch.where(selected < length, selected, 0), selected < length
+
+
 def tv_acceptance_terms(draft_logits, target_logits, valid_mask, temperature=1.0):
     """Additive block terms for [..., K, V] logits on identical prefixes.
 
@@ -93,7 +139,14 @@ def tv_acceptance_terms(draft_logits, target_logits, valid_mask, temperature=1.0
 
 
 def teacher_forced_tv_forward(
-    model, input_ids, attention_mask, anchors, hidden, valid_mask, last_hidden_states
+    model,
+    input_ids,
+    attention_mask,
+    anchors,
+    hidden,
+    valid_mask,
+    last_hidden_states,
+    global_block_count=None,
 ):
     """Score all blocks using target states and predecessors from the same sequence.
 
@@ -101,6 +154,8 @@ def teacher_forced_tv_forward(
     input_ids[s+j], and its target distribution comes from final hidden row s+j.
     No token sampling or target transformer forward occurs here or in backward.
     """
+    if hidden.ndim != 4 or anchors.dtype != torch.long or input_ids.dtype != torch.long:
+        raise ValueError("TV requires [B, A, K, H] hidden and int64 tokens/anchors")
     batch, blocks, width, hidden_size = hidden.shape
     if last_hidden_states is None:
         raise ValueError("tv-acceptance requires target final hidden states")
@@ -118,6 +173,12 @@ def teacher_forced_tv_forward(
         )
     flat_hidden = hidden.reshape(-1, width, hidden_size)
     with torch.no_grad():
+        if (
+            ((anchors < 0) | (anchors >= input_ids.size(1)))
+            .logical_and(valid_mask.bool().any(-1))
+            .any()
+        ):
+            raise ValueError("active TV anchors must lie within the complete sequence")
         positions = anchors[..., None] + torch.arange(width, device=input_ids.device)
         label_positions = positions + 1
         length = input_ids.size(1)
@@ -172,10 +233,10 @@ def teacher_forced_tv_forward(
             chunk_size=model.tv_objective_chunk_blocks,
         )
     )
-    return reduce_tv_terms(terms)
+    return reduce_tv_terms(terms, global_block_count=global_block_count)
 
 
-def reduce_tv_terms(terms: TVAcceptanceTerms):
+def reduce_tv_terms(terms: TVAcceptanceTerms, global_block_count=None):
     """Normalize across ranks and return DSpark's loss/telemetry contract."""
     scalars = torch.stack(
         [terms.loss_sum.detach(), terms.length_sum.detach(), terms.block_count.detach()]
@@ -194,20 +255,32 @@ def reduce_tv_terms(terms: TVAcceptanceTerms):
         dist.all_reduce(scalars)
         dist.all_reduce(positions)
     global_loss, global_length, global_count = scalars.unbind(0)
-    if global_count.item() <= 0:
+    denominator = (
+        global_count
+        if global_block_count is None
+        else torch.as_tensor(
+            global_block_count, device=global_count.device, dtype=global_count.dtype
+        ).detach()
+    )
+    if (
+        denominator.numel() != 1
+        or not torch.isfinite(denominator)
+        or denominator.item() <= 0
+    ):
         raise ValueError("tv-acceptance has no valid blocks on any rank")
     # FSDP averages rank gradients: compensate to weight every nonempty block
     # equally. The same reduced count also normalizes the detached telemetry.
-    loss = world * terms.loss_sum / global_count
+    loss = world * terms.loss_sum / denominator
+    telemetry_count = global_count.clamp_min(1)
     overlap, correct, count = positions.unbind(0)
     position_denominator = count.clamp_min(1)
     total_positions = count.sum().clamp_min(1)
     components = {
-        "tv_acceptance_loss": global_loss / global_count,
-        "tv_acceptance_length_proxy": global_length / global_count,
+        "tv_acceptance_loss": global_loss / telemetry_count,
+        "tv_acceptance_length_proxy": global_length / telemetry_count,
         "tv_mean_overlap": overlap.sum() / total_positions,
         "tv_valid_blocks": global_count,
-        "tv_mean_valid_length": count.sum() / global_count,
+        "tv_mean_valid_length": count.sum() / telemetry_count,
     }
     return (
         loss,

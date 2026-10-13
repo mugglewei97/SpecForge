@@ -115,14 +115,19 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, DSparkDraftModel]:
 
     device_type = device.type
 
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device=device_type if args.target_model_backend == "hf" else None,
-        trust_remote_code=args.trust_remote_code,
-        **target_model_kwargs,
-    )
+    if args.anchor_mode == "replay":
+        from specforge.inference.dspark_replay_engine import SGLangReplayEngine
+
+        target_model = SGLangReplayEngine(args)
+    else:
+        target_model = get_dflash_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device=device_type if args.target_model_backend == "hf" else None,
+            trust_remote_code=args.trust_remote_code,
+            **target_model_kwargs,
+        )
 
     if args.draft_config_path:
         draft_config = load_draft_config(args.draft_config_path)
@@ -215,6 +220,26 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     """Build train and eval dataloaders."""
     import hashlib
 
+    if args.anchor_mode == "replay" and args.rollout_prompt_format == "tokens":
+        from torch.utils.data.distributed import DistributedSampler
+        from specforge.data.dspark_replay import (
+            TokenPromptDataset,
+            collate_token_prompts,
+        )
+
+        dataset = TokenPromptDataset(args.train_data_path)
+        sampler = DistributedSampler(dataset, shuffle=True, seed=args.seed)
+        return (
+            DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                collate_fn=collate_token_prompts,
+                num_workers=0,
+            ),
+            None,
+        )
+
     train_paths = [args.train_data_path, *args.additional_train_data_path]
     mixture_weights = args.train_data_mixture_weights
     if mixture_weights is None:
@@ -243,7 +268,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    min_loss_tokens = 2 * args.block_size
+    min_loss_tokens = 1 if args.anchor_mode == "replay" else 2 * args.block_size
     processed_sources = []
     source_sizes = []
     for source_index, path in enumerate(train_paths):

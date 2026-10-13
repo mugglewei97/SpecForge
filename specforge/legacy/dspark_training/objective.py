@@ -14,6 +14,25 @@ TV_PREFIX_MODE = "teacher-forced"
 def add_objective_args(group):
     # Saved with training args to distinguish old sampled-prefix checkpoints.
     group.set_defaults(tv_prefix_mode=TV_PREFIX_MODE)
+    group.add_argument("--anchor-mode", choices=["random", "replay"], default="random")
+    group.add_argument(
+        "--rollout-target-version",
+        default=None,
+        help="Immutable target revision/checkpoint identity saved in every trace",
+    )
+    group.add_argument(
+        "--rollout-prompt-format", choices=["chat", "tokens"], default="chat"
+    )
+    group.add_argument("--rollout-max-new-tokens", type=int, default=1024)
+    group.add_argument(
+        "--rollout-timeout",
+        type=int,
+        default=600,
+        help="Local scheduler RPC timeout in seconds",
+    )
+    group.add_argument("--rollout-temperature", type=float, default=1.0)
+    group.add_argument("--rollout-top-p", type=float, default=1.0)
+    group.add_argument("--rollout-top-k", type=int, default=-1)
     group.add_argument(
         "--dspark-loss-type",
         choices=["ce-l1", "tv-acceptance"],
@@ -43,6 +62,53 @@ def add_objective_args(group):
 
 
 def validate_objective_args(args):
+    replay = getattr(args, "anchor_mode", "random") == "replay"
+    if replay:
+        if (
+            args.dspark_loss_type != "tv-acceptance"
+            or args.target_model_backend != "sglang"
+        ):
+            raise ValueError(
+                "replay requires tv-acceptance and the SGLang target backend"
+            )
+        if not args.rollout_target_version:
+            raise ValueError(
+                "replay requires --rollout-target-version (immutable target identity)"
+            )
+        if (
+            not math.isfinite(args.rollout_temperature)
+            or args.rollout_temperature < 0
+            or not 0 < args.rollout_top_p <= 1
+            or args.rollout_top_k == 0
+            or args.rollout_top_k < -1
+            or args.rollout_max_new_tokens < 1
+            or args.accumulation_steps < 1
+            or args.num_anchors < 1
+            or args.rollout_timeout < 1
+        ):
+            raise ValueError("invalid replay sampling/accumulation/block settings")
+        if args.additional_train_data_path or args.eval_data_path:
+            raise ValueError(
+                "replay v1 requires one prompt source and no separate eval dataset"
+            )
+        if args.resume:
+            raise ValueError(
+                "replay v1 uses fresh optimizer runs; warm start with --init-draft-model-path"
+            )
+        if (
+            args.sglang_enable_torch_compile
+            or args.sglang_enable_dp_attention
+            or args.sglang_enable_dp_lm_head
+            or args.sglang_ep_size != 1
+        ):
+            raise ValueError(
+                "replay v1 requires eager SGLang with TP=1, DP=1, EP=1 per training rank"
+            )
+        if (
+            args.sglang_context_length is not None
+            and args.sglang_context_length < args.max_length
+        ):
+            raise ValueError("SGLang context length must cover replay max-length")
     if args.dspark_loss_type != "tv-acceptance":
         return
     if (
@@ -54,7 +120,7 @@ def validate_objective_args(args):
         raise ValueError("TV objective chunk size must be positive")
     if args.tp_size != 1:
         raise ValueError("tv-acceptance currently requires --tp-size 1")
-    if args.accumulation_steps != 1 or args.micro_batch_size:
+    if not replay and (args.accumulation_steps != 1 or args.micro_batch_size):
         raise ValueError(
             "tv-acceptance requires accumulation-steps=1 and micro-batch-size=0 "
             "for exact block normalization"
@@ -76,6 +142,10 @@ def validate_objective_args(args):
 
 def validate_objective_resume(saved_args, args):
     saved = saved_args if isinstance(saved_args, Mapping) else vars(saved_args)
+    if saved.get("anchor_mode", "random") != getattr(args, "anchor_mode", "random"):
+        raise ValueError(
+            "Cannot resume with changed anchor_mode; use --init-draft-model-path"
+        )
     if (
         args.dspark_loss_type == "tv-acceptance"
         and saved.get("dspark_loss_type") == "tv-acceptance"

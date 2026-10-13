@@ -5881,6 +5881,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
         attention_mask: Optional[torch.Tensor] = None,
         sample_ids: Optional[torch.Tensor] = None,
         source_ids: Optional[torch.Tensor] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        anchor_mode: str = "random",
+        tv_global_block_count: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -5919,11 +5923,30 @@ class OnlineDSparkModel(OnlineDFlashModel):
             attention_mask = torch.ones_like(input_ids)
 
         # ---- DFlash backbone (identical construction to OnlineDFlashModel.forward) ----
-        if getattr(self, "tv_acceptance_enabled", False):
+        if anchor_mode not in ("random", "replay"):
+            raise ValueError(f"Unknown anchor mode: {anchor_mode}")
+        if anchor_mode == "replay":
+            if not getattr(self, "tv_acceptance_enabled", False):
+                raise ValueError("replay anchors require tv-acceptance")
+            from specforge.core.tv_acceptance import select_replay_anchors
+
+            anchor_positions, block_keep_mask = select_replay_anchors(
+                anchor_positions,
+                block_keep_mask,
+                loss_mask,
+                attention_mask,
+                self.num_anchors,
+            )
+            hidden_states = hidden_states.detach()
+        elif anchor_positions is not None or block_keep_mask is not None:
+            raise ValueError("explicit anchors require anchor_mode='replay'")
+        elif getattr(self, "tv_acceptance_enabled", False):
             from specforge.core.tv_acceptance import sample_tv_anchors
 
             anchor_positions, block_keep_mask = sample_tv_anchors(
-                loss_mask, attention_mask, self.num_anchors,
+                loss_mask,
+                attention_mask,
+                self.num_anchors,
             )
         else:
             anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -6039,6 +6062,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 hidden_4d,
                 eval_bool,
                 last_hidden_states,
+                global_block_count=tv_global_block_count,
             )
         reference_num = reference_cosine_num = reference_mse_num = reference_ratio_num = local_den.new_zeros(())
         if self.carh_reference_calibration_alpha > 0:

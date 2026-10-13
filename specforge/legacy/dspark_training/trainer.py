@@ -127,6 +127,17 @@ def _forward_dspark_data_batch(
     global_step,
     micro_index=0,
 ):
+    replay_kwargs = {}
+    if getattr(args, "anchor_mode", "random") == "replay":
+        from specforge.data.dspark_replay import assert_replay_batch
+
+        assert_replay_batch(data, args.draft_version, args.rollout_target_version)
+        replay_kwargs = dict(
+            anchor_mode="replay",
+            anchor_positions=data["anchor_positions"].to(device),
+            block_keep_mask=data["block_keep_mask"].to(device),
+            tv_global_block_count=data["tv_global_block_count"].to(device),
+        )
     # Slice on CPU before calling this function: neither target nor drafter
     # materializes the whole logical batch on GPU in microbatch mode.
     input_ids = data["input_ids"].to(device, non_blocking=True)
@@ -142,13 +153,24 @@ def _forward_dspark_data_batch(
     )
     if args.multi_teacher_oracle_export_dir or args.multi_teacher_oracle_cache:
         torch.manual_seed(rollout_seed)
-    target_output = target_model.generate_dflash_data(
-        input_ids, attention_mask, loss_mask
-    )
-    hidden_states = target_output.hidden_states.to(device, non_blocking=True)
+    with torch.no_grad():
+        if replay_kwargs:
+            from .replay import collective_phase
+
+            target_output = collective_phase(
+                lambda: target_model.generate_dflash_data(
+                    input_ids, attention_mask, loss_mask
+                ),
+                device,
+            )
+        else:
+            target_output = target_model.generate_dflash_data(
+                input_ids, attention_mask, loss_mask
+            )
+    hidden_states = target_output.hidden_states.detach().to(device, non_blocking=True)
     last_hidden_states = target_output.last_hidden_states
     if last_hidden_states is not None:
-        last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+        last_hidden_states = last_hidden_states.detach().to(device, non_blocking=True)
     elif needs_target_hidden:
         raise RuntimeError(
             "The selected DSpark objective requires target final hidden states, "
@@ -173,6 +195,7 @@ def _forward_dspark_data_batch(
             attention_mask=attention_mask,
             sample_ids=sample_ids,
             source_ids=source_ids,
+            **replay_kwargs,
         )
 
 
@@ -211,7 +234,7 @@ def run_training(args):
             "micro-batch-size must be 0 (disabled) or between 1 and batch-size"
         )
     if args.micro_batch_size:
-        if args.accumulation_steps != 1:
+        if args.accumulation_steps != 1 and args.anchor_mode != "replay":
             raise ValueError(
                 "Physical microbatch splitting requires accumulation-steps=1"
             )
@@ -1262,6 +1285,30 @@ def run_training(args):
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
+
+    if args.anchor_mode == "replay":
+        from .replay import run_replay_training
+
+        try:
+            run_replay_training(
+                args,
+                train_dataloader,
+                target_model,
+                dspark_model,
+                draft_model,
+                optimizer,
+                device,
+                tracker,
+                total_steps,
+                needs_target_hidden,
+                forward_batch=_forward_dspark_data_batch,
+                save_checkpoint=save_checkpoint,
+            )
+        finally:
+            target_model.close()
+            tracker.close()
+            destroy_distributed()
+        return
 
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
