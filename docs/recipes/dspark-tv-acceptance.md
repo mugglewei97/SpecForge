@@ -160,13 +160,14 @@ speculative rollout 和 replay capture，不额外加载第二份 capture target
 和 torch.compile。FSDP attention backend 仍可选 `sdpa`。
 实现不启动 Ray，也不调用 `pkill`。
 
-### 先核实服务器 SGLang
+### 安装 SGLang 0.5.18 replay 补丁
 
-本地审阅的基线是 SGLang `release/v0.5.18` commit `71de97b264`，其中
+开发与本地环境均已确认使用 SGLang `0.5.18`。本地审阅的源码基线是
+`release/v0.5.18` commit `71de97b264`，其中
 `DSparkWorkerV2` 没有训练所需的逐轮 trace；已有 spec-capture prefill 补丁不满足要求。
 补丁工具核对 draft/verify/model 的源码 SHA-256，以及 scheduler/Engine 接口，
 检查全部文件后才修改两个插入点所在的源码文件。其他实现会明确失败，不能只改版本号
-或跳过校验就启动训练。服务器环境尚需用下列命令实际检查。
+或跳过校验就启动训练。下列命令在训练环境检查实际安装源码并安装补丁。
 
 ```bash
 cd /ossfs/workspace/SpecForge
