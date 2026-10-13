@@ -74,6 +74,43 @@ class SGLangReplayEngine:
                 # Child schedulers inherit the rank-private root during spawn.
                 previous = os.environ.get("SPECFORGE_DSPARK_REPLAY_DIR")
                 os.environ["SPECFORGE_DSPARK_REPLAY_DIR"] = str(self.directory)
+
+                # Torchrun/torch.distributed sets MASTER_ADDR, MASTER_PORT,
+                # RANK, WORLD_SIZE, LOCAL_RANK so that training ranks can join
+                # the FSDP process group via env://.  SGLang Engine spawns
+                # an independent scheduler subprocess (mp.spawn) that must set
+                # up its own single-rank NCCL group — but the inherited env
+                # vars cause PyTorch's init_process_group to either connect
+                # to the wrong TCPStore (the training rendezvous) or collide
+                # on the same port, resulting in a 600 s TCPStore timeout.
+                #
+                # Save and clear the distributed env vars so the SGLang child
+                # process creates a fresh, conflict-free TCPStore on its own
+                # dynamically allocated port.
+                _saved_dist_env = {}
+                for _key in (
+                    "MASTER_ADDR",
+                    "MASTER_PORT",
+                    "RANK",
+                    "WORLD_SIZE",
+                    "LOCAL_RANK",
+                    "GROUP_WORLD_SIZE",
+                ):
+                    if _key in os.environ:
+                        _saved_dist_env[_key] = os.environ.pop(_key)
+
+                # Torchrun sets TORCHELASTIC_USE_AGENT_STORE=True so that
+                # training workers create a TCPStore *client* (the agent
+                # leader hosts the server).  The SGLang scheduler subprocess
+                # inherits this flag but runs its own independent NCCL group
+                # — no agent server exists for that group, so rank 0 must
+                # create a TCPStore *server* (is_master=True).  Without this
+                # override, every SGLang rank creates only a client and the
+                # connection hangs for 600 s before timing out.  PyTorch's
+                # own async_process_executor.py applies the same fix.
+                _saved_agent_store = os.environ.get("TORCHELASTIC_USE_AGENT_STORE")
+                os.environ["TORCHELASTIC_USE_AGENT_STORE"] = "False"
+
                 try:
                     self.engine = Engine(
                         model_path=self.args.target_model_path,
@@ -114,6 +151,13 @@ class SGLangReplayEngine:
                         os.environ.pop("SPECFORGE_DSPARK_REPLAY_DIR", None)
                     else:
                         os.environ["SPECFORGE_DSPARK_REPLAY_DIR"] = previous
+                    # Restore the distributed env vars so the FSDP training
+                    # process can continue using its original process group.
+                    os.environ.update(_saved_dist_env)
+                    if _saved_agent_store is None:
+                        os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+                    else:
+                        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = _saved_agent_store
             save_file(state_dict, str(self.directory / "weights.safetensors"))
             result = self._rpc(
                 "sync",

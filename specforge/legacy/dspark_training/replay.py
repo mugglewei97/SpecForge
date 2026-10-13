@@ -269,8 +269,15 @@ def run_replay_training(
                     step=step,
                 )
                 if rank == 0:
+                    acc_len_proxy = (proxy_sum / count).item()
+                    mean_overlap = (overlap_sum / position_sum.clamp_min(1)).item()
+                    mean_valid_len = (position_sum / count).item()
+                    accuracy = (correct_sum / position_sum.clamp_min(1)).item()
                     print(
-                        f"Replay step {step}: loss={loss_sum.item():.6f}, blocks={int(count)}, synchronized draft V{controller.version}",
+                        f"Replay step {step}: loss={loss_sum.item():.6f}, blocks={int(count)}, "
+                        f"acc_len={acc_len_proxy:.3f}, overlap={mean_overlap:.3f}, "
+                        f"valid_len={mean_valid_len:.2f}, acc={accuracy:.4f}, "
+                        f"draft V{controller.version}",
                         flush=True,
                     )
             if step % args.save_interval == 0:

@@ -92,8 +92,11 @@ def _mapped_weights(model, weights):
     loaders may silently ignore unknown names, which is unsafe for this loop.
     """
     params = dict(model.named_parameters())
+    _skip_prefixes = ("embed_tokens.", "lm_head.", "confidence_head.")
     packed = {}
     for name, value in weights.items():
+        if any(name.startswith(p) for p in _skip_prefixes):
+            continue
         mapped, part = name, None
         for fused, source, index in (
             ("qkv_proj", "q_proj", 0),
@@ -108,7 +111,7 @@ def _mapped_weights(model, weights):
         if mapped not in params:
             raise ValueError(f"unmapped DSpark weight: {name}")
         packed.setdefault(mapped, {})[part] = value
-    expected = {n for n in params if not n.startswith(("embed_tokens.", "lm_head."))}
+    expected = {n for n in params if not any(n.startswith(p) for p in _skip_prefixes)}
     if set(packed) != expected:
         raise ValueError(
             f"incomplete draft state: missing={sorted(expected - packed.keys())}, extra={sorted(packed.keys() - expected)}"
@@ -183,7 +186,7 @@ def dispatch(scheduler):
     worker = scheduler.draft_worker
     if type(worker).__name__ != "DSparkWorkerV2":
         raise RuntimeError("replay requires the audited DSparkWorkerV2")
-    if worker._simulate_acc_len != 0:
+    if worker._simulate_acc_len > 0:
         raise RuntimeError("real rollout forbids SGLANG_SIMULATE_ACC_LEN")
     state = getattr(worker, "_specforge_replay", None)
     try:
