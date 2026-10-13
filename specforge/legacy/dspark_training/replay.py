@@ -85,15 +85,16 @@ class SynchronousReplayController:
             raise
 
 
-def full_draft_state(model):
+def full_draft_state(model, *, offload_to_cpu=True):
     with FSDP.state_dict_type(
         model,
         StateDictType.FULL_STATE_DICT,
-        FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+        FullStateDictConfig(offload_to_cpu=offload_to_cpu, rank0_only=False),
     ):
         state = model.state_dict()
     return {
-        name.removeprefix("draft_model."): value.detach().cpu().contiguous().clone()
+        # FULL_STATE_DICT already owns full tensors independent of FSDP shards.
+        name.removeprefix("draft_model."): value.detach().contiguous()
         for name, value in state.items()
         if name.startswith("draft_model.")
     }
@@ -141,6 +142,18 @@ def _write_trace(path, records):
             stream.write(json.dumps(record) + "\n")
 
 
+def rollout_counts(records):
+    """Actual output counts, with accepted proposals clipped to the stop boundary."""
+    rounds = [meta for record in records for meta in record["round_metadata"]]
+    return [
+        sum(len(r["input_ids"]) - r["prompt_length"] for r in records),
+        len(rounds),
+        sum(min(r["accepted_draft_tokens"], r["committed_tokens"]) for r in rounds),
+        sum(r.get("verified_draft_tokens", r["draft_length"]) for r in rounds),
+        sum(r["committed_tokens"] for r in rounds),
+    ]
+
+
 def run_replay_training(
     args,
     dataloader,
@@ -164,12 +177,26 @@ def run_replay_training(
         for name, p in draft.named_parameters()
         if p.requires_grad
     }
+    sync_times = {}
+
+    def synchronize_device():
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
 
     def sync_weights(version):
-        state = full_draft_state(model)
-        return collective_phase(
+        started = time.perf_counter()
+        state = full_draft_state(
+            model,
+            offload_to_cpu=getattr(backend, "tensor_transport", "files") != "cuda-ipc",
+        )
+        synchronize_device()
+        sync_times["export"] = time.perf_counter() - started
+        started = time.perf_counter()
+        acknowledged = collective_phase(
             lambda: backend.sync(state, draft.config, trainable_names, version), device
         )
+        sync_times["sync"] = time.perf_counter() - started
+        return acknowledged
 
     controller = SynchronousReplayController(backend, sync_weights)
     controller.synchronize()
@@ -207,11 +234,11 @@ def run_replay_training(
 
     try:
         step = 0
-        step_t0 = time.perf_counter()
         for epoch in range(args.num_epochs):
             dataloader.sampler.set_epoch(epoch)
             iterator = iter(dataloader)
             while True:
+                step_t0 = time.perf_counter()
                 # Prefetching/tokenizing prompts is harmless; generation occurs only
                 # here, after the previous step's all-rank synchronization barrier.
                 batches = list(itertools.islice(iterator, args.accumulation_steps))
@@ -221,10 +248,13 @@ def run_replay_training(
                 for index, batch in enumerate(batches):
                     prompts.extend(
                         prompt_rows(
-                            batch, prefix=f"{run_id}-v{controller.version}-r{rank}-b{index}"
+                            batch,
+                            prefix=f"{run_id}-v{controller.version}-r{rank}-b{index}",
                         )
                     )
+                started = time.perf_counter()
                 records = collective_phase(lambda: controller.collect(prompts), device)
+                rollout_seconds = time.perf_counter() - started
                 args.draft_version = controller.version
 
                 # --- Submit trace write to background thread ---
@@ -243,10 +273,14 @@ def run_replay_training(
                     )(records)
 
                 data = collective_phase(collate, device)
-                count = data["block_keep_mask"].sum().to(device=device, dtype=torch.float32)
+                count = (
+                    data["block_keep_mask"].sum().to(device=device, dtype=torch.float32)
+                )
                 dist.all_reduce(count)
                 if count.item() <= 0:
-                    raise ValueError("rollout batch has no valid replay blocks on any rank")
+                    raise ValueError(
+                        "rollout batch has no valid replay blocks on any rank"
+                    )
                 data["tv_global_block_count"] = count
                 step += 1
                 model.set_training_progress(step, total_steps)
@@ -257,6 +291,8 @@ def run_replay_training(
                 overlap_sum = torch.zeros_like(loss_sum)
                 correct_sum = torch.zeros_like(loss_sum)
                 position_sum = torch.zeros_like(loss_sum)
+                capture_before = getattr(backend, "capture_seconds", 0.0)
+                started = time.perf_counter()
                 for index, micro in enumerate(split_replay_batch(data, micro_size)):
                     result = forward_batch(
                         micro,
@@ -275,25 +311,92 @@ def run_replay_training(
                     metrics = result[5]
                     positions = result[4].sum()
                     proxy_sum += (
-                        metrics["tv_acceptance_length_proxy"] * metrics["tv_valid_blocks"]
+                        metrics["tv_acceptance_length_proxy"]
+                        * metrics["tv_valid_blocks"]
                     )
                     overlap_sum += metrics["tv_mean_overlap"] * positions
                     correct_sum += result[1] * positions
                     position_sum += positions
 
+                synchronize_device()
+                capture_seconds = (
+                    getattr(backend, "capture_seconds", 0.0) - capture_before
+                )
+                train_seconds = time.perf_counter() - started - capture_seconds
+
                 # --- Confirm trace write before optimizer.step() ---
-                _await_trace()
+                collective_phase(_await_trace, device)
+                started = time.perf_counter()
                 controller.update(optimizer)
+                optimizer_seconds = (
+                    time.perf_counter()
+                    - started
+                    - sync_times["export"]
+                    - sync_times["sync"]
+                )
                 args.draft_version = controller.version
                 dist.all_reduce(loss_sum)
                 loss_sum /= dist.get_world_size()
                 if step % args.log_interval == 0:
+                    # Every rank participates. Stage maxima can come from
+                    # different ranks and need not add up to total step time.
+                    times = torch.tensor(
+                        [
+                            time.perf_counter() - step_t0,
+                            rollout_seconds,
+                            capture_seconds,
+                            train_seconds,
+                            optimizer_seconds,
+                            sync_times["export"],
+                            sync_times["sync"],
+                        ],
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                    counts = torch.tensor(
+                        rollout_counts(records), dtype=torch.float64, device=device
+                    )
+                    dist.all_reduce(times, op=dist.ReduceOp.MAX)
+                    dist.all_reduce(counts)
+                    (
+                        elapsed,
+                        rollout_s,
+                        capture_s,
+                        train_s,
+                        optimizer_s,
+                        export_s,
+                        sync_s,
+                    ) = times.tolist()
+                    output_tokens, rounds, accepted, verified, committed = (
+                        counts.tolist()
+                    )
+                    perf_metrics = {
+                        "perf/step_seconds": elapsed,
+                        "perf/rollout_seconds": rollout_s,
+                        "perf/target_capture_seconds": capture_s,
+                        "perf/forward_backward_seconds": train_s,
+                        "perf/optimizer_seconds": optimizer_s,
+                        "perf/weight_export_seconds": export_s,
+                        "perf/weight_sync_seconds": sync_s,
+                        "perf/rollout_tokens_per_second": output_tokens
+                        / max(rollout_s, 1e-9),
+                        "perf/output_tokens_per_step_second": output_tokens
+                        / max(elapsed, 1e-9),
+                        "rollout/accepted_draft_tokens_per_round": accepted
+                        / max(rounds, 1),
+                        "rollout/draft_acceptance_rate": accepted / max(verified, 1),
+                        "rollout/committed_tokens_per_round": committed
+                        / max(rounds, 1),
+                    }
                     tracker.log(
                         {
+                            **perf_metrics,
                             "train/loss": loss_sum.item(),
                             "train/tv_valid_blocks": count.item(),
                             "train/tv_acceptance_loss": loss_sum.item(),
-                            "train/tv_acceptance_length_proxy": (proxy_sum / count).item(),
+                            "train/tv_acceptance_length_proxy": (
+                                proxy_sum / count
+                            ).item(),
                             "train/tv_mean_overlap": (
                                 overlap_sum / position_sum.clamp_min(1)
                             ).item(),
@@ -311,15 +414,16 @@ def run_replay_training(
                         mean_overlap = (overlap_sum / position_sum.clamp_min(1)).item()
                         mean_valid_len = (position_sum / count).item()
                         accuracy = (correct_sum / position_sum.clamp_min(1)).item()
-                        elapsed = time.perf_counter() - step_t0
                         print(
                             f"Replay step {step}: loss={loss_sum.item():.6f}, blocks={int(count)}, "
                             f"acc_len={acc_len_proxy:.3f}, overlap={mean_overlap:.3f}, "
                             f"valid_len={mean_valid_len:.2f}, acc={accuracy:.4f}, "
-                            f"draft V{controller.version}, time={elapsed:.1f}s",
+                            f"real_accepted={accepted / max(rounds, 1):.3f}, "
+                            f"draft V{controller.version}, time={elapsed:.1f}s "
+                            f"(rollout={rollout_s:.1f}, capture={capture_s:.1f}, "
+                            f"train={train_s:.1f}, export={export_s:.1f}, sync={sync_s:.1f})",
                             flush=True,
                         )
-                step_t0 = time.perf_counter()
                 if step % args.save_interval == 0:
                     save_checkpoint(args, epoch, step, model, draft, optimizer)
                 if (args.max_steps is not None and step >= args.max_steps) or (

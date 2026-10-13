@@ -166,8 +166,9 @@ def test_two_rank_accumulation_uses_one_global_block_denominator(tmp_path):
 def test_synchronous_version_state_machine_and_failed_sync():
     events = []
     backend = SimpleNamespace(
-        rollout=lambda prompts, version: events.append(("rollout", version))
-        or [trace(version=version)]
+        rollout=lambda prompts, version: (
+            events.append(("rollout", version)) or [trace(version=version)]
+        )
     )
 
     def sync(version):
@@ -290,6 +291,7 @@ def test_training_loop_collects_whole_accumulation_before_backward(
     model, target = make_model()
     model.num_anchors = 10
     events = []
+    logs = []
 
     class Backend:
         def sync(self, state, config, names, version):
@@ -332,7 +334,7 @@ def test_training_loop_collects_whole_accumulation_before_backward(
         accumulation_steps=2,
         micro_batch_size=1,
         batch_size=1,
-        log_interval=100,
+        log_interval=1,
         save_interval=100,
         max_steps=None,
         stop_after_steps=None,
@@ -341,7 +343,7 @@ def test_training_loop_collects_whole_accumulation_before_backward(
         multi_teacher_oracle_cache=None,
         step_seeded_rollouts=False,
     )
-    monkeypatch.setattr(replay, "full_draft_state", lambda model: {})
+    monkeypatch.setattr(replay, "full_draft_state", lambda model, **kwargs: {})
     monkeypatch.setattr(replay.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(replay.dist, "get_world_size", lambda: 1)
     monkeypatch.setattr(replay.dist, "broadcast_object_list", lambda *a, **k: None)
@@ -354,7 +356,7 @@ def test_training_loop_collects_whole_accumulation_before_backward(
         model.draft_model,
         optimizer,
         "cpu",
-        SimpleNamespace(log=lambda *a, **k: None),
+        SimpleNamespace(log=lambda values, **kwargs: logs.append(values)),
         2,
         True,
         forward_batch=_forward_dspark_data_batch,
@@ -373,3 +375,26 @@ def test_training_loop_collects_whole_accumulation_before_backward(
         ("sync", 2),
     ]
     assert len(list(tmp_path.rglob("*.jsonl"))) == 2
+    assert len(logs) == 2
+    for values in logs:
+        assert values["rollout/accepted_draft_tokens_per_round"] == 2
+        assert values["rollout/committed_tokens_per_round"] == 3
+        assert values["rollout/draft_acceptance_rate"] == pytest.approx(2 / 7)
+        assert values["perf/step_seconds"] > 0
+        assert values["perf/weight_sync_seconds"] >= 0
+        assert values["perf/output_tokens_per_step_second"] > 0
+
+
+def test_rollout_metrics_exclude_accepted_tokens_beyond_stop():
+    from specforge.legacy.dspark_training.replay import rollout_counts
+
+    record = trace(anchors=(2,), length=6)
+    record["round_metadata"] = [
+        dict(
+            draft_length=7,
+            verified_draft_tokens=5,
+            accepted_draft_tokens=5,
+            committed_tokens=2,
+        )
+    ]
+    assert rollout_counts([record]) == [3, 1, 2, 5, 2]

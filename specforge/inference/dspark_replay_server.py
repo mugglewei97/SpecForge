@@ -11,6 +11,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
+from specforge.inference.dspark_replay_ipc import export_tensor, import_tensor
+
 PROTOCOL = 1
 
 
@@ -163,6 +165,15 @@ def _capture(scheduler, request):
         )
         if any(h is None for h in final):
             raise RuntimeError("target capture did not return final hidden states")
+        if request.get("tensor_transport", "files") == "cuda-ipc":
+            # Sender ownership extends through the trainer's clone + stream
+            # synchronization. Never release merely because capture RPC ends.
+            tensors = {
+                "hidden_states": torch.stack(hidden).contiguous(),
+                "last_hidden_states": torch.stack(final).contiguous(),
+            }
+            scheduler.draft_worker._specforge_capture_tensors = tensors
+            return {name: export_tensor(value) for name, value in tensors.items()}
         save_file(
             {
                 "hidden_states": torch.stack(hidden).contiguous().cpu(),
@@ -170,6 +181,7 @@ def _capture(scheduler, request):
             },
             str(_path("capture.safetensors")),
         )
+        return None
     finally:
         for module, name, child in replacements:
             setattr(module, name, child)
@@ -193,6 +205,13 @@ def dispatch(scheduler):
         action = request["action"]
         if state is not None and state["phase"] == "failed":
             raise RuntimeError("replay Engine is poisoned by a previous failure")
+        if (
+            getattr(worker, "_specforge_capture_tensors", None) is not None
+            and action != "release_capture"
+        ):
+            raise RuntimeError(
+                "previous CUDA capture must be released before more work"
+            )
         if action == "sync":
             version = request["draft_version"]
             if (
@@ -213,7 +232,16 @@ def dispatch(scheduler):
                 )
             if not scheduler.flush_cache():
                 raise RuntimeError("cache flush before draft sync failed")
-            weights = load_file(str(_path("weights.safetensors")))
+            transport = request.get("tensor_transport", "files")
+            if transport == "cuda-ipc":
+                weights = {
+                    name: import_tensor(handle, device=torch.cuda.current_device())
+                    for name, handle in request["weight_handles"].items()
+                }
+            elif transport == "files":
+                weights = load_file(str(_path("weights.safetensors")))
+            else:
+                raise ValueError("unknown replay tensor transport")
             if not set(request["trainable_names"]) <= weights.keys():
                 raise RuntimeError("sync omitted trainable parameters")
             mapped = _mapped_weights(worker.draft_model, weights)
@@ -234,6 +262,7 @@ def dispatch(scheduler):
                 phase="ready",
                 requests={},
                 target_version=request["target_version"],
+                tensor_transport=transport,
             )
             worker._specforge_replay = state
             result = dict(
@@ -321,9 +350,23 @@ def dispatch(scheduler):
                 or state["version"] != request["draft_version"]
             ):
                 raise RuntimeError("capture requires current-version replay")
+            if request.get("tensor_transport", "files") != state["tensor_transport"]:
+                raise RuntimeError("capture transport differs from synchronized Engine")
             if not scheduler.flush_cache():
                 raise RuntimeError("cache flush before target capture failed")
-            _capture(scheduler, request)
+            handles = _capture(scheduler, request)
+            result = dict(draft_version=state["version"])
+            if handles is not None:
+                result["capture_handles"] = handles
+        elif action == "release_capture":
+            if (
+                state is None
+                or state["phase"] != "replay"
+                or state["version"] != request["draft_version"]
+                or getattr(worker, "_specforge_capture_tensors", None) is None
+            ):
+                raise RuntimeError("release requires a pending current-version capture")
+            worker._specforge_capture_tensors = None
             result = dict(draft_version=state["version"])
         else:
             raise ValueError("unknown replay RPC action")

@@ -1,13 +1,14 @@
 """One owned SGLang Engine per FSDP rank, on the same GPU.
 
 The Engine owns one target copy used for both real decoding and replay capture.
-Safe local files carry full tensors; no output text is tokenized on replay.
+CUDA IPC can carry full tensors; no output text is tokenized on replay.
 """
 
 import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from safetensors.torch import load_file, save_file
 
 from specforge.data.dspark_replay import validate_trace
 from specforge.inference.dspark_replay_patch import inspect_patch, installed_root
+from specforge.inference.dspark_replay_ipc import export_tensor, import_tensor
 
 
 class SGLangReplayEngine:
@@ -26,6 +28,10 @@ class SGLangReplayEngine:
         self.capture_layer_ids = None
         self.failed = False
         self.directory = None
+        self.tensor_transport = getattr(args, "replay_tensor_transport", "files")
+        if self.tensor_transport not in ("files", "cuda-ipc"):
+            raise ValueError("unknown replay tensor transport")
+        self.capture_seconds = 0.0
 
     def set_capture_layers(self, layer_ids):
         self.capture_layer_ids = list(layer_ids)
@@ -68,7 +74,11 @@ class SGLangReplayEngine:
                 cfg["architectures"] = ["Qwen3DSparkModel"]
                 cfg.pop("auto_map", None)
                 (initial / "config.json").write_text(json.dumps(cfg))
-                save_file(state_dict, str(initial / "model.safetensors"))
+                # SGLang's initial model loader still needs one checkpoint.
+                save_file(
+                    {name: value.cpu() for name, value in state_dict.items()},
+                    str(initial / "model.safetensors"),
+                )
                 from sglang import Engine
 
                 # Child schedulers inherit the rank-private root during spawn.
@@ -158,13 +168,23 @@ class SGLangReplayEngine:
                         os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
                     else:
                         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = _saved_agent_store
-            save_file(state_dict, str(self.directory / "weights.safetensors"))
+            transfer = {}
+            if self.tensor_transport == "cuda-ipc":
+                # Keep the exported FSDP state alive until the scheduler's copy
+                # and CUDA synchronization have completed and RPC acknowledges.
+                transfer["weight_handles"] = {
+                    name: export_tensor(value) for name, value in state_dict.items()
+                }
+            else:
+                save_file(state_dict, str(self.directory / "weights.safetensors"))
             result = self._rpc(
                 "sync",
                 draft_version=version,
                 target_version=self.args.rollout_target_version,
                 trainable_names=sorted(trainable_names),
                 capture_layer_ids=self.capture_layer_ids,
+                tensor_transport=self.tensor_transport,
+                **transfer,
             )
             if (
                 result.get("protocol") != 1
@@ -247,18 +267,40 @@ class SGLangReplayEngine:
 
     @torch.no_grad()
     def generate_dflash_data(self, input_ids, attention_mask, loss_mask):
+        started = time.perf_counter()
         result = self._rpc(
             "capture",
             draft_version=self.version,
             input_ids=input_ids.cpu().tolist(),
             attention_mask=attention_mask.cpu().tolist(),
             loss_mask=loss_mask.cpu().tolist(),
+            tensor_transport=self.tensor_transport,
         )
         if result["draft_version"] != self.version:
             self.failed = True
             raise RuntimeError("target capture version acknowledgement mismatch")
-        tensors = load_file(str(self.directory / "capture.safetensors"))
-        (self.directory / "capture.safetensors").unlink()
+        if self.tensor_transport == "cuda-ipc":
+            try:
+                handles = result["capture_handles"]
+                if set(handles) != {"hidden_states", "last_hidden_states"}:
+                    raise RuntimeError("incomplete target capture handles")
+                # Own the training tensors: checkpointed backward can outlive
+                # this RPC. The server retains its allocations until release.
+                tensors = {
+                    name: import_tensor(
+                        handle, device=torch.cuda.current_device()
+                    ).clone()
+                    for name, handle in handles.items()
+                }
+                torch.cuda.synchronize()
+                self._rpc("release_capture", draft_version=self.version)
+            except BaseException:
+                self.failed = True
+                raise
+        else:
+            tensors = load_file(str(self.directory / "capture.safetensors"))
+            (self.directory / "capture.safetensors").unlink()
+        self.capture_seconds += time.perf_counter() - started
         return SimpleNamespace(**tensors)
 
     def close(self):

@@ -34,6 +34,12 @@ def add_objective_args(group):
     group.add_argument("--rollout-top-p", type=float, default=1.0)
     group.add_argument("--rollout-top-k", type=int, default=-1)
     group.add_argument(
+        "--replay-tensor-transport",
+        choices=["files", "cuda-ipc"],
+        default="files",
+        help="cuda-ipc: export FSDP weights on GPU and share weights/hidden with the owned same-GPU Engine; files: baseline transport",
+    )
+    group.add_argument(
         "--dspark-loss-type",
         choices=["ce-l1", "tv-acceptance"],
         default=OBJECTIVE_DEFAULTS["dspark_loss_type"],

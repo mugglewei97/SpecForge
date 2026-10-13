@@ -247,5 +247,68 @@ python -m pytest -q tests/test_utils/test_tv_acceptance.py \
 精确归一化、末尾不足累积窗口、target capture 次数、同步故障、Markov 权重覆盖、
 派生缓存失效、trace correction/bonus/stop 对齐和补丁幂等性。
 CPU 验证不替代服务器的 CUDA/SGLang/FSDP 两步 smoke test；当前没有服务器连接信息，
-8 卡的峰值显存、吞吐与 GPU 端到端行为尚未验证。首版用 safetensors 本地交换完整权重
-和 capture hidden，重视同步可核验性，存在每步磁盘/CPU 传输开销。
+8 卡的峰值显存、吞吐与 GPU 端到端行为尚未验证。
+
+### 用 CUDA IPC 减少权重和 hidden 传输
+
+原训练命令可追加 `--replay-tensor-transport cuda-ipc`。默认仍为 `files`，
+可用相同 checkpoint、数据、batch、anchors 和 seed 做对照。此选项只适用于
+Linux CUDA 下每个 FSDP rank 与其 owned SGLang Engine 共用同一 GPU 的部署。
+不改变 TV 公式、训练 block、优化器更新频率或采样参数。
+
+| 数据路径 | `files` | `cuda-ipc` |
+| --- | --- | --- |
+| 每步完整 draft 导出 | FSDP 汇集并 offload 到 CPU | FSDP 汇集到 GPU |
+| draft 同步 | 写/读 `weights.safetensors`，复制到 GPU | JSON 传 CUDA IPC handle，直接在 GPU 复制并回读验证 |
+| target capture 输出 | GPU → CPU → safetensors → CPU → GPU | Engine GPU → 同卡训练进程 GPU clone |
+
+IPC 仍使用很小的 `request.json` / `response.json` 作为控制消息。
+Engine 启动时的初始 checkpoint、正式训练 checkpoint 和 rollout trace 仍写文件。
+同步继续使用专用 DSpark 映射及版本确认，不调用可能转发到 target 的通用权重更新接口。
+此实现直接共享完整 state 的 storage，尚未改成逐桶 FSDP 汇集；仍有 full-state
+all-gather 和额外 GPU 权重副本。capture 接收方 clone 完并等待 CUDA 完成后才 ACK
+释放发送方 buffer，使 checkpoint backward 持有的是训练进程自己的张量。
+这些副本会增加峰值显存；出现显存不足时可显式退回 `files`，不会静默回退。
+
+先在训练环境验证真实进程间传输：
+
+```bash
+python -m pytest -q tests/test_runtime/test_dspark_replay_ipc.py
+```
+
+再以原训练命令分别运行短测（分别使用新的输出目录）：
+
+```bash
+# 在原命令末尾追加，保留原本的学习率、mem-fraction-static 等参数。
+--replay-tensor-transport files --max-steps 20 --log-interval 1 \
+  --output-dir /path/to/replay-benchmark-files
+
+--replay-tensor-transport cuda-ipc --max-steps 20 --log-interval 1 \
+  --output-dir /path/to/replay-benchmark-ipc
+```
+
+先做单卡两步 smoke，再在实际 8 卡配置比较；检查权重版本递增、loss 正常和实际
+接受长度没有异常。排除启动及前几步，比较后续 step 耗时与吞吐；相同 seed 不保证
+两次随机 rollout 的 token 序列完全一致，应比较多步结果。通过 CUDA 测试只确认
+底层共享可用，不能替代 SGLang + FSDP 训练测试。
+
+日志新增：
+
+- `perf/step_seconds`：当前 optimizer step 总耗时，不包含启动和 checkpoint 保存。
+- `perf/rollout_seconds`、`target_capture_seconds`、`forward_backward_seconds`、
+  `optimizer_seconds`、`weight_export_seconds`、`weight_sync_seconds`（均带 `perf/` 前缀）：
+  分阶段耗时，取所有 rank 最大值。capture 包含 target 前向和传输；
+  forward/backward 不含本 rank 的 capture 调用耗时，但可能包含等待其他 rank。
+  不同阶段的最大值可能来自不同 rank，因此不必加和为 step 总耗时。
+- `perf/rollout_tokens_per_second`：所有 rank 的新生成 token 数 / 最慢 rank rollout 秒数。
+  `perf/output_tokens_per_step_second` 则除以完整训练 step 秒数，用于评估整体训练速度。
+- `rollout/accepted_draft_tokens_per_round`：真实 rollout 每轮接受且最终提交的 draft token 数；
+  `draft_acceptance_rate` 为其总数 / verified draft token 总数；
+  `committed_tokens_per_round` 包含 correction/bonus（均带 `rollout/` 前缀）。
+  三者汇总全部 rank，并按实际 stop 截断，区别于 teacher-forced TV 的代理长度。
+  这些是训练 prompt 上的在线统计，最终效果仍需固定的独立评测集确认。
+
+这里没有把 verification 的 selected-token log-prob 替换进 TV loss：一个 token 的
+teacher 概率不足以恢复全词表 TV。当前 target capture 前向仍然存在，也没有新增
+proposal suffix 监督。移植该监督需要改变数据前缀和损失，必须单独比较实际接受长度
+随训练时间的变化，不能把更低的单步耗时直接解释为更好的训练效果。
