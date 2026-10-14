@@ -67,6 +67,29 @@ def test_proposal_tv_cli_and_sampling_contract():
         validate_objective_resume(saved, args)
 
 
+def test_proposal_survival_cli_and_resume_contract():
+    args = training_args(
+        "--dspark-loss-type", "tv-acceptance", "--anchor-mode", "replay",
+        "--tv-prefix-mode", "proposal", "--target-model-backend", "sglang",
+        "--rollout-target-version", "frozen-target",
+        "--tv-length-estimator", "proposal-survival",
+    )
+    validate_objective_args(args)
+    assert args.tv_length_estimator == "proposal-survival"
+    for key, value in (
+        ("tv_prefix_mode", "teacher-forced"),
+        ("anchor_mode", "random"),
+        ("dspark_loss_type", "ce-l1"),
+    ):
+        changed = SimpleNamespace(**{**vars(args), key: value})
+        with pytest.raises(ValueError, match="proposal-survival"):
+            validate_objective_args(changed)
+    saved = vars(args).copy()
+    saved.pop("tv_length_estimator")
+    with pytest.raises(ValueError, match="tv_length_estimator"):
+        validate_objective_resume(saved, args)
+
+
 def test_entrypoint_help_needs_no_training_dependencies():
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
@@ -116,6 +139,7 @@ def test_training_cli_and_objective_defaults_remain_compatible():
     assert args.tv_objective_chunk_blocks == 8
     assert args.tv_verification_batch_size is None
     assert args.tv_prefix_mode == "teacher-forced"
+    assert args.tv_length_estimator == "overlap-product"
 
 
 @pytest.mark.parametrize("flag", ["--tv-temperature", "--tv-sampling-temperature"])
@@ -161,6 +185,7 @@ def test_resume_accepts_saved_args_and_rejects_objective_changes(as_namespace):
         ("dspark_loss_type", "ce-l1"),
         ("tv_sampling_temperature", 0.7),
         ("tv_prefix_mode", "sampled"),
+        ("tv_length_estimator", "proposal-survival"),
     ):
         with pytest.raises(ValueError, match=key):
             validate_objective_resume(wrap({**saved, key: value}), args)

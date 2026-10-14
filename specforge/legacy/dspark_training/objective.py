@@ -7,6 +7,7 @@ OBJECTIVE_DEFAULTS = {
     "dspark_loss_type": "ce-l1",
     "tv_sampling_temperature": 1.0,
     "tv_objective_chunk_blocks": 8,
+    "tv_length_estimator": "overlap-product",
 }
 TV_PREFIX_MODE = "teacher-forced"
 
@@ -20,6 +21,15 @@ def add_objective_args(group):
         help="proposal: replay the original draft prefixes and verification teacher states",
     )
     group.add_argument("--anchor-mode", choices=["random", "replay"], default="random")
+    group.add_argument(
+        "--tv-length-estimator",
+        choices=["overlap-product", "proposal-survival"],
+        default=OBJECTIVE_DEFAULTS["tv_length_estimator"],
+        help=(
+            "proposal-survival: sampled-prefix survival with full-vocabulary "
+            "terminal overlap and on-policy gradient correction; requires replay/proposal"
+        ),
+    )
     group.add_argument(
         "--rollout-target-version",
         default=None,
@@ -75,6 +85,17 @@ def add_objective_args(group):
 def validate_objective_args(args):
     replay = getattr(args, "anchor_mode", "random") == "replay"
     prefix_mode = getattr(args, "tv_prefix_mode", TV_PREFIX_MODE)
+    estimator = getattr(args, "tv_length_estimator", "overlap-product")
+    if estimator not in ("overlap-product", "proposal-survival"):
+        raise ValueError("unknown TV length estimator")
+    if estimator == "proposal-survival" and (
+        not replay
+        or prefix_mode != "proposal"
+        or args.dspark_loss_type != "tv-acceptance"
+    ):
+        raise ValueError(
+            "proposal-survival requires tv-acceptance, replay and proposal prefixes"
+        )
     if prefix_mode not in (TV_PREFIX_MODE, "proposal"):
         raise ValueError("unknown TV prefix mode")
     if prefix_mode == "proposal":
@@ -188,9 +209,9 @@ def validate_objective_resume(saved_args, args):
         )
     # Chunk size and the obsolete verification batch size do not change the
     # teacher-forced objective or consume sampling RNG, so they may be retuned.
-    for name in ("dspark_loss_type", "tv_sampling_temperature"):
+    for name in ("dspark_loss_type", "tv_sampling_temperature", "tv_length_estimator"):
         default = OBJECTIVE_DEFAULTS[name]
-        if saved.get(name, default) != getattr(args, name):
+        if saved.get(name, default) != getattr(args, name, default):
             raise ValueError(
                 f"Cannot resume with changed {name}; "
                 "use --init-draft-model-path for a new objective"
@@ -220,6 +241,7 @@ def configure_objective(model, tokenizer, args):
         chunk_blocks=args.tv_objective_chunk_blocks,
         eos_token_ids=eos_ids,
         prefix_mode=getattr(args, "tv_prefix_mode", TV_PREFIX_MODE),
+        length_estimator=getattr(args, "tv_length_estimator", "overlap-product"),
     )
     args.tv_eos_token_ids = list(eos_ids)
     if args.tv_verification_batch_size is not None:
@@ -227,10 +249,18 @@ def configure_objective(model, tokenizer, args):
             "--tv-verification-batch-size is deprecated and ignored: "
             "teacher-forced TV reuses the original target forward."
         )
+    formula = "loss=mean_blocks(1-sum(cumprod(1-TV))/valid_K)"
+    if model.tv_length_estimator == "proposal-survival":
+        formula = (
+            "loss=mean_blocks(1-sum(prefix_sampled_survival*(1-TV))/block_size); "
+            "sampled survival uses min(p(d),q(d))/stopgrad(q(d)); "
+            "requires same-version deterministic rollout/replay logits"
+        )
     print_on_rank0(
         f"TV acceptance: {model.tv_prefix_mode} prefixes, "
+        f"{model.tv_length_estimator} estimator, "
         "cached target states reused across anchors, "
         "full-vocabulary softmax, "
-        "loss=mean_blocks(1-sum(cumprod(1-TV))/K). "
+        f"{formula}. "
         "CE/L1/confidence weights, PACE weights and loss-decay-gamma are unused."
     )

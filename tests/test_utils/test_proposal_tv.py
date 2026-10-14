@@ -149,7 +149,8 @@ def test_same_proposal_as_final_sequence_matches_loss_and_all_gradients(chunk_si
     assert model.lm_head.weight.grad is None
 
 
-def test_rejection_uses_proposal_predecessors_and_full_suffix_in_real_dspark():
+@pytest.mark.parametrize("estimator", ["overlap-product", "proposal-survival"])
+def test_rejection_uses_proposal_predecessors_and_full_suffix_in_real_dspark(estimator):
     torch.manual_seed(4)
     model, target = make_model()
     configure_tv_acceptance(
@@ -158,6 +159,7 @@ def test_rejection_uses_proposal_predecessors_and_full_suffix_in_real_dspark():
         chunk_blocks=1,
         eos_token_ids=[9],
         prefix_mode="proposal",
+        length_estimator=estimator,
     )
     with torch.no_grad():
         model.draft_model.markov_head.markov_w2.weight.normal_(std=0.1)

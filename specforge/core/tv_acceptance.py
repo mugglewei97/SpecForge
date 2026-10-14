@@ -94,13 +94,30 @@ def select_replay_anchors(anchors, keep, loss_mask, attention_mask, budget):
     return torch.where(selected < length, selected, 0), selected < length
 
 
-def tv_acceptance_terms(draft_logits, target_logits, valid_mask, temperature=1.0):
+def tv_acceptance_terms(
+    draft_logits,
+    target_logits,
+    valid_mask,
+    temperature=1.0,
+    *,
+    proposal_ids=None,
+    length_estimator="overlap-product",
+):
     """Additive block terms for [..., K, V] logits on identical prefixes.
 
     Full-vocabulary softmax uses a shared positive temperature for both models.
     An invalid position terminates its block; EOS is included by
     the caller, and subsequent positions are invalid. Empty blocks have zero
     weight. Only target logits are detached; all prefix products retain grad.
+
+    ``proposal-survival`` uses sum_k prod_{i<k}(min(p_i(d_i), q_i(d_i)) /
+    stopgrad(q_i(d_i))) * overlap_k. At the collecting policy its value uses
+    actual sampled-token survival, with the terminal token integrated out.
+    Detaching ONLY the denominator includes the proposal-distribution gradient.
+    This requires deterministic, same-version rollout/replay distributions and
+    exactly one update per rollout. It is not an off-policy importance ratio.
+    Normalize by the fixed tensor width, not the sampled EOS-truncated length:
+    a random denominator would change the accepted-token objective.
     """
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("TV acceptance temperature must be finite and positive")
@@ -108,20 +125,50 @@ def tv_acceptance_terms(draft_logits, target_logits, valid_mask, temperature=1.0
         raise ValueError("draft/target logits must have matching [..., K, V] shapes")
     if valid_mask.shape != draft_logits.shape[:-1]:
         raise ValueError("valid_mask must match the non-vocabulary logit dimensions")
+    if length_estimator not in ("overlap-product", "proposal-survival"):
+        raise ValueError("unknown TV length estimator")
+    if length_estimator == "proposal-survival" and (
+        proposal_ids is None
+        or proposal_ids.shape != valid_mask.shape
+        or proposal_ids.dtype != torch.long
+        or draft_logits.size(-2) < 1
+    ):
+        raise ValueError("proposal-survival requires aligned int64 proposal IDs")
     valid = valid_mask.bool().int().cumprod(dim=-1).bool()
     dtype = torch.float64 if draft_logits.dtype == torch.float64 else torch.float32
     # Padding may contain arbitrary values, including NaNs. Mask before softmax
     # to keep padding out of both the value and backward computation.
     q_logits = torch.where(valid[..., None], draft_logits.to(dtype), 0.0)
     p_logits = torch.where(valid[..., None], target_logits.detach().to(dtype), 0.0)
-    q = torch.softmax(q_logits / temperature, dim=-1)
-    p = torch.softmax(p_logits / temperature, dim=-1)
+    if length_estimator == "proposal-survival":
+        # Log space avoids dividing underflowed full-vocabulary probabilities.
+        q_log = torch.log_softmax(q_logits / temperature, dim=-1)
+        p_log = torch.log_softmax(p_logits / temperature, dim=-1)
+        q, p = q_log.exp(), p_log.exp()
+    else:
+        q = torch.softmax(q_logits / temperature, dim=-1)
+        p = torch.softmax(p_logits / temperature, dim=-1)
     a = (1 - 0.5 * (p - q).abs().sum(dim=-1)).clamp(0, 1)
     a = torch.where(valid, a, 0.0)
-    length = a.cumprod(dim=-1).sum(dim=-1)
     k = valid.sum(dim=-1)
+    if length_estimator == "proposal-survival":
+        ids = torch.where(valid, proposal_ids, 0)[..., None]
+        q_selected = q_log.gather(-1, ids).squeeze(-1)
+        p_selected = p_log.gather(-1, ids).squeeze(-1)
+        # Choose the constant branch at equality, including p == q optima.
+        log_mass = torch.where(q_selected < p_selected, q_selected, p_selected)
+        survival = (log_mass - q_selected.detach()).exp()
+        survival = torch.where(valid, survival, 0.0)
+        prefix = torch.cat(
+            [torch.ones_like(a[..., :1]), survival[..., :-1].cumprod(-1)], -1
+        )
+        length = (prefix * a).sum(-1)
+        denominator = draft_logits.size(-2)
+    else:
+        length = a.cumprod(dim=-1).sum(dim=-1)
+        denominator = k.clamp_min(1)
     nonempty = k > 0
-    block_loss = torch.where(nonempty, 1 - length / k.clamp_min(1), 0.0)
+    block_loss = torch.where(nonempty, 1 - length / denominator, 0.0)
     reduce_dims = tuple(range(valid.ndim - 1))
     correct = (q_logits.argmax(-1) == p_logits.argmax(-1)) & valid
     return TVAcceptanceTerms(
@@ -255,15 +302,23 @@ def proposal_tv_forward(
             device=hidden.device, dtype=hidden.dtype
         )
     return _tv_block_forward(
-        model, hidden, previous, teacher, valid, global_block_count
+        model,
+        hidden,
+        previous,
+        teacher,
+        valid,
+        global_block_count,
+        proposal_ids=proposal_ids,
     )
 
 
-def _tv_block_forward(model, hidden, previous, teacher, valid, global_block_count):
+def _tv_block_forward(
+    model, hidden, previous, teacher, valid, global_block_count, *, proposal_ids=None
+):
     width, hidden_size = hidden.shape[-2:]
     flat_hidden = hidden.reshape(-1, width, hidden_size)
 
-    def chunk_terms(h, prev, target_h, mask):
+    def chunk_terms(h, prev, target_h, mask, proposals):
         logits = model.lm_head(h)
         if model.draft_model.markov_head is not None:
             logits = model.draft_model.markov_head.apply_block_logits(
@@ -279,6 +334,10 @@ def _tv_block_forward(model, hidden, previous, teacher, valid, global_block_coun
                 target_logits,
                 mask,
                 model.tv_temperature,
+                proposal_ids=proposals,
+                length_estimator=getattr(
+                    model, "tv_length_estimator", "overlap-product"
+                ),
             )
         )
 
@@ -289,6 +348,7 @@ def _tv_block_forward(model, hidden, previous, teacher, valid, global_block_coun
             previous.reshape(-1, width),
             teacher.reshape_as(flat_hidden),
             valid.reshape(-1, width),
+            None if proposal_ids is None else proposal_ids.reshape(-1, width),
             chunk_size=model.tv_objective_chunk_blocks,
         )
     )
@@ -352,7 +412,13 @@ def reduce_tv_terms(terms: TVAcceptanceTerms, global_block_count=None):
 
 
 def configure_tv_acceptance(
-    model, *, temperature, chunk_blocks, eos_token_ids, prefix_mode="teacher-forced"
+    model,
+    *,
+    temperature,
+    chunk_blocks,
+    eos_token_ids,
+    prefix_mode="teacher-forced",
+    length_estimator="overlap-product",
 ):
     """Enable the pure objective before FSDP/optimizer creation.
 
@@ -366,6 +432,18 @@ def configure_tv_acceptance(
     head = draft.markov_head
     if prefix_mode not in ("teacher-forced", "proposal"):
         raise ValueError("unknown TV prefix mode")
+    if length_estimator not in ("overlap-product", "proposal-survival"):
+        raise ValueError("unknown TV length estimator")
+    if length_estimator == "proposal-survival":
+        if prefix_mode != "proposal":
+            raise ValueError("proposal-survival requires proposal prefixes")
+        if getattr(getattr(draft, "config", None), "attention_dropout", 0) or any(
+            isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.p > 0
+            for module in draft.modules()
+        ):
+            raise ValueError(
+                "proposal-survival requires deterministic replay without dropout"
+            )
     if prefix_mode == "proposal" and head is None:
         raise ValueError("proposal TV requires the vanilla Markov head")
     if (
@@ -396,4 +474,5 @@ def configure_tv_acceptance(
     model.tv_objective_chunk_blocks = int(chunk_blocks)
     model.tv_eos_token_ids = tuple(eos_token_ids)
     model.tv_prefix_mode = prefix_mode
+    model.tv_length_estimator = length_estimator
     model.tv_acceptance_enabled = True

@@ -2,6 +2,9 @@
 
 默认 `--tv-prefix-mode teacher-forced` 使用最终序列前缀。真实 proposal 前缀训练使用
 `--anchor-mode replay --tv-prefix-mode proposal`，见文末 proposal 模式说明。
+默认长度估计器为 `--tv-length-estimator overlap-product`。在同步 proposal replay 中，
+可选 `--tv-length-estimator proposal-survival`，保留具体 proposal token 与后续前缀的
+接受关联，并修正 block 内采样分布的梯度；公式与适用条件见文末。
 
 使用恢复的 `scripts/train_dspark.py` 入口：
 
@@ -365,4 +368,73 @@ CPU 测试覆盖同前缀 loss/梯度等价、拒绝后前驱、EOS/预算/覆�
 final hidden 行对齐、reservoir 上限、身份校验、IPC 生命周期及旧补丁升级。
 真实 SGLang GPU 上还需比较缓存重建 logits 与显式 proposal forward、同版本 draft
 rollout/replay 分数，并做单卡/多卡两步 smoke。收益评估用独立 prompts、相同 GPU 时间，
-比较实际接受长度和吞吐；固定 proposal 后反传仍是代理目标，不是期望接受长度的无偏梯度。
+比较实际接受长度和吞吐；默认 `overlap-product` 在固定 proposal 上反传仍是代理目标，
+不是期望接受长度的无偏梯度。
+
+### 按具体 proposal token 的生存概率估计接受长度
+
+在上述 proposal replay 命令末尾追加：
+
+```bash
+--tv-length-estimator proposal-survival \
+--output-dir /path/to/proposal-survival-posttrain
+```
+
+已有命令默认继续使用 `overlap-product`。新估计器要求 `tv-acceptance + replay + proposal`，
+沿用完整词表、相同温度、逐步同步、每批 rollout 只更新一次的约束，不支持 dropout。
+模型权重用 `--init-draft-model-path` 初始化，新建 optimizer/scheduler；切换估计器不能
+静默恢复旧 optimizer 状态。无需新增 target forward 或修改 SGLang trace 补丁。
+
+记 `d_i` 为原始 proposal，`p_i`、`q_i` 为对应 proposal 前缀上的 target/draft 分布，
+`a_i = sum_v min(p_i(v), q_i(v))`，`q_old` 为采集 proposal 的 draft 分布。采用：
+
+```text
+w_i(theta) = min(p_i(d_i), q_theta_i(d_i)) / stopgrad(q_old_i(d_i))
+R_hat(theta) = sum_{k=1..H} valid_k * [prod_{i<k} w_i(theta)] * a_k(theta)
+L_block = 1 - R_hat / H
+```
+
+`H` 为固定的模型 block size（例如 7）。`valid_k` 按实际 verification 覆盖、剩余预算、
+此前是否出现 proposal EOS 确定；当前位置 EOS 本身仍计入。空 block 不计入均值。
+外层仍按整个 optimizer step、所有 rank 的非空 block 总数归一化。
+
+在采集参数 `theta_old` 处，`w_i` 的前向值等于具体 token 的接受概率
+`r_i = min(1, p_i(d_i)/q_old_i(d_i))`，所以前向长度为：
+
+```text
+R_hat = a_1 + r_1*a_2 + r_1*r_2*a_3 + ...
+```
+
+每一项只采样到倒数第二个位置，最后一个 token 用完整词表精确求平均。
+对固定 round 起点和预算，若 proposal 确实来自 `q_old`，这个估计量的期望等于该轮
+接受的 draft token 数（包含 EOS，排除 root/correction/bonus）。它保留了具体 token
+的接受概率与后续前缀分布的关联。各长度项对末 token 的边缘化能去掉该项的一层采样噪声，
+但不保证整个和式的方差一定低于所有其他估计器。
+
+分母必须停止梯度，分子 `min(p,q_theta)` 和所有前缀乘积保留梯度。这等价于把 proposal
+采样概率的变化纳入 block 内的导数。直接对固定样本上的 `min(1,p/q_theta)` 求导会遗漏
+采样分布项：低估 token 的分支会没有接受率梯度，而高估分支只看到减小分母的收益。
+把整个 `r_i` detach 也会漏掉前缀接受质量变化对后续长度的贡献。
+
+实现以当前同版本、未更新的 replay `q_theta.detach()` 重建 `q_old`，用 log-softmax 和
+log 概率差避免小概率除法下溢；没有概率下限、权重裁剪或自归一化。
+**因此精确值/梯度结论以 rollout/replay 分布相同为前提**，不是异步或旧轨迹的离策略目标。
+SGLang 和训练侧的 kernel、精度或模型实现差异仍需真实 GPU 上做 logits parity 检查。
+该梯度也不包括 round 起点、跨轮状态占用和抽样权重的变化，不能称为完整生成过程的
+无偏吞吐梯度。未来若重复更新同一批数据，必须实际保存采集时的 draft 概率。
+
+新目标固定除以 `H`，不除以采样后 EOS 截断的 `K`。随机分母会改变目标，也会破坏上述
+逐长度项边缘化的推导。例如 `H=7`、只剩一个有效位置且 `p=q`，新 loss 为 `6/7`，
+而旧 loss 为 0；这反映当前最多只能接受一个 draft token。新旧 loss 数值不宜直接比较。
+
+现有日志保持兼容：`tv_acceptance_length_proxy` 在此模式记录 `R_hat` 的 block 均值；
+`tv_position_i` 和 `tv_mean_overlap` 仍是全词表 TV/overlap，不是具体 token 的接受率。
+同时检查 `tv_mean_valid_length`、真实 `rollout/accepted_draft_tokens_per_round` 和独立
+评测集吞吐。固定 H 时，`tv_acceptance_loss = 1 - tv_acceptance_length_proxy / H`。
+
+CPU 精确性测试穷举小词表的完整 proposal 树，对比真实接受长度及其参数梯度，包含
+条件分布随前缀变化、EOS、预算截断、单 token 退化为 TV、低精度和无效 padding：
+
+```bash
+python -m pytest -q tests/test_utils/test_proposal_survival.py tests/test_scripts/test_train_dspark.py
+```
