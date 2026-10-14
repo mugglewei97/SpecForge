@@ -13,7 +13,12 @@ TV_PREFIX_MODE = "teacher-forced"
 
 def add_objective_args(group):
     # Saved with training args to distinguish old sampled-prefix checkpoints.
-    group.set_defaults(tv_prefix_mode=TV_PREFIX_MODE)
+    group.add_argument(
+        "--tv-prefix-mode",
+        choices=[TV_PREFIX_MODE, "proposal"],
+        default=TV_PREFIX_MODE,
+        help="proposal: replay the original draft prefixes and verification teacher states",
+    )
     group.add_argument("--anchor-mode", choices=["random", "replay"], default="random")
     group.add_argument(
         "--rollout-target-version",
@@ -69,6 +74,25 @@ def add_objective_args(group):
 
 def validate_objective_args(args):
     replay = getattr(args, "anchor_mode", "random") == "replay"
+    prefix_mode = getattr(args, "tv_prefix_mode", TV_PREFIX_MODE)
+    if prefix_mode not in (TV_PREFIX_MODE, "proposal"):
+        raise ValueError("unknown TV prefix mode")
+    if prefix_mode == "proposal":
+        if not replay or args.dspark_loss_type != "tv-acceptance":
+            raise ValueError(
+                "proposal TV requires --anchor-mode replay and tv-acceptance"
+            )
+        if (
+            args.rollout_temperature != args.tv_sampling_temperature
+            # SGLang clamps draft temperatures below 1e-5 (and maps <1e-6
+            # to greedy), so those would not match the replay distribution.
+            or args.rollout_temperature < 1e-5
+            or args.rollout_top_p != 1.0
+            or args.rollout_top_k != -1
+        ):
+            raise ValueError(
+                "proposal TV requires equal rollout/TV temperatures >= 1e-5, top_p=1 and top_k=-1"
+            )
     if replay:
         if (
             args.dspark_loss_type != "tv-acceptance"
@@ -155,12 +179,12 @@ def validate_objective_resume(saved_args, args):
     if (
         args.dspark_loss_type == "tv-acceptance"
         and saved.get("dspark_loss_type") == "tv-acceptance"
-        and saved.get("tv_prefix_mode", "sampled") != TV_PREFIX_MODE
+        and saved.get("tv_prefix_mode", "sampled")
+        != getattr(args, "tv_prefix_mode", TV_PREFIX_MODE)
     ):
         raise ValueError(
             "Cannot resume TV with changed tv_prefix_mode: this checkpoint uses "
-            "sampled or unknown prefixes, but training now uses teacher-forced "
-            "prefixes. Use --init-draft-model-path with a new output directory."
+            "different or unknown prefixes. Use --init-draft-model-path with a new output directory."
         )
     # Chunk size and the obsolete verification batch size do not change the
     # teacher-forced objective or consume sampling RNG, so they may be retuned.
@@ -195,15 +219,17 @@ def configure_objective(model, tokenizer, args):
         temperature=args.tv_sampling_temperature,
         chunk_blocks=args.tv_objective_chunk_blocks,
         eos_token_ids=eos_ids,
+        prefix_mode=getattr(args, "tv_prefix_mode", TV_PREFIX_MODE),
     )
+    args.tv_eos_token_ids = list(eos_ids)
     if args.tv_verification_batch_size is not None:
         print_on_rank0(
             "--tv-verification-batch-size is deprecated and ignored: "
             "teacher-forced TV reuses the original target forward."
         )
     print_on_rank0(
-        "TV acceptance: teacher-forced ground-truth prefixes, "
-        "one target forward reused across anchors, no candidate sampling/verification, "
+        f"TV acceptance: {model.tv_prefix_mode} prefixes, "
+        "cached target states reused across anchors, "
         "full-vocabulary softmax, "
         "loss=mean_blocks(1-sum(cumprod(1-TV))/K). "
         "CE/L1/confidence weights, PACE weights and loss-decay-gamma are unused."

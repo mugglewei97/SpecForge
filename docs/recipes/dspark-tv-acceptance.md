@@ -1,4 +1,7 @@
-# DSpark ground-truth 前缀 TV 接收长度代理目标
+# DSpark TV 接收长度代理目标
+
+默认 `--tv-prefix-mode teacher-forced` 使用最终序列前缀。真实 proposal 前缀训练使用
+`--anchor-mode replay --tv-prefix-mode proposal`，见文末 proposal 模式说明。
 
 使用恢复的 `scripts/train_dspark.py` 入口：
 
@@ -166,7 +169,7 @@ speculative rollout 和 replay capture，不额外加载第二份 capture target
 `release/v0.5.18` commit `71de97b264`，其中
 `DSparkWorkerV2` 没有训练所需的逐轮 trace；已有 spec-capture prefill 补丁不满足要求。
 补丁工具核对 draft/verify/model 的源码 SHA-256，以及 scheduler/Engine 接口，
-检查全部文件后才修改两个插入点所在的源码文件。其他实现会明确失败，不能只改版本号
+检查全部文件后才修改 worker 和 scheduler 两个源码文件。其他实现会明确失败，不能只改版本号
 或跳过校验就启动训练。下列命令在训练环境检查实际安装源码并安装补丁。
 
 ```bash
@@ -194,6 +197,8 @@ bash examples/run_qwen3_8b_dspark_tv_replay.sh 8 sdpa \
 ```
 
 脚本沿用给定服务器的模型、数据、初始化 checkpoint 和 `mem-fraction-static=0.3`。
+该 replay 示例现在默认启用 `--tv-prefix-mode proposal --replay-tensor-transport cuda-ipc`；
+在命令末尾追加 `--tv-prefix-mode teacher-forced` 可运行前缀对照组。
 先跑两个 optimizer steps，检查日志中同步版本依次为 V1、V2；再去掉 `--max-steps`。
 `--batch-size 4 --accumulation-steps 2` 表示每 rank 每个更新采集 8 条 rollout。
 整批采集完成后才训练；不会提前生成下一步的数据。末尾不足一个累积窗口也完成一次更新。
@@ -223,10 +228,10 @@ replay 模式中 `--max-steps`、日志/保存间隔和 checkpoint step 使用 o
   `verifier_committed_tokens` 是 verifier 的 draft+correction/bonus 输出长度；
   `committed_tokens` 是按真实 EOS/stop/max-length 截断后的最终提交长度。
   `root_tokens=0`；实际提交的 correction/bonus 另有计数，停止位置之后的 token 不计入。
-- anchor `s`、槽位 `j`：目标 `input_ids[s+j+1]`，Markov predecessor
+- 在 `teacher-forced` 模式，anchor `s`、槽位 `j`：目标 `input_ids[s+j+1]`，Markov predecessor
   `input_ids[s+j]`，target final hidden `last_hidden_states[s+j]`。
   **接受长度仅作 telemetry，绝不截断训练 block**；仍计算最多 K 个最终序列位置。
-- response mask 从 `prompt_length` 构造，可叠加 trace 的 `loss_mask` 和右侧 padding
+- 在 `teacher-forced` 模式，response mask 从 `prompt_length` 构造，可叠加 trace 的 `loss_mask` 和右侧 padding
   `attention_mask`。EOS 本身有效，之后无效。anchor 本身无需属于 response。
 - anchors 使用 padding + keep mask，超过预算时从所有有效 anchors 中均匀无放回抽样。
   重叠窗口仍用原有 block attention 隔离。所有 microbatches 共用整步所有 rank 的
@@ -251,7 +256,7 @@ CPU 验证不替代服务器的 CUDA/SGLang/FSDP 两步 smoke test；当前没�
 
 ### 用 CUDA IPC 减少权重和 hidden 传输
 
-原训练命令可追加 `--replay-tensor-transport cuda-ipc`。默认仍为 `files`，
+原训练命令可追加 `--replay-tensor-transport cuda-ipc`。CLI 默认仍为 `files`，replay 示例使用 IPC，
 可用相同 checkpoint、数据、batch、anchors 和 seed 做对照。此选项只适用于
 Linux CUDA 下每个 FSDP rank 与其 owned SGLang Engine 共用同一 GPU 的部署。
 不改变 TV 公式、训练 block、优化器更新频率或采样参数。
@@ -308,7 +313,56 @@ python -m pytest -q tests/test_runtime/test_dspark_replay_ipc.py
   三者汇总全部 rank，并按实际 stop 截断，区别于 teacher-forced TV 的代理长度。
   这些是训练 prompt 上的在线统计，最终效果仍需固定的独立评测集确认。
 
-这里没有把 verification 的 selected-token log-prob 替换进 TV loss：一个 token 的
-teacher 概率不足以恢复全词表 TV。当前 target capture 前向仍然存在，也没有新增
-proposal suffix 监督。移植该监督需要改变数据前缀和损失，必须单独比较实际接受长度
-随训练时间的变化，不能把更低的单步耗时直接解释为更好的训练效果。
+### 真实 proposal 前缀模式
+
+```bash
+# 已安装 protocol 1 的训练环境也需重新执行；工具支持校验后升级到 protocol 2。
+python -m specforge.inference.dspark_replay_patch --apply
+bash examples/run_qwen3_8b_dspark_tv_replay.sh 1 sdpa --max-steps 2 --log-interval 1 \
+  --output-dir /path/to/proposal-tv-smoke
+```
+
+`--tv-prefix-mode proposal` 复用 rollout 的完整原始 proposal `d1…dK`：
+
+- Backbone 仍使用 root/mask 和原有 block attention；proposal 不进入双向注意力输入。
+  Vanilla Markov 前驱改为 `[root, d1, …, d(K-1)]`。
+- 在 verification 的 target logits processor 输入处复制 **final-norm hidden**，
+  `[root, d1, …, dK]` 的前 K 行分别预测 `d1…dK`，最后一行 bonus 不参与 loss。
+  不使用多层 aux hidden 或 selected-token log-prob 重建 teacher 分布。
+- 有效长度取实际 verification 覆盖、剩余生成预算和 proposal 自身首个 EOS 的交集。
+  包含 EOS 本身；拒绝位置、correction token、最终提交序列长度均不裁剪 proposal suffix。
+  接受长度仅用于统计，TV 仍比较完整词表。
+- 每个请求在 verification 中做均匀 reservoir sampling，最多保存 `--num-anchors` 个
+  block 的 hidden。trace v2 保存每轮 proposal、valid mask、预算、round ID，以及选中的
+  `selected_round_ids`；sample ID、round ID、anchor 和模型版本贯穿 capture/replay。
+  Collator 与模型前向不再抽样，teacher hidden 使用完全相同的 block 顺序。
+- 完整最终序列仍 capture 一次，为 draft 提供 context aux hidden；不逐 block 重跑 target。
+  Teacher 分布由缓存 hidden 经冻结 LM head 分块重建，沿用原有 TV 连乘和全局 block 归一化。
+  `files` 与 `cuda-ipc` 均支持，IPC clone 完成并同步后才释放发送方 allocation。
+  server 的 selected cache 按 microbatch 消费；未消费完成禁止同步下一版本。
+
+首版要求固定 K、static verification、vanilla Markov、相同且不小于 `1e-5` 的 rollout/TV 温度
+（更低温度会被 SGLang 改写）、
+`top_p=1 / top_k=-1`。拒绝 grammar、额外 logits processor/penalty、target logits
+scale/softcap、compact verification，以及会把标签注入 backbone 的 source semantics。
+旧 trace 或缺失 proposal/verification hidden 会报错；JSONL 用于审计，verification hidden
+只在当前训练更新期间保留，不能仅用 JSONL 离线重放 proposal TV。
+
+BF16 缓存按每 rank `B × A × K × H × 2` 字节计，B=4、A=512、K=7、H=4096
+约 112 MiB；IPC clone、单轮临时 hidden 和训练激活另计。日志增加
+`train/tv_position_1…K` 与 `perf/trainer_peak_allocated_bytes`（所有 rank 最大值，
+仅训练进程的 PyTorch allocator，不包含独立 SGLang 进程或整卡占用）。
+
+```bash
+python -m pytest -q tests/test_utils/test_proposal_tv.py \
+  tests/test_runtime/test_dspark_proposal_capture.py \
+  tests/test_utils/test_tv_acceptance.py tests/test_utils/test_dspark_replay.py \
+  tests/test_runtime/test_dspark_replay_server.py tests/test_runtime/test_dspark_replay_ipc.py \
+  tests/test_scripts/test_train_dspark.py
+```
+
+CPU 测试覆盖同前缀 loss/梯度等价、拒绝后前驱、EOS/预算/覆盖、teacher 停止梯度、
+final hidden 行对齐、reservoir 上限、身份校验、IPC 生命周期及旧补丁升级。
+真实 SGLang GPU 上还需比较缓存重建 logits 与显式 proposal forward、同版本 draft
+rollout/replay 分数，并做单卡/多卡两步 smoke。收益评估用独立 prompts、相同 GPU 时间，
+比较实际接受长度和吞吐；固定 proposal 后反传仍是代理目标，不是期望接受长度的无偏梯度。

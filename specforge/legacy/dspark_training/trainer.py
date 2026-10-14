@@ -128,6 +128,8 @@ def _forward_dspark_data_batch(
     micro_index=0,
 ):
     replay_kwargs = {}
+    capture_kwargs = {}
+    proposal_mode = getattr(args, "tv_prefix_mode", "teacher-forced") == "proposal"
     if getattr(args, "anchor_mode", "random") == "replay":
         from specforge.data.dspark_replay import assert_replay_batch
 
@@ -138,6 +140,19 @@ def _forward_dspark_data_batch(
             block_keep_mask=data["block_keep_mask"].to(device),
             tv_global_block_count=data["tv_global_block_count"].to(device),
         )
+        if proposal_mode:
+            for name in ("proposal_ids", "proposal_valid_mask", "proposal_round_ids"):
+                if name not in data:
+                    raise ValueError(f"proposal replay batch missing {name}")
+            replay_kwargs.update(
+                proposal_ids=data["proposal_ids"].to(device),
+                proposal_valid_mask=data["proposal_valid_mask"].to(device),
+            )
+            capture_kwargs["proposal_selection"] = dict(
+                sample_ids=data["trace_sample_ids"],
+                round_ids=data["proposal_round_ids"].tolist(),
+                anchors=data["anchor_positions"].tolist(),
+            )
     # Slice on CPU before calling this function: neither target nor drafter
     # materializes the whole logical batch on GPU in microbatch mode.
     input_ids = data["input_ids"].to(device, non_blocking=True)
@@ -159,7 +174,7 @@ def _forward_dspark_data_batch(
 
             target_output = collective_phase(
                 lambda: target_model.generate_dflash_data(
-                    input_ids, attention_mask, loss_mask
+                    input_ids, attention_mask, loss_mask, **capture_kwargs
                 ),
                 device,
             )
@@ -169,9 +184,18 @@ def _forward_dspark_data_batch(
             )
     hidden_states = target_output.hidden_states.detach().to(device, non_blocking=True)
     last_hidden_states = target_output.last_hidden_states
+    if proposal_mode:
+        proposal_teacher = getattr(target_output, "proposal_teacher_hidden", None)
+        if proposal_teacher is None:
+            raise RuntimeError(
+                "proposal replay requires cached verification final hidden states"
+            )
+        replay_kwargs["proposal_teacher_hidden"] = proposal_teacher.detach().to(
+            device, non_blocking=True
+        )
     if last_hidden_states is not None:
         last_hidden_states = last_hidden_states.detach().to(device, non_blocking=True)
-    elif needs_target_hidden:
+    elif needs_target_hidden and not proposal_mode:
         raise RuntimeError(
             "The selected DSpark objective requires target final hidden states, "
             "but the target backend "

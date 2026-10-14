@@ -9,7 +9,15 @@ from torch.utils.data import Dataset
 from specforge.core.tv_acceptance import select_replay_anchors
 
 
-def validate_trace(record, *, draft_version, target_version, vocab_size=None):
+def validate_trace(
+    record,
+    *,
+    draft_version,
+    target_version,
+    vocab_size=None,
+    prefix_mode="teacher-forced",
+    block_size=None,
+):
     required = {
         "sample_id",
         "input_ids",
@@ -69,19 +77,104 @@ def validate_trace(record, *, draft_version, target_version, vocab_size=None):
         or not {"temperature", "top_p", "top_k", "speculative"} <= sampling.keys()
     ):
         raise ValueError("trace requires complete sampling_config")
+    if prefix_mode == "proposal":
+        _validate_proposal_trace(record, vocab_size=vocab_size, block_size=block_size)
     return record
+
+
+def _validate_proposal_trace(record, *, vocab_size, block_size):
+    if record.get("trace_version") != 2 or record.get("tv_prefix_mode") != "proposal":
+        raise ValueError("proposal TV requires a version 2 proposal trace")
+    selected = record.get("selected_round_ids")
+    rounds = record["round_metadata"]
+    if (
+        not isinstance(selected, list)
+        or any(type(i) is not int or not 0 <= i < len(rounds) for i in selected)
+        or selected != sorted(set(selected))
+    ):
+        raise ValueError("invalid selected proposal round IDs")
+    sampling = record["sampling_config"]
+    if (
+        not isinstance(sampling.get("temperature"), (int, float))
+        or not 1e-5 <= sampling["temperature"] < float("inf")
+        or sampling["top_p"] != 1
+        or sampling["top_k"] != -1
+        or type(sampling.get("max_new_tokens")) is not int
+    ):
+        raise ValueError("proposal trace has unsupported sampling settings")
+    for index, (anchor, meta) in enumerate(zip(record["anchor_positions"], rounds)):
+        ids, valid = meta.get("proposal_ids"), meta.get("proposal_valid_mask")
+        width = meta["draft_length"]
+        verified, remaining = (
+            meta.get("verified_draft_tokens"),
+            meta.get("remaining_budget"),
+        )
+        if (
+            width < 1
+            or (block_size is not None and width != block_size)
+            or type(meta.get("round_id")) is not int
+            or meta["round_id"] != index
+            or not isinstance(ids, list)
+            or len(ids) != width
+            or any(
+                type(t) is not int
+                or t < 0
+                or (vocab_size is not None and t >= vocab_size)
+                for t in ids
+            )
+            or not isinstance(valid, list)
+            or len(valid) != width
+            or any(type(v) is not bool for v in valid)
+            or valid != sorted(valid, reverse=True)
+            or type(verified) is not int
+            or not 0 <= verified <= width
+            or meta["accepted_draft_tokens"] > verified
+            or type(remaining) is not int
+            or remaining < 0
+            or remaining
+            != max(0, record["prompt_length"] + sampling["max_new_tokens"] - anchor - 1)
+            or sum(valid) > min(verified, remaining)
+        ):
+            raise ValueError("misaligned proposal IDs, validity, round ID or budget")
+
+
+def validate_proposal_anchors(anchors, keep, attention_mask, budget):
+    """Validate already selected blocks without consuming RNG or reordering rows."""
+    if (
+        anchors is None
+        or keep is None
+        or anchors.ndim != 2
+        or anchors.dtype != torch.long
+        or keep.dtype != torch.bool
+        or anchors.shape != keep.shape
+        or anchors.size(0) != attention_mask.size(0)
+        or not 1 <= anchors.size(1) <= budget
+        or ((anchors < 0) | (anchors >= attention_mask.size(1))).any()
+        or (keep & ~attention_mask.gather(1, anchors).bool()).any()
+    ):
+        raise ValueError("invalid selected proposal anchors")
 
 
 class RolloutTraceDataset(Dataset):
     """Read a step's saved JSONL traces for inspection or a single replay."""
 
-    def __init__(self, path, *, draft_version, target_version):
+    def __init__(
+        self,
+        path,
+        *,
+        draft_version,
+        target_version,
+        prefix_mode="teacher-forced",
+        block_size=None,
+    ):
         with Path(path).expanduser().resolve().open() as stream:
             self.records = [
                 validate_trace(
                     json.loads(line),
                     draft_version=draft_version,
                     target_version=target_version,
+                    prefix_mode=prefix_mode,
+                    block_size=block_size,
                 )
                 for line in stream
                 if line.strip()
@@ -135,12 +228,16 @@ class ReplayCollator:
         num_anchors,
         eos_token_ids=(),
         pad_token_id=0,
+        prefix_mode="teacher-forced",
+        block_size=None,
     ):
         self.draft_version = draft_version
         self.target_version = target_version
         self.num_anchors = num_anchors
         self.eos_token_ids = tuple(eos_token_ids)
         self.pad_token_id = pad_token_id
+        self.prefix_mode = prefix_mode
+        self.block_size = block_size
 
     def __call__(self, records):
         if not records:
@@ -150,6 +247,8 @@ class ReplayCollator:
                 record,
                 draft_version=self.draft_version,
                 target_version=self.target_version,
+                prefix_mode=self.prefix_mode,
+                block_size=self.block_size,
             )
         batch = len(records)
         length = max(len(r["input_ids"]) for r in records)
@@ -195,9 +294,15 @@ class ReplayCollator:
                 record["anchor_positions"], dtype=torch.long
             )
             keep[row, :count] = True
-        anchors, keep = select_replay_anchors(
-            anchors, keep, loss, attention, self.num_anchors
-        )
+        proposal_data = {}
+        if self.prefix_mode == "proposal":
+            proposal_data = self._collate_proposals(records, attention)
+            anchors = proposal_data.pop("anchor_positions")
+            keep = proposal_data.pop("block_keep_mask")
+        else:
+            anchors, keep = select_replay_anchors(
+                anchors, keep, loss, attention, self.num_anchors
+            )
         return dict(
             input_ids=ids,
             attention_mask=attention,
@@ -210,6 +315,48 @@ class ReplayCollator:
             draft_version=[r["draft_version"] for r in records],
             target_version=[r["target_version"] for r in records],
             round_metadata=[r["round_metadata"] for r in records],
+            **proposal_data,
+        )
+
+    def _collate_proposals(self, records, attention):
+        # Reservoir sampling already ran in verification. Every field follows
+        # the same round IDs, including teacher rows fetched by the capture RPC.
+        width = max(1, max(len(r["selected_round_ids"]) for r in records))
+        if width > self.num_anchors or self.block_size is None or self.block_size < 1:
+            raise ValueError(
+                "proposal replay requires a fixed K and bounded selected rounds"
+            )
+        shape = (len(records), width)
+        anchors = torch.zeros(shape, dtype=torch.long)
+        round_ids = torch.full(shape, -1, dtype=torch.long)
+        proposals = torch.zeros((*shape, self.block_size), dtype=torch.long)
+        valid = torch.zeros_like(proposals, dtype=torch.bool)
+        for row, record in enumerate(records):
+            for col, index in enumerate(record["selected_round_ids"]):
+                meta = record["round_metadata"][index]
+                anchors[row, col] = record["anchor_positions"][index]
+                round_ids[row, col] = index
+                proposals[row, col] = torch.tensor(meta["proposal_ids"])
+                valid[row, col] = torch.tensor(meta["proposal_valid_mask"])
+                expected = min(meta["verified_draft_tokens"], meta["remaining_budget"])
+                for pos, token in enumerate(meta["proposal_ids"][:expected]):
+                    if token in self.eos_token_ids:
+                        expected = pos + 1
+                        break
+                if meta["proposal_valid_mask"] != [
+                    i < expected for i in range(self.block_size)
+                ]:
+                    raise ValueError(
+                        "proposal mask differs from verification coverage, budget or EOS"
+                    )
+        keep = valid.any(-1)
+        validate_proposal_anchors(anchors, keep, attention, self.num_anchors)
+        return dict(
+            anchor_positions=anchors,
+            block_keep_mask=keep,
+            proposal_ids=proposals,
+            proposal_valid_mask=valid,
+            proposal_round_ids=round_ids,
         )
 
 

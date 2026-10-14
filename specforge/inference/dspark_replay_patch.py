@@ -12,13 +12,14 @@ from pathlib import Path
 
 WORKER = "srt/speculative/dspark_components/dspark_worker_v2.py"
 SCHEDULER = "srt/managers/scheduler.py"
-MARKER = "# SpecForge DSpark replay protocol 1"
+MARKER = "# SpecForge DSpark replay protocol 2"
 AUDITED_SOURCES = {
     WORKER: "c2e1333e75390f7e4785d59e3bddc3131eaec72e818b975020f6c1bb2452b560",
     "srt/speculative/dspark_components/dspark_verify.py": "534b8d81f26cad3fb066c131954bc897acdd4318910308701d791594c40a088e",
     "srt/models/dspark.py": "194759ffba28cc1e1d7d8ba28cb2f0134ec9f935eae34392bca2178c748b19ce",
     "srt/models/dflash.py": "b4c867543d80845bb621cb9bf93a0f9d8b09a6753f2a4d32e5e36d2122babc30",
     "srt/model_executor/model_runner_components/spec_aux_hidden_state.py": "db31c1d76466c6f99e5acdf9483a2a6beb4e6d8a6d96a07c17646257a61a7e9f",
+    "srt/layers/logits_processor.py": "43a0674df59067223fb793d78bb9f947049d2f983704a09a3c67282bf654cad0",
 }
 EDITS = {
     WORKER: [
@@ -35,6 +36,12 @@ EDITS = {
             "        record_round(self, batch, prefix_lens, draft_tokens, accept, layout)\n"
             "        if batch.return_logprob:\n            compute_spec_logprobs(\n",
         ),
+        (
+            "        prepare_mamba_track_for_verify(batch)\n",
+            "        from specforge.inference.dspark_replay_server import begin_verification\n"
+            "        begin_verification(self, batch, run_compact)\n"
+            "        prepare_mamba_track_for_verify(batch)\n",
+        ),
     ],
     SCHEDULER: [
         (
@@ -47,6 +54,24 @@ EDITS = {
         ),
     ],
 }
+
+# Exact protocol-1 installations can be upgraded; all original source hashes
+# still have to match before any mutation. Unknown or partial patches fail closed.
+LEGACY_EDITS = {
+    relative: [
+        (old, new.replace(MARKER, "# SpecForge DSpark replay protocol 1"))
+        for old, new in edits
+    ]
+    for relative, edits in ((WORKER, EDITS[WORKER][:2]), (SCHEDULER, EDITS[SCHEDULER]))
+}
+
+
+def _unpatch(text, relative):
+    for old, new in EDITS.get(relative, []):
+        text = text.replace(new, old)
+    for old, new in LEGACY_EDITS.get(relative, []):
+        text = text.replace(new, old)
+    return text
 
 
 def installed_root():
@@ -61,8 +86,7 @@ def inspect_patch(root, *, apply=False, require=False):
     changes, report = {}, {}
     for relative, expected in AUDITED_SOURCES.items():
         text = (root / relative).read_text()
-        for old, new in EDITS.get(relative, []):
-            text = text.replace(new, old)
+        text = _unpatch(text, relative)
         actual = hashlib.sha256(text.encode()).hexdigest()
         if actual != expected:
             raise RuntimeError(
@@ -71,6 +95,11 @@ def inspect_patch(root, *, apply=False, require=False):
     for relative, edits in EDITS.items():
         path = root / relative
         text = path.read_text()
+        # Normalize a complete old patch only when its old marker is present.
+        if "# SpecForge DSpark replay protocol 1" in text:
+            if not all(new in text for _, new in LEGACY_EDITS[relative]):
+                raise RuntimeError(f"partially installed replay patch: {path}")
+            text = _unpatch(text, relative)
         # Require all markers, not just one: partial installs cannot be used.
         states = [new in text for old, new in edits]
         if any(states) and not all(states):

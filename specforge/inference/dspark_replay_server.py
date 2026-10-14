@@ -6,6 +6,7 @@ The owned Engine uses local RPC and a private exchange directory, not HTTP.
 
 import json
 import os
+import random
 from pathlib import Path
 
 import torch
@@ -13,7 +14,7 @@ from safetensors.torch import load_file, save_file
 
 from specforge.inference.dspark_replay_ipc import export_tensor, import_tensor
 
-PROTOCOL = 1
+PROTOCOL = 2
 
 
 def _root():
@@ -54,6 +55,68 @@ def register_requests(worker, batch):
         entry["req"] = req
 
 
+def begin_verification(worker, batch, run_compact):
+    """Arm a one-forward hook on the LM-head input, never on aux hidden output."""
+    state = getattr(worker, "_specforge_replay", None)
+    if state is None or state.get("tv_prefix_mode") != "proposal":
+        return
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.speculative.dspark_components.dspark_verify import (
+        verify_logits_adjustments_are_noop,
+    )
+
+    if (
+        state["phase"] != "rollout"
+        or run_compact
+        or worker._verify_planner.mode_value != "static"
+        or batch.has_grammar
+        or not verify_logits_adjustments_are_noop(batch.sampling_info)
+    ):
+        raise RuntimeError(
+            "proposal TV requires fixed static verification without logits processors or grammar"
+        )
+    processors = [
+        m
+        for m in worker.target_worker.model_runner.model.modules()
+        if isinstance(m, LogitsProcessor)
+    ]
+    if len(processors) != 1:
+        raise RuntimeError("proposal TV requires one audited target logits processor")
+    processor = processors[0]
+    if getattr(processor, "logit_scale", None) not in (None, 1.0) or getattr(
+        processor, "final_logit_softcapping", None
+    ):
+        raise RuntimeError(
+            "proposal TV cannot reconstruct scaled or softcapped target logits"
+        )
+    if getattr(worker, "_specforge_verify_hook", None) is not None:
+        raise RuntimeError("previous proposal verification was not consumed")
+    worker._specforge_verify_final = None
+
+    def capture(module, args, kwargs):
+        hidden = args[1] if len(args) > 1 else kwargs["hidden_states"]
+        metadata = args[3] if len(args) > 3 else kwargs["logits_metadata"]
+        if (
+            not metadata.forward_mode.is_target_verify()
+            or worker._specforge_verify_final is not None
+        ):
+            raise RuntimeError("unexpected target forward during proposal verification")
+        expected = len(batch.reqs) * (worker.gamma + 1)
+        if hidden.ndim != 2 or hidden.size(0) != expected:
+            raise RuntimeError("proposal verification final hidden rows are misaligned")
+        # The processor may release/reuse its input. Own these rows before that
+        # happens; record_round retains only reservoir-selected blocks, without bonus.
+        worker._specforge_verify_final = (
+            hidden.detach()
+            .reshape(len(batch.reqs), worker.gamma + 1, -1)[:, : worker.gamma]
+            .clone()
+        )
+
+    worker._specforge_verify_hook = processor.register_forward_pre_hook(
+        capture, with_kwargs=True
+    )
+
+
 def record_round(worker, batch, prefix_lens, draft_tokens, accept, layout):
     state = getattr(worker, "_specforge_replay", None)
     if state is None:
@@ -70,6 +133,18 @@ def record_round(worker, batch, prefix_lens, draft_tokens, accept, layout):
         if layout is not None
         else [draft_tokens.shape[1] + 1] * len(anchors)
     )
+    proposal_mode = state.get("tv_prefix_mode") == "proposal"
+    teacher = None
+    if proposal_mode:
+        hook = getattr(worker, "_specforge_verify_hook", None)
+        if hook is not None:
+            hook.remove()
+            worker._specforge_verify_hook = None
+        teacher = getattr(worker, "_specforge_verify_final", None)
+        worker._specforge_verify_final = None
+        if teacher is None or teacher.shape[:2] != draft_tokens.shape:
+            raise RuntimeError("proposal verification final hidden was not captured")
+        proposal_ids = draft_tokens.detach().cpu().tolist()
     for i, req in enumerate(batch.reqs):
         entry = state["requests"][req.rid]
         if entry["draft_version"] != state["version"]:
@@ -85,6 +160,106 @@ def record_round(worker, batch, prefix_lens, draft_tokens, accept, layout):
                 root_tokens=0,
             )
         )
+        if proposal_mode:
+            meta = entry["rounds"][-1]
+            round_id = len(entry["rounds"]) - 1
+            remaining = max(
+                0,
+                len(entry["input_ids"])
+                + entry["sampling_config"]["max_new_tokens"]
+                - int(anchors[i])
+                - 1,
+            )
+            valid_length = min(
+                int(verify_lengths[i]) - 1, remaining, len(proposal_ids[i])
+            )
+            for pos, token in enumerate(proposal_ids[i][:valid_length]):
+                if token in state["eos_token_ids"]:
+                    valid_length = pos + 1
+                    break
+            meta.update(
+                round_id=round_id,
+                proposal_ids=proposal_ids[i],
+                proposal_valid_mask=[
+                    j < valid_length for j in range(len(proposal_ids[i]))
+                ],
+                remaining_budget=remaining,
+            )
+            if valid_length:
+                entry["proposal_seen"] += 1
+                cache = entry["proposal_cache"]
+                slot = (
+                    len(cache)
+                    if len(cache) < state["anchor_budget"]
+                    else state["rng"].randrange(entry["proposal_seen"])
+                )
+                if slot < state["anchor_budget"]:
+                    # Clone each selected row separately so evicting a round
+                    # releases its storage, even when other requests keep theirs.
+                    item = (round_id, teacher[i].clone())
+                    if slot == len(cache):
+                        cache.append(item)
+                    else:
+                        cache[slot] = item
+
+
+def _proposal_capture_tensors(worker, request):
+    """Gather the exact selected IDs once; consume buffers after successful transfer."""
+    state = worker._specforge_replay
+    selection = request.get("proposal_selection")
+    if not isinstance(selection, dict) or set(selection) != {
+        "sample_ids",
+        "round_ids",
+        "anchors",
+    }:
+        raise ValueError(
+            "proposal capture requires sample, round and anchor identities"
+        )
+    samples, rounds, anchors = (
+        selection[k] for k in ("sample_ids", "round_ids", "anchors")
+    )
+    if (
+        len(samples) != len(request["input_ids"])
+        or len(rounds) != len(samples)
+        or len(anchors) != len(samples)
+        or len(set(samples)) != len(samples)
+    ):
+        raise ValueError("misaligned proposal capture samples")
+    template = state["proposal_template"]
+    width = len(rounds[0]) if rounds else 0
+    if not 1 <= width <= state["anchor_budget"]:
+        raise ValueError("invalid proposal capture block count")
+    result = template.new_zeros((len(samples), width, worker.gamma, template.size(-1)))
+    consumed = []
+    for row, sample in enumerate(samples):
+        entry = state["proposal_pending"].get(sample)
+        if entry is None or len(rounds[row]) != width or len(anchors[row]) != width:
+            raise ValueError("unknown or misaligned proposal capture sample")
+        if request["input_ids"][row][: len(entry["input_ids"])] != entry["input_ids"]:
+            raise ValueError("proposal capture sequence differs from rollout")
+        seen = set()
+        for col, (round_id, anchor) in enumerate(zip(rounds[row], anchors[row])):
+            if round_id == -1:
+                continue
+            if (
+                type(round_id) is not int
+                or round_id not in entry["cache"]
+                or round_id in seen
+            ):
+                raise ValueError(
+                    "unknown, duplicated or already consumed proposal round"
+                )
+            expected_anchor, hidden = entry["cache"][round_id]
+            if anchor != expected_anchor:
+                raise ValueError("proposal capture anchor/round mismatch")
+            result[row, col].copy_(hidden)
+            seen.add(round_id)
+        if seen != set(entry["cache"]):
+            raise ValueError(
+                "proposal capture must include every selected round exactly once"
+            )
+        consumed.append(sample)
+    return result, consumed
 
 
 def _mapped_weights(model, weights):
@@ -165,23 +340,29 @@ def _capture(scheduler, request):
         )
         if any(h is None for h in final):
             raise RuntimeError("target capture did not return final hidden states")
+        worker = scheduler.draft_worker
+        state = worker._specforge_replay
+        tensors = {"hidden_states": torch.stack(hidden).contiguous()}
+        consumed = []
+        if state.get("tv_prefix_mode") == "proposal":
+            proposal_hidden, consumed = _proposal_capture_tensors(worker, request)
+            tensors["proposal_teacher_hidden"] = proposal_hidden
+        else:
+            tensors["last_hidden_states"] = torch.stack(final).contiguous()
         if request.get("tensor_transport", "files") == "cuda-ipc":
             # Sender ownership extends through the trainer's clone + stream
             # synchronization. Never release merely because capture RPC ends.
-            tensors = {
-                "hidden_states": torch.stack(hidden).contiguous(),
-                "last_hidden_states": torch.stack(final).contiguous(),
-            }
             scheduler.draft_worker._specforge_capture_tensors = tensors
-            return {name: export_tensor(value) for name, value in tensors.items()}
-        save_file(
-            {
-                "hidden_states": torch.stack(hidden).contiguous().cpu(),
-                "last_hidden_states": torch.stack(final).contiguous().cpu(),
-            },
-            str(_path("capture.safetensors")),
-        )
-        return None
+            handles = {name: export_tensor(value) for name, value in tensors.items()}
+        else:
+            save_file(
+                {name: value.cpu() for name, value in tensors.items()},
+                str(_path("capture.safetensors")),
+            )
+            handles = None
+        for sample in consumed:
+            del state["proposal_pending"][sample]
+        return handles
     finally:
         for module, name, child in replacements:
             setattr(module, name, child)
@@ -230,6 +411,10 @@ def dispatch(scheduler):
                 raise RuntimeError(
                     "sync must follow one replay update, with version V+1"
                 )
+            if state is not None and state.get("proposal_pending"):
+                raise RuntimeError(
+                    "proposal caches must be consumed before the next update"
+                )
             if not scheduler.flush_cache():
                 raise RuntimeError("cache flush before draft sync failed")
             transport = request.get("tensor_transport", "files")
@@ -263,7 +448,16 @@ def dispatch(scheduler):
                 requests={},
                 target_version=request["target_version"],
                 tensor_transport=transport,
+                tv_prefix_mode=request.get("tv_prefix_mode", "teacher-forced"),
+                anchor_budget=request.get("anchor_budget", 1),
+                eos_token_ids=tuple(request.get("eos_token_ids", ())),
+                rng=random.Random(request.get("replay_seed", 0)),
             )
+            if (
+                state["tv_prefix_mode"] not in ("teacher-forced", "proposal")
+                or state["anchor_budget"] < 1
+            ):
+                raise ValueError("invalid proposal replay configuration")
             worker._specforge_replay = state
             result = dict(
                 protocol=PROTOCOL,
@@ -279,8 +473,25 @@ def dispatch(scheduler):
                 or state["version"] != request["draft_version"]
             ):
                 raise RuntimeError("rollout cannot start before successful weight sync")
+            if state.get("tv_prefix_mode") == "proposal":
+                for entry in request["requests"]:
+                    sampling = entry["sampling_config"]
+                    if (
+                        not 1e-5 <= sampling["temperature"] < float("inf")
+                        or sampling["top_p"] != 1
+                        or sampling["top_k"] != -1
+                    ):
+                        raise ValueError(
+                            "proposal rollout requires temperature >= 1e-5, top_p=1, top_k=-1"
+                        )
             state["requests"] = {
-                r["sample_id"]: dict(r, draft_version=state["version"], rounds=[])
+                r["sample_id"]: dict(
+                    r,
+                    draft_version=state["version"],
+                    rounds=[],
+                    proposal_cache=[],
+                    proposal_seen=0,
+                )
                 for r in request["requests"]
             }
             if len(state["requests"]) != len(request["requests"]):
@@ -291,6 +502,8 @@ def dispatch(scheduler):
             if state is None or state["phase"] != "rollout":
                 raise RuntimeError("finish requires a live rollout batch")
             records = []
+            proposal_mode = state.get("tv_prefix_mode") == "proposal"
+            state["proposal_pending"] = {}
             for entry in state["requests"].values():
                 req = entry.get("req")
                 if req is None or not req.finished():
@@ -340,6 +553,30 @@ def dispatch(scheduler):
                         sampling_config=sampling,
                     )
                 )
+                if proposal_mode:
+                    cache = {
+                        index: (entry["rounds"][index]["anchor"], hidden)
+                        for index, hidden in entry["proposal_cache"]
+                    }
+                    records[-1].update(
+                        trace_version=2,
+                        tv_prefix_mode="proposal",
+                        selected_round_ids=sorted(cache),
+                    )
+                    state["proposal_pending"][entry["sample_id"]] = dict(
+                        input_ids=ids, cache=cache
+                    )
+                    if cache:
+                        # Zero rows hold dtype/device/width without retaining a block allocation.
+                        value = next(iter(cache.values()))[1]
+                        state["proposal_template"] = value.new_empty(
+                            (0, value.size(-1))
+                        )
+            if proposal_mode and "proposal_template" not in state:
+                # Empty local ranks must still participate in global normalization.
+                param = next(scheduler.tp_worker.model_runner.model.parameters())
+                hidden_size = scheduler.tp_worker.model_runner.model.config.hidden_size
+                state["proposal_template"] = param.new_empty((0, hidden_size))
             state["requests"] = {}
             state["phase"] = "replay"
             result = dict(records=records, draft_version=state["version"])

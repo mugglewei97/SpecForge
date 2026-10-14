@@ -5885,6 +5885,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         block_keep_mask: Optional[torch.Tensor] = None,
         anchor_mode: str = "random",
         tv_global_block_count: Optional[torch.Tensor] = None,
+        proposal_ids: Optional[torch.Tensor] = None,
+        proposal_valid_mask: Optional[torch.Tensor] = None,
+        proposal_teacher_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -5923,20 +5926,30 @@ class OnlineDSparkModel(OnlineDFlashModel):
             attention_mask = torch.ones_like(input_ids)
 
         # ---- DFlash backbone (identical construction to OnlineDFlashModel.forward) ----
+        proposal_mode = getattr(self, "tv_prefix_mode", "teacher-forced") == "proposal"
+        if proposal_mode and anchor_mode != "replay":
+            raise ValueError("proposal TV requires replay anchors")
         if anchor_mode not in ("random", "replay"):
             raise ValueError(f"Unknown anchor mode: {anchor_mode}")
         if anchor_mode == "replay":
             if not getattr(self, "tv_acceptance_enabled", False):
                 raise ValueError("replay anchors require tv-acceptance")
-            from specforge.core.tv_acceptance import select_replay_anchors
+            if proposal_mode:
+                from specforge.data.dspark_replay import validate_proposal_anchors
 
-            anchor_positions, block_keep_mask = select_replay_anchors(
-                anchor_positions,
-                block_keep_mask,
-                loss_mask,
-                attention_mask,
-                self.num_anchors,
-            )
+                validate_proposal_anchors(
+                    anchor_positions, block_keep_mask, attention_mask, self.num_anchors
+                )
+            else:
+                from specforge.core.tv_acceptance import select_replay_anchors
+
+                anchor_positions, block_keep_mask = select_replay_anchors(
+                    anchor_positions,
+                    block_keep_mask,
+                    loss_mask,
+                    attention_mask,
+                    self.num_anchors,
+                )
             hidden_states = hidden_states.detach()
         elif anchor_positions is not None or block_keep_mask is not None:
             raise ValueError("explicit anchors require anchor_mode='replay'")
@@ -6017,6 +6030,18 @@ class OnlineDSparkModel(OnlineDFlashModel):
             self.block_size, device=device
         ).lt(active_block_size).view(1, 1, -1)
         eval_bool = eval_bool & active_depth_mask
+        if proposal_mode:
+            if (
+                proposal_ids is None
+                or proposal_valid_mask is None
+                or proposal_ids.shape != (bsz, n_blocks, self.block_size)
+                or proposal_valid_mask.shape != proposal_ids.shape
+                or proposal_valid_mask.dtype != torch.bool
+            ):
+                raise ValueError(
+                    "proposal TV requires aligned proposal tokens and validity mask"
+                )
+            eval_bool = proposal_valid_mask & block_keep_mask[..., None]
         eval_mask = eval_bool.float()  # [B, nb, bs]
 
         decay_weight_mask = eval_mask * self._decay_weights(device)
@@ -6052,6 +6077,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_before_summary = hidden_4d
         hidden_4d = self.draft_model.apply_block_summary(hidden_4d)
         if getattr(self, "tv_acceptance_enabled", False):
+            if proposal_mode:
+                from specforge.core.tv_acceptance import proposal_tv_forward
+
+                return proposal_tv_forward(
+                    self,
+                    input_ids,
+                    anchor_positions,
+                    hidden_4d,
+                    proposal_ids,
+                    eval_bool,
+                    proposal_teacher_hidden,
+                    global_block_count=tv_global_block_count,
+                )
             from specforge.core.tv_acceptance import teacher_forced_tv_forward
 
             return teacher_forced_tv_forward(

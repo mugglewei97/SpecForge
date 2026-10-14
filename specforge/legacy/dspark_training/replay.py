@@ -239,6 +239,8 @@ def run_replay_training(
             iterator = iter(dataloader)
             while True:
                 step_t0 = time.perf_counter()
+                if torch.device(device).type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
                 # Prefetching/tokenizing prompts is harmless; generation occurs only
                 # here, after the previous step's all-rank synchronization barrier.
                 batches = list(itertools.islice(iterator, args.accumulation_steps))
@@ -270,6 +272,8 @@ def run_replay_training(
                         target_version=args.rollout_target_version,
                         num_anchors=args.num_anchors,
                         eos_token_ids=model.tv_eos_token_ids,
+                        prefix_mode=getattr(args, "tv_prefix_mode", "teacher-forced"),
+                        block_size=getattr(args, "block_size", None),
                     )(records)
 
                 data = collective_phase(collate, device)
@@ -291,6 +295,8 @@ def run_replay_training(
                 overlap_sum = torch.zeros_like(loss_sum)
                 correct_sum = torch.zeros_like(loss_sum)
                 position_sum = torch.zeros_like(loss_sum)
+                tv_position_sum = None
+                tv_position_count = None
                 capture_before = getattr(backend, "capture_seconds", 0.0)
                 started = time.perf_counter()
                 for index, micro in enumerate(split_replay_batch(data, micro_size)):
@@ -317,6 +323,11 @@ def run_replay_training(
                     overlap_sum += metrics["tv_mean_overlap"] * positions
                     correct_sum += result[1] * positions
                     position_sum += positions
+                    if tv_position_sum is None:
+                        tv_position_sum = torch.zeros_like(result[2])
+                        tv_position_count = torch.zeros_like(result[4])
+                    tv_position_sum += result[2].detach() * result[4]
+                    tv_position_count += result[4]
 
                 synchronize_device()
                 capture_seconds = (
@@ -388,9 +399,25 @@ def run_replay_training(
                         "rollout/committed_tokens_per_round": committed
                         / max(rounds, 1),
                     }
+                    peak = torch.tensor(
+                        torch.cuda.max_memory_allocated(device)
+                        if torch.device(device).type == "cuda"
+                        else 0,
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+                    perf_metrics["perf/trainer_peak_allocated_bytes"] = peak.item()
+                    position_metrics = {
+                        f"train/tv_position_{index + 1}": value
+                        for index, value in enumerate(
+                            (tv_position_sum / tv_position_count.clamp_min(1)).tolist()
+                        )
+                    }
                     tracker.log(
                         {
                             **perf_metrics,
+                            **position_metrics,
                             "train/loss": loss_sum.item(),
                             "train/tv_valid_blocks": count.item(),
                             "train/tv_acceptance_loss": loss_sum.item(),

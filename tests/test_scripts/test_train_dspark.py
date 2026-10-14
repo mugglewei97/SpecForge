@@ -37,6 +37,36 @@ def training_args(*extra):
     )
 
 
+def test_proposal_tv_cli_and_sampling_contract():
+    args = training_args(
+        "--dspark-loss-type",
+        "tv-acceptance",
+        "--anchor-mode",
+        "replay",
+        "--tv-prefix-mode",
+        "proposal",
+        "--target-model-backend",
+        "sglang",
+        "--rollout-target-version",
+        "frozen-target",
+    )
+    validate_objective_args(args)
+    for key, value in (
+        ("rollout_temperature", 0.0),
+        ("rollout_top_p", 0.9),
+        ("rollout_top_k", 10),
+        ("tv_sampling_temperature", 0.5),
+        ("anchor_mode", "random"),
+        ("dspark_loss_type", "ce-l1"),
+    ):
+        changed = SimpleNamespace(**{**vars(args), key: value})
+        with pytest.raises(ValueError, match="proposal TV"):
+            validate_objective_args(changed)
+    saved = {**vars(args), "tv_prefix_mode": "teacher-forced"}
+    with pytest.raises(ValueError, match="tv_prefix_mode"):
+        validate_objective_resume(saved, args)
+
+
 def test_entrypoint_help_needs_no_training_dependencies():
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(

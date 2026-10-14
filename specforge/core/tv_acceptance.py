@@ -1,8 +1,4 @@
-"""TV acceptance-length proxy on ground-truth training-sequence prefixes.
-
-Reuse the target's single sequence forward for every anchor. The prefix-product
-objective is a teacher-forced proxy, not measured speculative acceptance length.
-"""
+"""Full-vocabulary TV acceptance proxy on teacher-forced or rollout prefixes."""
 
 import math
 from typing import NamedTuple
@@ -171,7 +167,6 @@ def teacher_forced_tv_forward(
         raise ValueError(
             "teacher-forced TV inputs and target hidden states are misaligned"
         )
-    flat_hidden = hidden.reshape(-1, width, hidden_size)
     with torch.no_grad():
         if (
             ((anchors < 0) | (anchors >= input_ids.size(1)))
@@ -204,6 +199,70 @@ def teacher_forced_tv_forward(
             device=hidden.device, dtype=hidden.dtype
         )
 
+    return _tv_block_forward(
+        model, hidden, previous, teacher, valid, global_block_count
+    )
+
+
+def proposal_tv_forward(
+    model,
+    input_ids,
+    anchors,
+    hidden,
+    proposal_ids,
+    proposal_valid_mask,
+    proposal_teacher_hidden,
+    global_block_count=None,
+):
+    """Replay fixed proposals; rejected suffixes still define the Markov prefix.
+
+    Teacher rows are final-norm verification rows [root, d1, ..., d(K-1)].
+    Neither the corrected sequence's suffix nor accepted length limits this loss.
+    """
+    if hidden.ndim != 4 or anchors.dtype != torch.long or input_ids.dtype != torch.long:
+        raise ValueError(
+            "proposal TV requires [B, A, K, H] hidden and int64 anchors/tokens"
+        )
+    if (
+        proposal_ids is None
+        or proposal_valid_mask is None
+        or proposal_teacher_hidden is None
+        or proposal_ids.shape != hidden.shape[:-1]
+        or proposal_ids.dtype != torch.long
+        or proposal_valid_mask.shape != proposal_ids.shape
+        or proposal_valid_mask.dtype != torch.bool
+        or proposal_teacher_hidden.shape != hidden.shape
+        or anchors.shape != hidden.shape[:2]
+        or input_ids.ndim != 2
+        or input_ids.size(0) != hidden.size(0)
+    ):
+        raise ValueError(
+            "proposal TV requires aligned proposal IDs, mask and verification final hidden"
+        )
+    with torch.no_grad():
+        if ((anchors < 0) | (anchors >= input_ids.size(1))).any():
+            raise ValueError("proposal anchor outside the complete sequence")
+        previous = torch.cat(
+            [input_ids.gather(1, anchors)[..., None], proposal_ids[..., :-1]], -1
+        )
+        valid = proposal_valid_mask.clone()
+        eos = torch.zeros_like(valid)
+        for token_id in model.tv_eos_token_ids:
+            eos |= proposal_ids == token_id
+        valid &= (eos.int().cumsum(-1) - eos.int()) == 0
+        valid = valid.int().cumprod(-1).bool()
+        teacher = proposal_teacher_hidden.detach().to(
+            device=hidden.device, dtype=hidden.dtype
+        )
+    return _tv_block_forward(
+        model, hidden, previous, teacher, valid, global_block_count
+    )
+
+
+def _tv_block_forward(model, hidden, previous, teacher, valid, global_block_count):
+    width, hidden_size = hidden.shape[-2:]
+    flat_hidden = hidden.reshape(-1, width, hidden_size)
+
     def chunk_terms(h, prev, target_h, mask):
         logits = model.lm_head(h)
         if model.draft_model.markov_head is not None:
@@ -229,7 +288,7 @@ def teacher_forced_tv_forward(
             flat_hidden,
             previous.reshape(-1, width),
             teacher.reshape_as(flat_hidden),
-            valid,
+            valid.reshape(-1, width),
             chunk_size=model.tv_objective_chunk_blocks,
         )
     )
@@ -292,7 +351,9 @@ def reduce_tv_terms(terms: TVAcceptanceTerms, global_block_count=None):
     )
 
 
-def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
+def configure_tv_acceptance(
+    model, *, temperature, chunk_blocks, eos_token_ids, prefix_mode="teacher-forced"
+):
     """Enable the pure objective before FSDP/optimizer creation.
 
     Initial support is the user's vanilla Markov DSpark configuration (or no
@@ -303,6 +364,17 @@ def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
         raise ValueError("temperature must be finite and > 0; chunk_blocks must be > 0")
     draft = model.draft_model
     head = draft.markov_head
+    if prefix_mode not in ("teacher-forced", "proposal"):
+        raise ValueError("unknown TV prefix mode")
+    if prefix_mode == "proposal" and head is None:
+        raise ValueError("proposal TV requires the vanilla Markov head")
+    if (
+        prefix_mode == "proposal"
+        and getattr(model, "conv_source_semantic_alpha", 0) > 0
+    ):
+        raise ValueError(
+            "proposal TV does not support label-conditioned source semantics"
+        )
     if head is not None and getattr(head, "markov_head_type", "vanilla") != "vanilla":
         raise ValueError(
             "tv-acceptance currently supports only the vanilla Markov head"
@@ -323,4 +395,5 @@ def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
     model.tv_temperature = float(temperature)
     model.tv_objective_chunk_blocks = int(chunk_blocks)
     model.tv_eos_token_ids = tuple(eos_token_ids)
+    model.tv_prefix_mode = prefix_mode
     model.tv_acceptance_enabled = True

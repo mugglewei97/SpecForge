@@ -33,6 +33,8 @@ exec torchrun --standalone --nproc_per_node "$NUM_GPUS" scripts/train_dspark.py 
     --log-interval 10 \
     --save-interval 1000 \
     --dspark-loss-type tv-acceptance \
+    --tv-prefix-mode proposal \
+    --replay-tensor-transport cuda-ipc \
     --anchor-mode replay \
     --target-model-backend sglang \
     --block-size 7 \

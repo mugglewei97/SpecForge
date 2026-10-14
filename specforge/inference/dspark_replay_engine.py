@@ -32,6 +32,7 @@ class SGLangReplayEngine:
         if self.tensor_transport not in ("files", "cuda-ipc"):
             raise ValueError("unknown replay tensor transport")
         self.capture_seconds = 0.0
+        self.tv_prefix_mode = getattr(args, "tv_prefix_mode", "teacher-forced")
 
     def set_capture_layers(self, layer_ids):
         self.capture_layer_ids = list(layer_ids)
@@ -184,10 +185,14 @@ class SGLangReplayEngine:
                 trainable_names=sorted(trainable_names),
                 capture_layer_ids=self.capture_layer_ids,
                 tensor_transport=self.tensor_transport,
+                tv_prefix_mode=self.tv_prefix_mode,
+                anchor_budget=getattr(self.args, "num_anchors", 1),
+                eos_token_ids=getattr(self.args, "tv_eos_token_ids", ()),
+                replay_seed=getattr(self.args, "seed", 0) + version,
                 **transfer,
             )
             if (
-                result.get("protocol") != 1
+                result.get("protocol") != 2
                 or result.get("draft_version") != version
                 or not result.get("cache_flushed")
                 or set(result.get("loaded_names", [])) != set(state_dict)
@@ -253,6 +258,8 @@ class SGLangReplayEngine:
                     record,
                     draft_version=version,
                     target_version=self.args.rollout_target_version,
+                    prefix_mode=self.tv_prefix_mode,
+                    block_size=self.block_size,
                 )
                 if (
                     "output_ids" not in result
@@ -266,7 +273,9 @@ class SGLangReplayEngine:
             raise
 
     @torch.no_grad()
-    def generate_dflash_data(self, input_ids, attention_mask, loss_mask):
+    def generate_dflash_data(
+        self, input_ids, attention_mask, loss_mask, *, proposal_selection=None
+    ):
         started = time.perf_counter()
         result = self._rpc(
             "capture",
@@ -275,6 +284,7 @@ class SGLangReplayEngine:
             attention_mask=attention_mask.cpu().tolist(),
             loss_mask=loss_mask.cpu().tolist(),
             tensor_transport=self.tensor_transport,
+            proposal_selection=proposal_selection,
         )
         if result["draft_version"] != self.version:
             self.failed = True
@@ -282,7 +292,12 @@ class SGLangReplayEngine:
         if self.tensor_transport == "cuda-ipc":
             try:
                 handles = result["capture_handles"]
-                if set(handles) != {"hidden_states", "last_hidden_states"}:
+                teacher_key = (
+                    "proposal_teacher_hidden"
+                    if self.tv_prefix_mode == "proposal"
+                    else "last_hidden_states"
+                )
+                if set(handles) != {"hidden_states", teacher_key}:
                     raise RuntimeError("incomplete target capture handles")
                 # Own the training tensors: checkpointed backward can outlive
                 # this RPC. The server retains its allocations until release.
@@ -300,6 +315,16 @@ class SGLangReplayEngine:
         else:
             tensors = load_file(str(self.directory / "capture.safetensors"))
             (self.directory / "capture.safetensors").unlink()
+        teacher_key = (
+            "proposal_teacher_hidden"
+            if self.tv_prefix_mode == "proposal"
+            else "last_hidden_states"
+        )
+        if set(tensors) != {"hidden_states", teacher_key}:
+            self.failed = True
+            raise RuntimeError("incomplete target capture tensors")
+        if self.tv_prefix_mode == "proposal":
+            tensors["last_hidden_states"] = None
         self.capture_seconds += time.perf_counter() - started
         return SimpleNamespace(**tensors)
 
