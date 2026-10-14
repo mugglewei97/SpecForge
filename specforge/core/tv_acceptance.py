@@ -219,7 +219,15 @@ def reduce_tv_terms(terms: TVAcceptanceTerms):
     )
 
 
-def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
+def configure_tv_acceptance(
+    model,
+    *,
+    temperature,
+    chunk_blocks,
+    eos_token_ids,
+    beta=False,
+    verification_batch_size=None,
+):
     """Enable the pure objective before FSDP/optimizer creation.
 
     Initial support is the user's vanilla Markov DSpark configuration (or no
@@ -229,6 +237,12 @@ def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
     if not math.isfinite(temperature) or temperature <= 0 or chunk_blocks < 1:
         raise ValueError("temperature must be finite and > 0; chunk_blocks must be > 0")
     draft = model.draft_model
+    if beta and (
+        model.block_size != 7 or getattr(draft.config, "block_size", None) != 7
+    ):
+        raise ValueError("tv-acceptance-beta requires actual model block_size=7")
+    if beta and verification_batch_size is not None and verification_batch_size < 1:
+        raise ValueError("TV beta verification batch size must be positive")
     head = draft.markov_head
     if head is not None and getattr(head, "markov_head_type", "vanilla") != "vanilla":
         raise ValueError(
@@ -251,3 +265,5 @@ def configure_tv_acceptance(model, *, temperature, chunk_blocks, eos_token_ids):
     model.tv_objective_chunk_blocks = int(chunk_blocks)
     model.tv_eos_token_ids = tuple(eos_token_ids)
     model.tv_acceptance_enabled = True
+    model.tv_acceptance_beta = bool(beta)
+    model.tv_verification_batch_size = verification_batch_size

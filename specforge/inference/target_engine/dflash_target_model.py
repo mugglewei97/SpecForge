@@ -72,6 +72,12 @@ class DFlashTargetEngine(TargetEngine):
         """Set which layers' hidden states to capture (TargetEngine hook)."""
         self.capture_layer_ids = layer_ids
 
+    def proposal_verification(self):
+        """Own target resources for a single sampled-prefix training forward."""
+        from .proposal_verification import ProposalVerificationSession
+
+        return ProposalVerificationSession(self)
+
     @abstractmethod
     def score_proposal_tokens(
         self,
@@ -102,7 +108,6 @@ class DFlashTargetEngine(TargetEngine):
 
 
 class SGLangDFlashTargetEngine(DFlashTargetEngine):
-
     backend = "sglang"
 
     def __init__(self, backend):  # backend: sglang_backend.SGLangCaptureBackend
@@ -154,6 +159,15 @@ class SGLangDFlashTargetEngine(DFlashTargetEngine):
     def score_proposal_tokens(self, input_ids, attention_mask):
         return self._backend.score_next_token_ids(input_ids, attention_mask)
 
+    def proposal_verification(self):
+        from .proposal_verification import supports_qwen3_prefix_cache
+
+        if supports_qwen3_prefix_cache(self._backend.hf_config):
+            from .sglang_backend.proposal_cache import SGLangProposalVerificationSession
+
+            return SGLangProposalVerificationSession(self)
+        return super().proposal_verification()
+
     def score_proposal_distribution(
         self,
         input_ids,
@@ -176,7 +190,6 @@ class SGLangDFlashTargetEngine(DFlashTargetEngine):
 
 
 class HFDFlashTargetEngine(DFlashTargetEngine):
-
     backend = "hf"
 
     def __init__(self, model: nn.Module):
@@ -213,6 +226,16 @@ class HFDFlashTargetEngine(DFlashTargetEngine):
         return _DFLASH.hf_capture(
             self.model, self.capture_layer_ids, input_ids, attention_mask, loss_mask
         )
+
+    def proposal_verification(self):
+        from .proposal_verification import (
+            HFProposalVerificationSession,
+            supports_qwen3_prefix_cache,
+        )
+
+        if supports_qwen3_prefix_cache(self.model.config):
+            return HFProposalVerificationSession(self)
+        return super().proposal_verification()
 
     @torch.no_grad()
     def score_proposal_tokens(self, input_ids, attention_mask):

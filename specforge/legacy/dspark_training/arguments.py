@@ -1608,4 +1608,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv=None):
-    return build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    if args.dspark_loss_type == "tv-acceptance-beta":
+        from .objective import TV_BETA_PREFIX_MODE
+
+        args.tv_prefix_mode = TV_BETA_PREFIX_MODE
+    return args

@@ -83,6 +83,8 @@ class DFlashTargetOutput(TargetCaptureBatch):
     # to form the soft next-token distribution). None when the backend does not
     # surface it (then DSpark must run CE-only).
     last_hidden_states: Optional[torch.Tensor] = None
+    # Optional, local to a proposal-verification session; released after forward.
+    past_key_values: Any = None
 
 
 @dataclass(frozen=True)
@@ -480,11 +482,19 @@ class DFlashCapturePolicy(TargetCapturePolicy):
         loss_mask,
         **kwargs,
     ) -> DFlashTargetOutput:
-        outputs = model(
+        from .proposal_verification import supports_qwen3_prefix_cache
+
+        # Qwen3 capture only needs Transformer states, never full-sequence logits.
+        transformer = (
+            model.model
+            if supports_qwen3_prefix_cache(getattr(model, "config", None))
+            else model
+        )
+        outputs = transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
-            use_cache=False,
+            use_cache=kwargs.get("use_cache", False),
         )
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output;
@@ -504,6 +514,7 @@ class DFlashCapturePolicy(TargetCapturePolicy):
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             last_hidden_states=last_hidden_states,
+            past_key_values=getattr(outputs, "past_key_values", None),
         )
 
     @torch.no_grad()

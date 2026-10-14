@@ -142,38 +142,46 @@ def _forward_dspark_data_batch(
     )
     if args.multi_teacher_oracle_export_dir or args.multi_teacher_oracle_cache:
         torch.manual_seed(rollout_seed)
-    target_output = target_model.generate_dflash_data(
-        input_ids, attention_mask, loss_mask
-    )
-    hidden_states = target_output.hidden_states.to(device, non_blocking=True)
-    last_hidden_states = target_output.last_hidden_states
-    if last_hidden_states is not None:
-        last_hidden_states = last_hidden_states.to(device, non_blocking=True)
-    elif needs_target_hidden:
-        raise RuntimeError(
-            "The selected DSpark objective requires target final hidden states, "
-            "but the target backend "
-            f"({args.target_model_backend}) did not surface last_hidden_states. "
-            "Use a backend that returns final hidden states, such as "
-            "--target-model-backend hf."
+    beta = getattr(args, "dspark_loss_type", "ce-l1") == "tv-acceptance-beta"
+    if beta:
+        session_context = target_model.proposal_verification()
+    else:
+        session_context = contextlib.nullcontext(None)
+    # Includes capture and draft forward: cache resources are also released if
+    # either fails. Checkpointed loss closures retain only verified hidden rows.
+    with session_context as session:
+        capture = session.capture if beta else target_model.generate_dflash_data
+        target_output = capture(input_ids, attention_mask, loss_mask)
+        hidden_states = target_output.hidden_states.to(device, non_blocking=True)
+        last_hidden_states = target_output.last_hidden_states
+        if last_hidden_states is not None:
+            last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+        elif needs_target_hidden:
+            raise RuntimeError(
+                "The selected DSpark objective requires target final hidden states, "
+                "but the target backend "
+                f"({args.target_model_backend}) did not surface last_hidden_states. "
+                "Use a backend that returns final hidden states, such as "
+                "--target-model-backend hf."
+            )
+        if args.step_seeded_rollouts:
+            torch.manual_seed(rollout_seed)
+        forward_context = (
+            torch.no_grad()
+            if args.multi_teacher_oracle_export_dir
+            else contextlib.nullcontext()
         )
-    if args.step_seeded_rollouts:
-        torch.manual_seed(rollout_seed)
-    forward_context = (
-        torch.no_grad()
-        if args.multi_teacher_oracle_export_dir
-        else contextlib.nullcontext()
-    )
-    with forward_context:
-        return dspark_model(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            last_hidden_states=last_hidden_states,
-            attention_mask=attention_mask,
-            sample_ids=sample_ids,
-            source_ids=source_ids,
-        )
+        with forward_context:
+            return dspark_model(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                loss_mask=loss_mask,
+                last_hidden_states=last_hidden_states,
+                attention_mask=attention_mask,
+                sample_ids=sample_ids,
+                source_ids=source_ids,
+                **({"tv_verification_session": session} if beta else {}),
+            )
 
 
 def run_training(args):
@@ -261,7 +269,7 @@ def run_training(args):
     device_type = device.type
 
     needs_target_hidden = (
-        (args.dspark_loss_type == "tv-acceptance")
+        (args.dspark_loss_type in {"tv-acceptance", "tv-acceptance-beta"})
         or (args.offline_acceptance_objective != "none")
         or (args.bv_loss_alpha > 0)
         or (args.carh_predecessor_diagnostics_interval > 0)

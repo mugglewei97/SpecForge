@@ -1,4 +1,133 @@
-# DSpark ground-truth 前缀 TV 接收长度代理目标
+# DSpark TV 接收长度训练：teacher-forced 与 beta
+
+`tv-acceptance` 保留原 ground-truth 前缀代理目标；新增的
+`tv-acceptance-beta` 在实际 proposal 前缀上优化固定轮次起点下的单轮
+期望连续接受长度及其梯度。默认 `ce-l1` 不变。
+
+## Beta：实际 proposal 前缀与采样分布梯度
+
+在现有示例命令末尾覆盖 loss 类型和输出目录即可：
+
+```bash
+bash examples/run_qwen3_8b_dspark_tv_acceptance.sh 8 flex_attention sglang \
+    --dspark-loss-type tv-acceptance-beta \
+    --output-dir /path/to/dspark-tv-beta
+```
+
+从已有模型后训练时追加 `--init-draft-model-path /path/to/checkpoint`。
+模型的实际 `block_size` 必须为 7（包括从 checkpoint 加载的配置），不能
+只依据 CLI 的默认值判断。beta 沿用 `T > 0`、全词表 softmax、vanilla
+Markov head 或无 Markov head、`tp-size=1`、`accumulation-steps=1`、
+`micro-batch-size=0` 的限制，并支持 FSDP 数据并行。
+
+对固定 anchor 上采到的 proposal `d_1, ..., d_K`，所有分布均以相同的
+实际 proposal 前缀为条件：
+
+```text
+a_i = sum_v min(p_i(v), q_i(v)) = 1 - TV(p_i, q_i)
+r_i = min(1, p_i(d_i) / q_old,i(d_i))
+R_hat = a_1 + r_1*a_2 + r_1*r_2*a_3 + ...
+L_block = 1 - R_hat / 7
+```
+
+当前位置使用全词表重叠率；前面的位置使用实际采样 token 的接受概率。
+这样保留了“某个 token 被接受”和“它构成的后续前缀容易继续接受”的
+关联。单条路径的 `R_hat` 是估计量；对 proposal 采样取期望，才得到
+固定起点、给定有效预测范围下的期望连续接受长度。
+
+反向传播使用：
+
+```text
+r_tilde_i(theta) = min(p_i(d_i), q_theta,i(d_i)) / stopgrad(q_old,i(d_i))
+```
+
+`q_old` 是本次采样保存的 token log probability，对应同一版本模型，
+不是历史 checkpoint；`q_theta` 由同一份 backbone hidden 和相同
+前驱 token、温度 replay 得到。分母停止梯度，分子和整个前缀连乘
+保留梯度，不对训练比值再做 `clamp(max=1)`。实际计算采用
+`exp(min(log_p(d), log_q(d)) - old_log_q(d))`，避免先转概率再相除
+导致的小概率下溢。
+
+对路径取期望时，采样概率中的 `q_old` 与分母抵消，留下前缀的
+`prod min(p(d), q_theta(d))`，因此同时包含接受质量和 proposal
+采样分布变化的梯度。只对 `min(1,p/q_theta)` 反传或 detach
+前缀权重，都不能得到相同梯度。
+
+anchors 仍从监督区域选取。padding、序列尾部或监督 mask 的首个
+无效位置限制该 anchor 的预测范围；实际采样的 EOS 计入当前位，
+其后不再计分。reference EOS 不替代 proposal EOS 判断。
+有效长度不足 7 时，loss 分母仍为 7；空 block 不参与均值。
+各 rank 按全局有效 block 数归一化，全部 rank 为空时明确报错。
+该目标不含 bonus token，也不计算策略变化对下一轮起点分布的影响。
+
+### 数据流与计算复用
+
+原序列 target capture 提供上下文 hidden，draft backbone 对这些
+anchors 运行一次。之后用同一份 draft hidden 采样并 replay：首位
+Markov 前驱为 anchor token，后续前驱为实际采样 token。target 必须
+在对应的 proposal 前缀上评分。
+
+首位置直接复用原 target final hidden；只要前面的 proposal 与
+reference 仍相同，后续对应位置也继续复用。若第 `j` 个 proposal
+首次分叉，预测它的分布仍可复用，只有第 `j+1` 位起需要验证。
+分叉后即使 token 再次相同，也不会恢复复用 reference 后缀。
+整轮所需前缀全部命中时，不发送额外验证请求；验证只需消费到最后
+一个有效 proposal 的前驱，无需再为最后一个 proposal 计算 bonus。
+
+全注意力 Qwen3 使用额外的后端优化：
+
+- HF capture 直接调用 Transformer，省去无用的整段词表投影。
+  原 batch 的 KV 保留到当前 draft 前向完成；每批候选复制所需
+  prefix KV，通过 attention mask 和显式位置编号批量计算短续接。
+- SGLang 共享完整 KV 页，候选独占新增页。不共享可被续写的部分页，
+  页边界最多重算 `page_size-1` 个 token。每批验证后释放新增页，
+  当前前向结束后释放原缓存；异常退出也清理。prefix 索引使用 int64。
+- SGLang 缓存路径默认最多批量验证 64 个候选；HF 和完整候选 fallback
+  默认 4 个。可用 `--tv-verification-batch-size` 调整。
+
+其他架构使用完整候选验证，但仍复用相同前缀的 target hidden。
+SGLang beta 路径要求非空、右侧 padding 的输入。
+没有为全部 anchors 常驻完整词表 logits/probabilities；全词表 TV
+投影仍按 `--tv-objective-chunk-blocks` 分块。
+
+proposal、旧 token log probability 和验证后的 target hidden 在反向前
+固定。checkpoint 反向只重算词表投影、概率和 loss，不重新采样，
+不重新运行 target Transformer，也不依赖已经释放的 KV。
+
+### 日志、恢复与验证
+
+beta 日志使用 `tv_acceptance_length_estimate`，区别于旧模式的
+`tv_acceptance_length_proxy`。其余 `tv_acceptance_loss`、
+`tv_mean_overlap`、`tv_valid_blocks`、`tv_mean_valid_length` 保留。
+`accuracy` 表示实际 proposal 前缀上 draft/target 的 argmax 一致率，
+不是实测接受率；position loss 仍为各位置 TV。
+
+beta checkpoint 保存 `tv_prefix_mode=sampled-beta-v1`。切换 loss
+类型、前缀语义或温度不能直接恢复 optimizer；使用
+`--init-draft-model-path` 和新的输出目录重新开始。分块和验证批量
+可以调整，但 beta 的分块变化可能改变随机数消费顺序，不保证逐步
+复现同一条采样轨迹。
+
+```bash
+python -m pytest -q \
+    tests/test_utils/test_tv_acceptance.py \
+    tests/test_utils/test_tv_acceptance_beta.py \
+    tests/test_scripts/test_train_dspark.py \
+    tests/test_modeling/test_target/test_proposal_verification.py \
+    tests/test_modeling/test_target/test_sglang_proposal_cache.py
+```
+
+测试包括小词表路径穷举的期望值/梯度、EOS、有限差分、低精度和
+log 空间小概率、采样/replay 一致性、完整候选参考值与梯度、真实
+小型 DSpark 前后向，以及真实小型 Qwen3 的 HF KV 等价性。
+SGLang 的 CPU 测试使用模拟分页 allocator 检查页隔离、int64 索引、
+释放和异常清理，不替代真实 SGLang GPU 执行。
+
+训练速度、显存峰值及实际解码收益仍需 GPU 实测。应使用相同模型、
+batch、anchors 和序列长度，对比旧模式与 beta 的完整 step 吞吐，
+并观察前缀命中率和分叉位置；当前不承诺接近旧模式速度。
+
+## 原 tv-acceptance 模式
 
 使用恢复的 `scripts/train_dspark.py` 入口：
 

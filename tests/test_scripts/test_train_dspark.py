@@ -149,6 +149,46 @@ def test_teacher_forced_resume_allows_memory_tuning():
     validate_objective_resume(saved, args)
 
 
+def test_beta_cli_resume_semantics_and_memory_tuning():
+    args = training_args("--dspark-loss-type", "tv-acceptance-beta")
+    validate_objective_args(args)
+    assert args.tv_prefix_mode == "sampled-beta-v1"
+    saved = {
+        **vars(args),
+        "tv_objective_chunk_blocks": 32,
+        "tv_verification_batch_size": 64,
+    }
+    validate_objective_resume(saved, args)
+    for key, value in (
+        ("dspark_loss_type", "tv-acceptance"),
+        ("tv_sampling_temperature", 0.7),
+        ("tv_prefix_mode", "teacher-forced"),
+    ):
+        with pytest.raises(ValueError, match=key):
+            validate_objective_resume({**saved, key: value}, args)
+    saved.pop("tv_prefix_mode")
+    with pytest.raises(ValueError, match="tv_prefix_mode"):
+        validate_objective_resume(saved, args)
+
+
+@pytest.mark.parametrize(
+    "flag,value,match",
+    [
+        ("--tv-verification-batch-size", "0", "verification"),
+        ("--tv-verification-batch-size", "-1", "verification"),
+        ("--tv-temperature", "nan", "temperature"),
+        ("--tp-size", "2", "tp-size"),
+        ("--accumulation-steps", "2", "normalization"),
+        ("--netprefix-mode", "baseline", "standalone"),
+    ],
+)
+def test_beta_cli_rejects_unsupported_options(flag, value, match):
+    with pytest.raises(ValueError, match=match):
+        validate_objective_args(
+            training_args("--dspark-loss-type", "tv-acceptance-beta", flag, value)
+        )
+
+
 def test_config_preserves_checkpoint_values_and_explicit_cli_overrides():
     config = SimpleNamespace(
         markov_rank=32,

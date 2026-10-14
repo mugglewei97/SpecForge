@@ -9,6 +9,8 @@ OBJECTIVE_DEFAULTS = {
     "tv_objective_chunk_blocks": 8,
 }
 TV_PREFIX_MODE = "teacher-forced"
+TV_BETA_PREFIX_MODE = "sampled-beta-v1"
+TV_OBJECTIVES = ("tv-acceptance", "tv-acceptance-beta")
 
 
 def add_objective_args(group):
@@ -16,9 +18,9 @@ def add_objective_args(group):
     group.set_defaults(tv_prefix_mode=TV_PREFIX_MODE)
     group.add_argument(
         "--dspark-loss-type",
-        choices=["ce-l1", "tv-acceptance"],
+        choices=["ce-l1", *TV_OBJECTIVES],
         default=OBJECTIVE_DEFAULTS["dspark_loss_type"],
-        help="tv-acceptance: accepted-length proxy on ground-truth prefixes; reuse one target forward.",
+        help="tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
     )
     group.add_argument(
         "--tv-temperature",
@@ -26,7 +28,7 @@ def add_objective_args(group):
         dest="tv_sampling_temperature",
         type=float,
         default=OBJECTIVE_DEFAULTS["tv_sampling_temperature"],
-        help="Shared target/draft softmax temperature. The old sampling name is an alias; no tokens are sampled.",
+        help="Shared target/draft softmax temperature; beta uses it for both proposal sampling and replay.",
     )
     group.add_argument(
         "--tv-objective-chunk-blocks",
@@ -38,13 +40,20 @@ def add_objective_args(group):
         "--tv-verification-batch-size",
         type=int,
         default=None,
-        help="Deprecated and ignored: teacher-forced TV does not run candidate verification.",
+        help="Beta candidate verification batch size (default: 64 with SGLang prefix KV, 4 otherwise); ignored by teacher-forced TV.",
     )
 
 
 def validate_objective_args(args):
-    if args.dspark_loss_type != "tv-acceptance":
+    if args.dspark_loss_type not in TV_OBJECTIVES:
         return
+    if args.dspark_loss_type == "tv-acceptance-beta":
+        args.tv_prefix_mode = TV_BETA_PREFIX_MODE
+        if (
+            args.tv_verification_batch_size is not None
+            and args.tv_verification_batch_size < 1
+        ):
+            raise ValueError("TV beta verification batch size must be positive")
     if (
         not math.isfinite(args.tv_sampling_temperature)
         or args.tv_sampling_temperature <= 0
@@ -77,17 +86,22 @@ def validate_objective_args(args):
 def validate_objective_resume(saved_args, args):
     saved = saved_args if isinstance(saved_args, Mapping) else vars(saved_args)
     if (
-        args.dspark_loss_type == "tv-acceptance"
-        and saved.get("dspark_loss_type") == "tv-acceptance"
-        and saved.get("tv_prefix_mode", "sampled") != TV_PREFIX_MODE
+        args.dspark_loss_type in TV_OBJECTIVES
+        and saved.get("dspark_loss_type") == args.dspark_loss_type
+        and saved.get("tv_prefix_mode", "sampled")
+        != (
+            TV_BETA_PREFIX_MODE
+            if args.dspark_loss_type == "tv-acceptance-beta"
+            else TV_PREFIX_MODE
+        )
     ):
         raise ValueError(
             "Cannot resume TV with changed tv_prefix_mode: this checkpoint uses "
-            "sampled or unknown prefixes, but training now uses teacher-forced "
-            "prefixes. Use --init-draft-model-path with a new output directory."
+            "incompatible or unknown prefix semantics. "
+            "Use --init-draft-model-path with a new output directory."
         )
-    # Chunk size and the obsolete verification batch size do not change the
-    # teacher-forced objective or consume sampling RNG, so they may be retuned.
+    # Memory knobs do not change the objective and may be retuned. Beta chunk
+    # size can change RNG ordering, so this does not promise bitwise replay.
     for name in ("dspark_loss_type", "tv_sampling_temperature"):
         default = OBJECTIVE_DEFAULTS[name]
         if saved.get(name, default) != getattr(args, name):
@@ -99,7 +113,7 @@ def validate_objective_resume(saved_args, args):
 
 def configure_objective(model, tokenizer, args):
     """Enable target-state reuse and freeze unused heads before FSDP wrapping."""
-    if args.dspark_loss_type != "tv-acceptance":
+    if args.dspark_loss_type not in TV_OBJECTIVES:
         return
     from transformers import AutoConfig
 
@@ -119,7 +133,18 @@ def configure_objective(model, tokenizer, args):
         temperature=args.tv_sampling_temperature,
         chunk_blocks=args.tv_objective_chunk_blocks,
         eos_token_ids=eos_ids,
+        beta=args.dspark_loss_type == "tv-acceptance-beta",
+        verification_batch_size=args.tv_verification_batch_size,
     )
+    if args.dspark_loss_type == "tv-acceptance-beta":
+        print_on_rank0(
+            "TV acceptance beta: actual proposal prefixes, same-version rollout/replay, "
+            "differentiable min(p(d),q(d))/stopgrad(q_old(d)) prefix factors, "
+            "loss=mean_blocks(1-(a1+r1*a2+r1*r2*a3+...)/7). "
+            "Fixed anchors; excludes bonus tokens and future round-start gradients. "
+            "Reuse target hidden and full-attention Qwen3 prefix KV when available."
+        )
+        return
     if args.tv_verification_batch_size is not None:
         print_on_rank0(
             "--tv-verification-batch-size is deprecated and ignored: "

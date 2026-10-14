@@ -5881,6 +5881,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         attention_mask: Optional[torch.Tensor] = None,
         sample_ids: Optional[torch.Tensor] = None,
         source_ids: Optional[torch.Tensor] = None,
+        tv_verification_session=None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -6029,6 +6030,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_before_summary = hidden_4d
         hidden_4d = self.draft_model.apply_block_summary(hidden_4d)
         if getattr(self, "tv_acceptance_enabled", False):
+            if getattr(self, "tv_acceptance_beta", False):
+                from specforge.core.tv_acceptance_beta import sampled_tv_beta_forward
+
+                return sampled_tv_beta_forward(
+                    self,
+                    input_ids,
+                    attention_mask,
+                    anchor_positions,
+                    hidden_4d,
+                    eval_bool,
+                    last_hidden_states,
+                    tv_verification_session,
+                )
             from specforge.core.tv_acceptance import teacher_forced_tv_forward
 
             return teacher_forced_tv_forward(
