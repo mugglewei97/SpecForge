@@ -1,7 +1,9 @@
+import copy
 import os
 import tempfile
 import unittest
 from datetime import timedelta
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -118,6 +120,27 @@ def _distributed_worker(rank, init_file, device_type):
             assert model.weight.grad is None
         _assert_step(optimizer, torch.tensor(3.0, device=device), native_clip=True)
 
+        # A non-finite gradient on one rank must stop even the rank owning an
+        # empty shard, without advancing either optimizer or scheduler state.
+        parameters = [p.detach().clone() for p in optimizer.model_params]
+        masters = [p.detach().clone() for p in optimizer.fp32_params]
+        moments = copy.deepcopy(optimizer.optimizer.state_dict())
+        schedule = copy.deepcopy(optimizer.scheduler.state_dict())
+        value = float("nan") if rank == 0 else 1.0
+        root(torch.tensor([[value]], device=device)).sum().backward()
+        try:
+            optimizer.step()
+        except FloatingPointError:
+            pass
+        else:
+            raise AssertionError("all ranks must reject the non-finite gradient")
+        torch.testing.assert_close(optimizer.model_params, parameters, rtol=0, atol=0)
+        torch.testing.assert_close(optimizer.fp32_params, masters, rtol=0, atol=0)
+        torch.testing.assert_close(optimizer.optimizer.state_dict(), moments)
+        assert optimizer.scheduler.state_dict() == schedule
+        assert all(p.grad is None for p in optimizer.model_params)
+        assert all(p.grad is None for p in optimizer.fp32_params)
+
         # Distributed initialization alone must not trigger a norm reduction
         # for a regular, replicated model without FSDP.
         model = torch.nn.Linear(2, 1, bias=False, device=device)
@@ -129,6 +152,47 @@ def _distributed_worker(rank, init_file, device_type):
 
 
 class TestLegacyBF16OptimizerClipGradNorm(unittest.TestCase):
+    def test_nonfinite_gradients_preserve_parameters_moments_and_scheduler(self):
+        for bad_value in (float("nan"), float("inf")):
+            for use_fsdp in (False, True):
+                with self.subTest(bad_value=bad_value, use_fsdp=use_fsdp):
+                    model = torch.nn.Linear(2, 1, bias=False)
+                    wrapper = (
+                        SimpleNamespace(
+                            clip_grad_norm_=lambda limit: torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), limit
+                            )
+                        )
+                        if use_fsdp
+                        else None
+                    )
+                    optimizer = BF16Optimizer(
+                        model, lr=1e-3, max_grad_norm=1.0, fsdp_model=wrapper
+                    )
+                    model.weight.grad = torch.ones_like(model.weight)
+                    optimizer.step()
+                    parameters = model.weight.detach().clone()
+                    masters = [p.detach().clone() for p in optimizer.fp32_params]
+                    moments = copy.deepcopy(optimizer.optimizer.state_dict())
+                    schedule = copy.deepcopy(optimizer.scheduler.state_dict())
+                    model.weight.grad = torch.tensor([[bad_value, 1.0]])
+
+                    with self.assertRaisesRegex(FloatingPointError, "non-finite"):
+                        optimizer.step()
+
+                    torch.testing.assert_close(
+                        model.weight, parameters, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        optimizer.fp32_params, masters, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        optimizer.optimizer.state_dict(), moments
+                    )
+                    self.assertEqual(optimizer.scheduler.state_dict(), schedule)
+                    self.assertIsNone(model.weight.grad)
+                    self.assertTrue(all(p.grad is None for p in optimizer.fp32_params))
+
     def test_non_fsdp_keeps_fp32_master_clipping(self):
         model = torch.nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
         optimizer = BF16Optimizer(model, lr=1e-3, max_grad_norm=1.0)

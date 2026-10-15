@@ -101,6 +101,8 @@ def record_metrics(
         if hasattr(optimizer, "get_learning_rates"):
             for name, value in optimizer.get_learning_rates().items():
                 logdict[f"train/lr_{name}"] = value
+        if hasattr(optimizer, "get_grad_stats"):
+            components = {**components, **optimizer.get_grad_stats(reset=True)}
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy

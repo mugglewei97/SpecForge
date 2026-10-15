@@ -1,3 +1,4 @@
+import math
 import os
 
 import torch
@@ -72,6 +73,9 @@ class BF16Optimizer:
             self._has_markov_group = False
 
         self.last_grad_norm = None
+        self._grad_norm_sum = 0.0
+        self._grad_step_count = 0
+        self._grad_clip_count = 0
         self.scheduler = CosineAnnealingWarmupLR(
             self.optimizer,
             total_steps=total_steps,
@@ -95,6 +99,17 @@ class BF16Optimizer:
                 self.fp32_params, self.max_grad_norm
             )
         self.last_grad_norm = grad_norm.detach()
+        grad_norm_value = float(grad_norm)
+        if not math.isfinite(grad_norm_value):
+            # FSDP has already reduced the norm over all gradient shards, so
+            # every rank stops before Adam moments or the scheduler advance.
+            self.optimizer.zero_grad(set_to_none=True)
+            for p in self.model_params:
+                p.grad = None
+            raise FloatingPointError(
+                "refusing optimizer step with non-finite global grad norm "
+                f"{grad_norm_value} (max_grad_norm={self.max_grad_norm})"
+            )
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
@@ -102,6 +117,9 @@ class BF16Optimizer:
             for p, mp in zip(self.model_params, self.fp32_params):
                 p.data.copy_(mp.data.to(p.dtype))
                 p.grad = None
+        self._grad_norm_sum += grad_norm_value
+        self._grad_step_count += 1
+        self._grad_clip_count += int(grad_norm_value > self.max_grad_norm)
         return self.last_grad_norm
 
     def load_state_dict(self, state_dict):
@@ -133,6 +151,21 @@ class BF16Optimizer:
     def get_grad_norm(self):
         """Return the most recent pre-clipping gradient norm, if available."""
         return self.last_grad_norm
+
+    def get_grad_stats(self, *, reset=False):
+        """Pre-clip norms and clipping frequency since the last logging reset."""
+        if not self._grad_step_count:
+            return {}
+        stats = {
+            "grad_norm": float(self.last_grad_norm),
+            "grad_norm_mean": self._grad_norm_sum / self._grad_step_count,
+            "grad_clip_fraction": self._grad_clip_count / self._grad_step_count,
+        }
+        if reset:
+            self._grad_norm_sum = 0.0
+            self._grad_step_count = 0
+            self._grad_clip_count = 0
+        return stats
 
     def set_full_param_shapes(self, shapes):
         """Store the full (unsharded) parameter shapes captured *before*

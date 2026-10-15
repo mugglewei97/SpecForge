@@ -73,6 +73,7 @@ reference 仍相同，后续对应位置也继续复用。若第 `j` 个 proposa
 分叉后即使 token 再次相同，也不会恢复复用 reference 后缀。
 整轮所需前缀全部命中时，不发送额外验证请求；验证只需消费到最后
 一个有效 proposal 的前驱，无需再为最后一个 proposal 计算 bonus。
+同一验证批次的变长后缀 hidden 合并回填，避免逐 anchor 发起索引拷贝。
 
 全注意力 Qwen3 使用额外的后端优化：
 
@@ -101,6 +102,12 @@ beta 日志使用 `tv_acceptance_length_estimate`，区别于旧模式的
 `tv_mean_overlap`、`tv_valid_blocks`、`tv_mean_valid_length` 保留。
 `accuracy` 表示实际 proposal 前缀上 draft/target 的 argmax 一致率，
 不是实测接受率；position loss 仍为各位置 TV。
+
+默认 AdamW 路径还记录 `train/grad_norm`（最近一步裁剪前的全局范数）、
+`train/grad_norm_mean` 和 `train/grad_clip_fraction`（自上次日志以来所有
+optimizer steps 的平均范数与超过裁剪阈值的比例）。这些指标用于判断
+loss 尺度与裁剪阈值是否合适，不改变 loss。全局梯度范数出现 NaN/Inf
+时会终止更新，保留模型参数、Adam 状态和学习率调度进度，避免写入坏权重。
 
 beta checkpoint 保存 `tv_prefix_mode=sampled-beta-v1`。切换 loss
 类型、前缀语义或温度不能直接恢复 optimizer；使用

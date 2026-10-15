@@ -175,12 +175,20 @@ def verify_beta_proposals(
                 for b, _, _, first, length in group
             ],
         )
+        destinations, values = [], []
         for (block, _, _, first, length), value in zip(group, states, strict=True):
             if value.shape != teacher[block, first:length].shape:
                 raise ValueError(
                     "target verification returned misaligned final hidden states"
                 )
-            teacher[block, first:length] = value.to(teacher)
+            destinations.extend(range(block * width + first, block * width + length))
+            values.append(value)
+        # Copy all ragged suffix rows together instead of launching an indexed
+        # assignment (and possibly a dtype/device conversion) for every anchor.
+        indices = torch.tensor(destinations, device=teacher.device, dtype=torch.long)
+        teacher.view(-1, teacher.size(-1)).index_copy_(
+            0, indices, torch.cat(values, dim=0).to(teacher)
+        )
     return teacher
 
 

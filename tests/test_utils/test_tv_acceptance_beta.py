@@ -197,7 +197,8 @@ def test_sampled_eos_and_same_policy_replay():
     assert not rollout.log_probs.requires_grad
 
 
-def test_target_reuse_stops_after_first_divergence_even_if_tokens_match_again():
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_target_reuse_stops_after_first_divergence_even_if_tokens_match_again(batch_size):
     target = RecordingTarget(16)
     ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
     anchors = torch.tensor([[0, 1, 2]])
@@ -213,7 +214,7 @@ def test_target_reuse_stops_after_first_divergence_even_if_tokens_match_again():
     with ProposalVerificationSession(target) as session:
         original = session.capture(ids, torch.ones_like(ids), torch.ones_like(ids))
         verified = verify_beta_proposals(
-            session, ids, anchors, rollout, original.last_hidden_states, 4
+            session, ids, anchors, rollout, original.last_hidden_states, batch_size
         )
     # First block adds no candidate request. Only prefixes through d_(K-1)
     # are needed, so no candidate includes its final proposal/bonus position.
