@@ -128,6 +128,22 @@ def configure_objective(model, tokenizer, args):
         eos_ids = ()
     elif isinstance(eos_ids, int):
         eos_ids = (eos_ids,)
+    from .config import is_dflash2_config
+
+    if is_dflash2_config(model.draft_model.config):
+        if args.dspark_loss_type != "tv-acceptance-beta":
+            raise ValueError("DFlash2 requires tv-acceptance-beta in this entrypoint")
+        model.configure_beta(
+            temperature=args.tv_sampling_temperature,
+            chunk_blocks=args.tv_objective_chunk_blocks,
+            eos_token_ids=eos_ids,
+            verification_batch_size=args.tv_verification_batch_size,
+        )
+        print_on_rank0(
+            "DFlash2 TV beta: 8 native slots, 7 proposals; strict unary top-k "
+            "selector sampling/replay, full-vocabulary target normalization."
+        )
+        return
     configure_tv_acceptance(
         model,
         temperature=args.tv_sampling_temperature,

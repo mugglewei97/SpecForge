@@ -1,5 +1,15 @@
 """Resolve CLI overrides while retaining values stored in model checkpoints."""
 
+
+def is_dflash2_config(config) -> bool:
+    architectures = (
+        config.get("architectures")
+        if isinstance(config, dict)
+        else getattr(config, "architectures", None)
+    )
+    return architectures == ["DFlash2DraftModel"]
+
+
 # These options override the checkpoint only when explicitly supplied on CLI.
 HEAD_DEFAULTS = {
     "markov_head_type": "vanilla",

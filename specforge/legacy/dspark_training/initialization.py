@@ -1,9 +1,11 @@
-"""Weight-only initialization for DSpark post-training."""
+"""Weight-only initialization for DSpark and native DFlash2 post-training."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from .config import is_dflash2_config
 
 if TYPE_CHECKING:
     from specforge.legacy.dspark import DSparkDraftModel
@@ -37,6 +39,19 @@ def prepare_warm_start(args):
             "Post-training requires an output-dir different from the initialization checkpoint"
         )
     args.init_draft_model_path = str(source)
+    if getattr(args, "draft_config_path", None):
+        import json
+
+        requested_path = Path(args.draft_config_path).expanduser()
+        if requested_path.is_file():
+            requested = json.loads(requested_path.read_text())
+            checkpoint = json.loads((source / "config.json").read_text())
+            if is_dflash2_config(requested) != is_dflash2_config(checkpoint):
+                raise ValueError(
+                    "DFlash2 and DSpark checkpoints are not interchangeable; "
+                    "use a matching draft config and initialization checkpoint, "
+                    "or omit --init-draft-model-path to train from scratch"
+                )
     # Architecture and capture layers come from the learned drafter, including
     # when the launch command also supplies a generic scratch config.
     args.draft_config_path = str(source / "config.json")
@@ -60,9 +75,15 @@ def load_checkpoint_model(path, *, dtype=None):
 
     from specforge.legacy.dspark import DSparkDraftModel
 
-    model, info = DSparkDraftModel.from_pretrained(
+    config = load_draft_config(path)
+    model_class = DSparkDraftModel
+    if is_dflash2_config(config):
+        from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+
+        model_class = DFlash2DraftModel
+    model, info = model_class.from_pretrained(
         path,
-        config=load_draft_config(path),
+        config=config,
         torch_dtype=torch.bfloat16 if dtype is None else dtype,
         local_files_only=True,
         weights_only=True,
@@ -74,8 +95,9 @@ def load_checkpoint_model(path, *, dtype=None):
         if info.get(key)
     }
     if errors:
+        name = "DFlash2" if is_dflash2_config(config) else "DSpark"
         raise ValueError(
-            f"Incomplete or incompatible DSpark checkpoint {path}: {errors}"
+            f"Incomplete or incompatible {name} checkpoint {path}: {errors}"
         )
     return model
 
@@ -102,6 +124,11 @@ def initialize_draft_weights(draft_model, args):
     loaded_model = load_checkpoint_model(
         args.init_draft_model_path, dtype=next(draft_model.parameters()).dtype
     )
+    if is_dflash2_config(draft_model.config):
+        if not is_dflash2_config(loaded_model.config):
+            raise ValueError("DFlash2 initialization requires a DFlash2 checkpoint")
+        draft_model.load_state_dict(loaded_model.state_dict(), strict=True)
+        return
     _load_draft_state_allowing_selector_expansion(
         draft_model,
         loaded_model,

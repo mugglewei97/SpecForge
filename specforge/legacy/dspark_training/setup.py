@@ -23,7 +23,7 @@ from specforge.legacy.data_utils import (
 from specforge.legacy.dspark import DSparkDraftModel
 from specforge.utils import print_on_rank0
 
-from .config import _apply_dspark_config
+from .config import _apply_dspark_config, is_dflash2_config
 from .initialization import load_draft_config
 
 
@@ -102,8 +102,8 @@ def _apply_trainable_parameter_scope(
     return trainable, frozen
 
 
-def build_models(args, device) -> Tuple[DFlashTargetModel, DSparkDraftModel]:
-    """Build target model (backend wrapper) and DSpark draft model."""
+def build_models(args, device) -> Tuple[DFlashTargetModel, torch.nn.Module]:
+    """Build the target backend and the configured DSpark or DFlash2 draft."""
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using "
         f"{args.target_model_backend} backend"
@@ -155,6 +155,23 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, DSparkDraftModel]:
             f"active horizons={args.elastic_short_horizon},"
             f"{args.elastic_long_horizon}."
         )
+
+    if is_dflash2_config(draft_config):
+        from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+
+        from .dflash2 import prepare_dflash2_config
+
+        prepare_dflash2_config(draft_config, args)
+        draft_model = DFlash2DraftModel(draft_config).to(
+            device=device, dtype=torch.bfloat16
+        )
+        target_model.set_capture_layers(draft_model.target_layer_ids)
+        print_on_rank0(
+            f"DFlash2 TV beta: block_size={draft_model.block_size}, "
+            f"proposal_length=7, selector_top_k={draft_model.candidate_selector.top_k}, "
+            f"attention_backend={args.attention_backend}"
+        )
+        return target_model, draft_model
 
     _apply_dspark_config(draft_config, args)
     draft_config._attn_implementation = args.attention_backend

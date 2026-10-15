@@ -1,4 +1,4 @@
-"""Export legacy DSpark model and optimizer checkpoints."""
+"""Export DSpark or native DFlash2 model and optimizer checkpoints."""
 
 import json
 import os
@@ -12,9 +12,12 @@ from torch.distributed.fsdp import StateDictType
 from specforge.legacy.optimizer import save_fsdp_optimizer_state
 from specforge.utils import print_on_rank0
 
+from .config import is_dflash2_config
+
 
 def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
     """Save checkpoint."""
+    is_dflash2 = is_dflash2_config(getattr(draft_model, "config", {}))
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
@@ -50,11 +53,15 @@ def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
             # Append non-optimizer fields (epoch, step, args) to the
             # file that save_fsdp_optimizer_state already created.
             saved = torch.load(
-                training_state_path, map_location="cpu", weights_only=False
+                training_state_path, map_location="cpu", weights_only=is_dflash2
             )
             saved["epoch"] = epoch
             saved["global_step"] = step
-            saved["args"] = args
+            saved["args"] = vars(args) if is_dflash2 else args
+            if is_dflash2:
+                from .dflash2 import dflash2_beta_resume_contract
+
+                saved["dflash2_tv_beta"] = dflash2_beta_resume_contract(draft_model)
             torch.save(saved, training_state_path)
 
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
@@ -76,13 +83,18 @@ def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
             # resolve DSparkDraftModel (which subclasses DFlashDraftModel) on
             # reload with trust_remote_code.
             modeling_dir = os.path.join(os.path.dirname(__file__), "..")
-            for fname in (
-                "dspark.py",
-                "dflash.py",
-                "dflash2.py",
-                "neighbor_residual.py",
-                "light_conv_kernel.py",
-            ):
+            modeling_files = (
+                ()
+                if is_dflash2
+                else (
+                    "dspark.py",
+                    "dflash.py",
+                    "dflash2.py",
+                    "neighbor_residual.py",
+                    "light_conv_kernel.py",
+                )
+            )
+            for fname in modeling_files:
                 src = os.path.join(modeling_dir, fname)
                 if os.path.exists(src):
                     shutil.copy(src, os.path.join(save_dir, fname))

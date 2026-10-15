@@ -348,6 +348,7 @@ def load_fsdp_optimizer_state(
     path: str,
     *,
     restore_scheduler: bool = True,
+    weights_only: bool = False,
 ):
     """Load optimizer state from the rank-agnostic (full-param) format
     written by :func:`save_fsdp_optimizer_state`.
@@ -356,7 +357,7 @@ def load_fsdp_optimizer_state(
     the saved Adam state tensors are already in full-param shape — the
     same shape as the optimizer's fp32 clones.
     """
-    state = torch.load(path, map_location="cpu", weights_only=False)
+    state = torch.load(path, map_location="cpu", weights_only=weights_only)
     if not state.get("_fsdp_full_param_format"):
         raise RuntimeError(
             f"Checkpoint at {path} does not have the _fsdp_full_param_format "

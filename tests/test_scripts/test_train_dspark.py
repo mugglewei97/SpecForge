@@ -300,7 +300,16 @@ def test_mask_token_preserves_checkpoint_unless_explicitly_overridden(
         resolve_mask_token_id(args, model, SimpleNamespace(mask_token_id=9))
 
 
-def test_example_forwards_post_training_options_without_starting_training(tmp_path):
+@pytest.mark.parametrize(
+    "recipe,block_size",
+    [
+        ("run_qwen3_8b_dspark_tv_acceptance.sh", 7),
+        ("run_qwen3_8b_dflash2_tv_acceptance_beta.sh", 8),
+    ],
+)
+def test_example_forwards_post_training_options_without_starting_training(
+    tmp_path, recipe, block_size
+):
     root = Path(__file__).resolve().parents[2]
     # Replace the executable for this subprocess only; capture argv without GPUs.
     executable = tmp_path / "torchrun"
@@ -309,7 +318,7 @@ def test_example_forwards_post_training_options_without_starting_training(tmp_pa
     result = subprocess.run(
         [
             "bash",
-            "examples/run_qwen3_8b_dspark_tv_acceptance.sh",
+            f"examples/{recipe}",
             "8",
             "sdpa",
             "hf",
@@ -329,3 +338,7 @@ def test_example_forwards_post_training_options_without_starting_training(tmp_pa
     assert args.init_draft_model_path == "/checkpoint with spaces"
     assert args.num_epochs == 1
     assert args.attention_backend == "sdpa"
+    assert args.block_size == block_size
+    if block_size == 8:
+        assert args.dspark_loss_type == "tv-acceptance-beta"
+        assert args.draft_config_path.endswith("qwen3-8b-dflash2.json")

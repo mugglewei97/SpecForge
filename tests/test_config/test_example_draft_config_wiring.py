@@ -73,7 +73,7 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
                         architecture,
                     )
 
-    def test_only_future_vlm_draft_configs_lack_a_unified_recipe(self):
+    def test_configs_without_unified_recipes_are_explicitly_accounted_for(self):
         referenced = {
             draft_config.resolve()
             for _, _, draft_config in _local_draft_configs()
@@ -86,6 +86,9 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
             {
                 "qwen2-5-vl-7b-eagle3.json",
                 "qwen2.5-vl-32b-eagle3.json",
+                # Standalone train_dspark.py beta recipe: the unified runtime
+                # does not yet supply sampled-proposal verification sessions.
+                "qwen3-8b-dflash2.json",
             },
         )
 

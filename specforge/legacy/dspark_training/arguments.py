@@ -38,7 +38,7 @@ def _comma_separated_strings(value: str) -> Tuple[str, ...]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train DSpark Draft Model")
+    parser = argparse.ArgumentParser(description="Train DSpark or native DFlash2 (TV beta)")
 
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)

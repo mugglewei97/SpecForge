@@ -63,8 +63,10 @@ from specforge.tracker import create_tracker
 from specforge.utils import get_local_device, print_on_rank0, print_with_rank
 
 from .checkpoint import save_checkpoint
+from .config import is_dflash2_config
 from .initialization import (
     initialize_draft_weights,
+    load_checkpoint_model,
     prepare_warm_start,
     resolve_mask_token_id,
 )
@@ -300,13 +302,17 @@ def run_training(args):
         )
 
     target_model, draft_model = build_models(args, device)
+    is_dflash2 = is_dflash2_config(draft_model.config)
     validate_predictive_auxiliary(args, draft_model)
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DSparkDraftModel.from_pretrained(
-            draft_model_last_checkpoint, torch_dtype=torch.bfloat16
-        )
+        if is_dflash2:
+            loaded_model = load_checkpoint_model(draft_model_last_checkpoint)
+        else:
+            loaded_model = DSparkDraftModel.from_pretrained(
+                draft_model_last_checkpoint, torch_dtype=torch.bfloat16
+            )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
         print("Loaded draft model weights from checkpoint")
@@ -316,7 +322,7 @@ def run_training(args):
         )
         if os.path.exists(training_state_path):
             resume_state = torch.load(
-                training_state_path, map_location="cpu", weights_only=False
+                training_state_path, map_location="cpu", weights_only=is_dflash2
             )
             validate_optimizer_resume(resume_state, args.optimizer)
             validate_predictive_resume(resume_state.get("args", {}), args)
@@ -527,323 +533,334 @@ def run_training(args):
             f"Training-only predictive auxiliaries: {draft_model.config.predictive_auxiliary}"
         )
 
-    dspark_model = OnlineDSparkModel(
-        draft_model=draft_model,
-        target_lm_head=target_components.lm_head,
-        target_embed_tokens=target_components.embed_tokens,
-        conv_source_semantic_alpha=args.conv_source_semantic_alpha,
-        carh_reference_calibration_alpha=args.carh_reference_calibration_alpha,
-        predictive_aux_warmup_ratio=args.predictive_aux_warmup_ratio,
-        predictive_aux_ramp_ratio=args.predictive_aux_ramp_ratio,
-        source_semantic_codebook=semantic_codebook,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
-        attention_backend=args.attention_backend,
-        num_anchors=args.num_anchors,
-        loss_decay_gamma=args.loss_decay_gamma,
-        ce_loss_alpha=args.ce_loss_alpha,
-        l1_loss_alpha=args.l1_loss_alpha,
-        bv_loss_alpha=args.bv_loss_alpha,
-        bv_temperature=args.bv_temperature,
-        bv_anneal_ratio=args.bv_anneal_ratio,
-        bv_block_chunk_size=args.bv_block_chunk_size,
-        offline_acceptance_objective=args.offline_acceptance_objective,
-        offline_acceptance_greedy_weight=(args.offline_acceptance_greedy_weight),
-        offline_acceptance_stochastic_weight=(
-            args.offline_acceptance_stochastic_weight
-        ),
-        offline_acceptance_temperature=args.offline_acceptance_temperature,
-        offline_acceptance_lk_eta=args.offline_acceptance_lk_eta,
-        offline_acceptance_dpace_rho=args.offline_acceptance_dpace_rho,
-        offline_acceptance_cold_start_ratio=(args.offline_acceptance_cold_start_ratio),
-        offline_acceptance_transition_ratio=(args.offline_acceptance_transition_ratio),
-        confidence_head_alpha=args.confidence_head_alpha,
-        confidence_target_mode=args.confidence_target_mode,
-        confidence_detach_backbone=args.confidence_detach_backbone,
-        carh_predecessor_diagnostics_interval=args.carh_predecessor_diagnostics_interval,
-        carh_sampled_prefix_memory_start_ratio=(
-            args.carh_sampled_prefix_memory_start_ratio
-        ),
-        carh_sampled_prefix_memory_ramp_ratio=(
-            args.carh_sampled_prefix_memory_ramp_ratio
-        ),
-        recall_correction_alpha=args.recall_correction_alpha,
-        recall_partition_top_k=args.recall_partition_top_k,
-        recall_correction_loss_budget=args.recall_correction_loss_budget,
-        pace_mode=args.pace_mode,
-        pace_alpha=args.pace_alpha,
-        pace_hybrid_beta=args.pace_hybrid_beta,
-        pace_apply_to=args.pace_apply_to,
-        pace_blend_max=args.pace_blend_max,
-        pace_warmup_ratio=args.pace_warmup_ratio,
-        pace_ramp_ratio=args.pace_ramp_ratio,
-        pace_decay_start_ratio=args.pace_decay_start_ratio,
-        pace_blend_final=args.pace_blend_final,
-        pace_residual_beta=args.pace_residual_beta,
-        pace_residual_min=args.pace_residual_min,
-        pace_residual_max=args.pace_residual_max,
-        prefix_credit_mode=args.prefix_credit_mode,
-        prefix_credit_alpha=args.prefix_credit_alpha,
-        prefix_credit_warmup_ratio=args.prefix_credit_warmup_ratio,
-        prefix_credit_ramp_ratio=args.prefix_credit_ramp_ratio,
-        prefix_credit_backbone_grad_scale=(args.prefix_credit_backbone_grad_scale),
-        shallow_frc_alpha=args.shallow_frc_alpha,
-        shallow_frc_max_depth=args.shallow_frc_max_depth,
-        shallow_frc_margin=args.shallow_frc_margin,
-        shallow_frc_temperature=args.shallow_frc_temperature,
-        dfap_alpha=args.dfap_alpha,
-        dfap_min_depth=args.dfap_min_depth,
-        dfap_margin=args.dfap_margin,
-        dfap_temperature=args.dfap_temperature,
-        state_credit_partition=args.state_credit_partition,
-        conv_gate_loss_alpha=args.conv_gate_loss_alpha,
-        block_summary_counterfactual_alpha=args.block_summary_counterfactual_alpha,
-        transition_credit_alpha=args.transition_credit_alpha,
-        transition_credit_max_depth=args.transition_credit_max_depth,
-        transition_credit_margin=args.transition_credit_margin,
-        transition_credit_temperature=args.transition_credit_temperature,
-        transition_credit_loss_budget=args.transition_credit_loss_budget,
-        transition2_margin_alpha=args.transition2_margin_alpha,
-        transition2_margin_floor=args.transition2_margin_floor,
-        transition2_margin_temperature=args.transition2_margin_temperature,
-        transition2_margin_loss_budget=args.transition2_margin_loss_budget,
-        prefix_bottleneck_alpha=args.prefix_bottleneck_alpha,
-        prefix_bottleneck_max_depth=args.prefix_bottleneck_max_depth,
-        prefix_bottleneck_margin_floor=args.prefix_bottleneck_margin_floor,
-        prefix_bottleneck_softmin_temperature=(
-            args.prefix_bottleneck_softmin_temperature
-        ),
-        prefix_bottleneck_loss_temperature=(args.prefix_bottleneck_loss_temperature),
-        prefix_bottleneck_loss_budget=args.prefix_bottleneck_loss_budget,
-        deep_survival_guard_alpha=args.deep_survival_guard_alpha,
-        deep_survival_guard_min_prefix=args.deep_survival_guard_min_prefix,
-        deep_survival_guard_start_depth=args.deep_survival_guard_start_depth,
-        deep_survival_guard_margin_floor=(args.deep_survival_guard_margin_floor),
-        deep_survival_guard_temperature=args.deep_survival_guard_temperature,
-        deep_survival_guard_loss_budget=(args.deep_survival_guard_loss_budget),
-        carh_recoverability_top_k=args.carh_recoverability_top_k,
-        carh_recovery_loss_alpha=args.carh_recovery_loss_alpha,
-        carh_preservation_loss_alpha=args.carh_preservation_loss_alpha,
-        carh_noop_loss_alpha=args.carh_noop_loss_alpha,
-        carh_preservation_margin=args.carh_preservation_margin,
-        carh_preservation_temperature=args.carh_preservation_temperature,
-        carh_recoverability_loss_budget=(args.carh_recoverability_loss_budget),
-        carh_gate_calibration_alpha=args.carh_gate_calibration_alpha,
-        carh_gate_noop_alpha=args.carh_gate_noop_alpha,
-        carh_gate_margin_threshold=args.carh_gate_margin_threshold,
-        carh_gate_calibration_warmup_ratio=(args.carh_gate_calibration_warmup_ratio),
-        selector_loss_alpha=args.selector_loss_alpha,
-        selector_rollout_ratio=args.selector_rollout_ratio,
-        selector_training_mode=args.selector_training_mode,
-        selector_distill_alpha=args.selector_distill_alpha,
-        selector_preservation_alpha=args.selector_preservation_alpha,
-        selector_distill_temperature=args.selector_distill_temperature,
-        selector_advantage_margin=args.selector_advantage_margin,
-        selector_teacher_warmup_ratio=args.selector_teacher_warmup_ratio,
-        selector_distill_start_ratio=args.selector_distill_start_ratio,
-        selector_consolidation_ratio=args.selector_consolidation_ratio,
-        selector_loss_budget=args.selector_loss_budget,
-        selector_margin_threshold=float(draft_model.selector_margin_threshold),
-        selector_tree_loss_alpha=args.selector_tree_loss_alpha,
-        selector_tree_branch_width=args.selector_tree_branch_width,
-        selector_tree_margin=args.selector_tree_margin,
-        selector_tree_temperature=args.selector_tree_temperature,
-        on_policy_survival_alpha=args.on_policy_survival_alpha,
-        on_policy_full_alpha=args.on_policy_full_alpha,
-        on_policy_first_rejection_max_depth=(args.on_policy_first_rejection_max_depth),
-        on_policy_boundary_max_depth=args.on_policy_boundary_max_depth,
-        on_policy_deep_alpha=args.on_policy_deep_alpha,
-        on_policy_deep_start_depth=args.on_policy_deep_start_depth,
-        on_policy_margin_floor=args.on_policy_margin_floor,
-        on_policy_temperature=args.on_policy_temperature,
-        on_policy_rollout_temperatures=args.on_policy_rollout_temperatures,
-        on_policy_rollout_temperature_probs=(args.on_policy_rollout_temperature_probs),
-        on_policy_anchor_sampling=args.on_policy_anchor_sampling,
-        on_policy_hazard_power=args.on_policy_hazard_power,
-        on_policy_flatness_power_max=args.on_policy_flatness_power_max,
-        on_policy_flatness_warmup_ratio=(args.on_policy_flatness_warmup_ratio),
-        on_policy_uniform_exploration=args.on_policy_uniform_exploration,
-        dialogue_phase_masses=args.dialogue_phase_masses,
-        dialogue_boundary_boost=args.dialogue_boundary_boost,
-        dialogue_script_transition_boost=(args.dialogue_script_transition_boost),
-        dialogue_occupancy_diagnostics=args.dialogue_occupancy_diagnostics,
-        dialogue_num_sources=1 + len(args.additional_train_data_path),
-        dialogue_token_class_lookup=dialogue_token_class_lookup,
-        dialogue_prefix_phase_weighting=(args.dialogue_prefix_phase_weighting),
-        dialogue_t2cm_boundary_weighting=(args.dialogue_t2cm_boundary_weighting),
-        dialogue_dsg_adaptive_margin=args.dialogue_dsg_adaptive_margin,
-        dialogue_dsg_late_margin_bonus=(args.dialogue_dsg_late_margin_bonus),
-        dialogue_dsg_boundary_margin_bonus=(args.dialogue_dsg_boundary_margin_bonus),
-        on_policy_distributional_top_k=args.on_policy_distributional_top_k,
-        on_policy_distributional_min_top_k=(args.on_policy_distributional_min_top_k),
-        on_policy_distributional_mass_threshold=(
-            args.on_policy_distributional_mass_threshold
-        ),
-        on_policy_distributional_alpha=args.on_policy_distributional_alpha,
-        on_policy_distributional_deep_alpha=(args.on_policy_distributional_deep_alpha),
-        on_policy_distributional_cold_start_ratio=(
-            args.on_policy_distributional_cold_start_ratio
-        ),
-        on_policy_rejection_aligned_alpha=(args.on_policy_rejection_aligned_alpha),
-        on_policy_rejection_aligned_survival_blend=(
-            args.on_policy_rejection_aligned_survival_blend
-        ),
-        on_policy_temperature_exclusive_routing=(
-            args.on_policy_temperature_exclusive_routing
-        ),
-        on_policy_mixed_kl_alpha=args.on_policy_mixed_kl_alpha,
-        on_policy_mixed_kl_accepted_weight=(args.on_policy_mixed_kl_accepted_weight),
-        on_policy_mixed_kl_rejected_weight=(args.on_policy_mixed_kl_rejected_weight),
-        on_policy_mixed_kl_rejection_decay=(args.on_policy_mixed_kl_rejection_decay),
-        on_policy_clipped_rkl_alpha=args.on_policy_clipped_rkl_alpha,
-        on_policy_clipped_rkl_clip=args.on_policy_clipped_rkl_clip,
-        on_policy_clipped_rkl_temperature_weights=(
-            args.on_policy_clipped_rkl_temperature_weights
-        ),
-        on_policy_target_distribution_temperature_floor=(
-            args.on_policy_target_distribution_temperature_floor
-        ),
-        on_policy_target_margin_alpha=args.on_policy_target_margin_alpha,
-        on_policy_target_margin_scale=args.on_policy_target_margin_scale,
-        on_policy_target_margin_offset=args.on_policy_target_margin_offset,
-        on_policy_target_margin_min=args.on_policy_target_margin_min,
-        on_policy_target_margin_max=args.on_policy_target_margin_max,
-        on_policy_target_margin_max_depth=(args.on_policy_target_margin_max_depth),
-        on_policy_deployment_top_k=args.on_policy_deployment_top_k,
-        on_policy_deployment_top_p=args.on_policy_deployment_top_p,
-        on_policy_credit_partition=args.on_policy_credit_partition,
-        on_policy_middle_max_depth=args.on_policy_middle_max_depth,
-        on_policy_middle_alpha=args.on_policy_middle_alpha,
-        on_policy_temperature_hazard_credit=(args.on_policy_temperature_hazard_credit),
-        on_policy_hazard_ema_decay=args.on_policy_hazard_ema_decay,
-        on_policy_hazard_weight_min=args.on_policy_hazard_weight_min,
-        on_policy_hazard_weight_max=args.on_policy_hazard_weight_max,
-        on_policy_marginal_value_credit=(args.on_policy_marginal_value_credit),
-        on_policy_marginal_value_temperature=(
-            args.on_policy_marginal_value_temperature
-        ),
-        on_policy_marginal_value_weight_min=(args.on_policy_marginal_value_weight_min),
-        on_policy_marginal_value_weight_max=(args.on_policy_marginal_value_weight_max),
-        on_policy_language_hazard_credit=(args.on_policy_language_hazard_credit),
-        on_policy_language_han_threshold=(args.on_policy_language_han_threshold),
-        on_policy_language_hazard_ema_decay=(args.on_policy_language_hazard_ema_decay),
-        on_policy_language_hazard_weight_min=(
-            args.on_policy_language_hazard_weight_min
-        ),
-        on_policy_language_hazard_weight_max=(
-            args.on_policy_language_hazard_weight_max
-        ),
-        on_policy_mix_ratio_max=args.on_policy_mix_ratio_max,
-        on_policy_start_step=args.on_policy_start_step,
-        on_policy_ramp_steps=args.on_policy_ramp_steps,
-        on_policy_repair_value=args.on_policy_repair_value,
-        on_policy_repair_value_horizon=args.on_policy_repair_value_horizon,
-        on_policy_interval=args.on_policy_interval,
-        on_policy_loss_budget=args.on_policy_loss_budget,
-        on_policy_preservation_alpha=args.on_policy_preservation_alpha,
-        on_policy_regression_alpha=args.on_policy_regression_alpha,
-        on_policy_regression_margin=args.on_policy_regression_margin,
-        on_policy_greedy_preservation_alpha=(args.on_policy_greedy_preservation_alpha),
-        on_policy_greedy_preservation_margin_floor=(
-            args.on_policy_greedy_preservation_margin_floor
-        ),
-        on_policy_greedy_preservation_temperature=(
-            args.on_policy_greedy_preservation_temperature
-        ),
-        on_policy_reset_replay_alpha=args.on_policy_reset_replay_alpha,
-        on_policy_reset_replay_horizon=args.on_policy_reset_replay_horizon,
-        on_policy_reset_replay_max_rejection_depth=(
-            args.on_policy_reset_replay_max_rejection_depth
-        ),
-        on_policy_reset_replay_start_ratio=(args.on_policy_reset_replay_start_ratio),
-        on_policy_reset_replay_ramp_ratio=(args.on_policy_reset_replay_ramp_ratio),
-        on_policy_reset_replay_loss_budget=(args.on_policy_reset_replay_loss_budget),
-        on_policy_reset_replay_advantage_threshold=(
-            args.on_policy_reset_replay_advantage_threshold
-        ),
-        on_policy_reset_replay_value_clip=(args.on_policy_reset_replay_value_clip),
-        on_policy_preference_alpha=args.on_policy_preference_alpha,
-        on_policy_preference_value_gap=args.on_policy_preference_value_gap,
-        on_policy_preference_temperature=args.on_policy_preference_temperature,
-        on_policy_preference_loss_budget=args.on_policy_preference_loss_budget,
-        on_policy_pareto_credit=args.on_policy_pareto_credit,
-        on_policy_pareto_ema_decay=args.on_policy_pareto_ema_decay,
-        on_policy_pareto_temperature=args.on_policy_pareto_temperature,
-        on_policy_pareto_weight_min=args.on_policy_pareto_weight_min,
-        on_policy_pareto_weight_max=args.on_policy_pareto_weight_max,
-        parallel_refiner_hazard_alpha=args.parallel_refiner_hazard_alpha,
-        parallel_refiner_recovery_alpha=args.parallel_refiner_recovery_alpha,
-        parallel_refiner_preservation_alpha=(args.parallel_refiner_preservation_alpha),
-        parallel_refiner_margin_floor=args.parallel_refiner_margin_floor,
-        parallel_refiner_temperature=args.parallel_refiner_temperature,
-        parallel_refiner_loss_budget=args.parallel_refiner_loss_budget,
-        refiner_advantage_mode=args.refiner_advantage_mode,
-        refiner_advantage_threshold=args.refiner_advantage_threshold,
-        refiner_advantage_gate_alpha=args.refiner_advantage_gate_alpha,
-        refiner_advantage_regression_alpha=(args.refiner_advantage_regression_alpha),
-        refiner_advantage_distill_alpha=args.refiner_advantage_distill_alpha,
-        refiner_advantage_preservation_alpha=(
-            args.refiner_advantage_preservation_alpha
-        ),
-        refiner_advantage_greedy_preservation_alpha=(
-            args.refiner_advantage_greedy_preservation_alpha
-        ),
-        refiner_advantage_greedy_margin_floor=(
-            args.refiner_advantage_greedy_margin_floor
-        ),
-        refiner_advantage_gate_distill_min_probability=(
-            args.refiner_advantage_gate_distill_min_probability
-        ),
-        refiner_advantage_distill_top_k=(args.refiner_advantage_distill_top_k),
-        refiner_advantage_distill_temperature=(
-            args.refiner_advantage_distill_temperature
-        ),
-        refiner_advantage_value_clip=args.refiner_advantage_value_clip,
-        refiner_advantage_distill_start_ratio=(
-            args.refiner_advantage_distill_start_ratio
-        ),
-        refiner_advantage_consolidation_ratio=(
-            args.refiner_advantage_consolidation_ratio
-        ),
-        refiner_advantage_loss_budget=args.refiner_advantage_loss_budget,
-        vat_enabled=args.vat_enabled,
-        vat_hard_loss_alpha=args.vat_hard_loss_alpha,
-        vat_soft_loss_alpha=args.vat_soft_loss_alpha,
-        vat_verification_head_alpha=args.vat_verification_head_alpha,
-        vat_post_rejection_decay_gamma=(args.vat_post_rejection_decay_gamma),
-        vat_simulation_temperature=args.vat_simulation_temperature,
-        branch_value_mode=args.branch_value_mode,
-        branch_value_top_m=args.branch_value_top_m,
-        branch_value_horizon=args.branch_value_horizon,
-        branch_value_alpha=args.branch_value_alpha,
-        branch_value_temperature=args.branch_value_temperature,
-        branch_value_loss_budget=args.branch_value_loss_budget,
-        branch_value_warmup_ratio=args.branch_value_warmup_ratio,
-        branch_value_consolidation_ratio=(args.branch_value_consolidation_ratio),
-        elastic_horizon_enabled=args.elastic_horizon_enabled,
-        elastic_short_horizon=args.elastic_short_horizon,
-        elastic_long_horizon=args.elastic_long_horizon,
-        elastic_warmup_ratio=args.elastic_warmup_ratio,
-        elastic_late_ratio=args.elastic_late_ratio,
-        elastic_consolidation_ratio=args.elastic_consolidation_ratio,
-        elastic_middle_long_prob=args.elastic_middle_long_prob,
-        elastic_late_long_prob=args.elastic_late_long_prob,
-        elastic_pair_probability=args.elastic_pair_probability,
-        elastic_projective_num_anchors=args.elastic_projective_num_anchors,
-        elastic_projective_alpha=args.elastic_projective_alpha,
-        elastic_projective_top_k=args.elastic_projective_top_k,
-        elastic_overlap_gap=args.elastic_overlap_gap,
-        elastic_margin_gap=args.elastic_margin_gap,
-        elastic_loss_budget=args.elastic_loss_budget,
-    )
-    dspark_model.configure_multi_teacher_oracle(
-        mode=args.multi_teacher_oracle_mode,
-        alpha=args.multi_teacher_oracle_alpha,
-        advantage_threshold=args.multi_teacher_oracle_advantage_threshold,
-        value_clip=args.multi_teacher_oracle_value_clip,
-        loss_budget=args.multi_teacher_oracle_loss_budget,
-    )
+    if is_dflash2:
+        from .dflash2 import build_dflash2_training_model
+
+        dspark_model = build_dflash2_training_model(
+            args, draft_model, target_components, mask_token_id
+        )
+    else:
+        dspark_model = OnlineDSparkModel(
+            draft_model=draft_model,
+            target_lm_head=target_components.lm_head,
+            target_embed_tokens=target_components.embed_tokens,
+            conv_source_semantic_alpha=args.conv_source_semantic_alpha,
+            carh_reference_calibration_alpha=args.carh_reference_calibration_alpha,
+            predictive_aux_warmup_ratio=args.predictive_aux_warmup_ratio,
+            predictive_aux_ramp_ratio=args.predictive_aux_ramp_ratio,
+            source_semantic_codebook=semantic_codebook,
+            block_size=draft_model.block_size,
+            mask_token_id=mask_token_id,
+            attention_backend=args.attention_backend,
+            num_anchors=args.num_anchors,
+            loss_decay_gamma=args.loss_decay_gamma,
+            ce_loss_alpha=args.ce_loss_alpha,
+            l1_loss_alpha=args.l1_loss_alpha,
+            bv_loss_alpha=args.bv_loss_alpha,
+            bv_temperature=args.bv_temperature,
+            bv_anneal_ratio=args.bv_anneal_ratio,
+            bv_block_chunk_size=args.bv_block_chunk_size,
+            offline_acceptance_objective=args.offline_acceptance_objective,
+            offline_acceptance_greedy_weight=(args.offline_acceptance_greedy_weight),
+            offline_acceptance_stochastic_weight=(
+                args.offline_acceptance_stochastic_weight
+            ),
+            offline_acceptance_temperature=args.offline_acceptance_temperature,
+            offline_acceptance_lk_eta=args.offline_acceptance_lk_eta,
+            offline_acceptance_dpace_rho=args.offline_acceptance_dpace_rho,
+            offline_acceptance_cold_start_ratio=(args.offline_acceptance_cold_start_ratio),
+            offline_acceptance_transition_ratio=(args.offline_acceptance_transition_ratio),
+            confidence_head_alpha=args.confidence_head_alpha,
+            confidence_target_mode=args.confidence_target_mode,
+            confidence_detach_backbone=args.confidence_detach_backbone,
+            carh_predecessor_diagnostics_interval=args.carh_predecessor_diagnostics_interval,
+            carh_sampled_prefix_memory_start_ratio=(
+                args.carh_sampled_prefix_memory_start_ratio
+            ),
+            carh_sampled_prefix_memory_ramp_ratio=(
+                args.carh_sampled_prefix_memory_ramp_ratio
+            ),
+            recall_correction_alpha=args.recall_correction_alpha,
+            recall_partition_top_k=args.recall_partition_top_k,
+            recall_correction_loss_budget=args.recall_correction_loss_budget,
+            pace_mode=args.pace_mode,
+            pace_alpha=args.pace_alpha,
+            pace_hybrid_beta=args.pace_hybrid_beta,
+            pace_apply_to=args.pace_apply_to,
+            pace_blend_max=args.pace_blend_max,
+            pace_warmup_ratio=args.pace_warmup_ratio,
+            pace_ramp_ratio=args.pace_ramp_ratio,
+            pace_decay_start_ratio=args.pace_decay_start_ratio,
+            pace_blend_final=args.pace_blend_final,
+            pace_residual_beta=args.pace_residual_beta,
+            pace_residual_min=args.pace_residual_min,
+            pace_residual_max=args.pace_residual_max,
+            prefix_credit_mode=args.prefix_credit_mode,
+            prefix_credit_alpha=args.prefix_credit_alpha,
+            prefix_credit_warmup_ratio=args.prefix_credit_warmup_ratio,
+            prefix_credit_ramp_ratio=args.prefix_credit_ramp_ratio,
+            prefix_credit_backbone_grad_scale=(args.prefix_credit_backbone_grad_scale),
+            shallow_frc_alpha=args.shallow_frc_alpha,
+            shallow_frc_max_depth=args.shallow_frc_max_depth,
+            shallow_frc_margin=args.shallow_frc_margin,
+            shallow_frc_temperature=args.shallow_frc_temperature,
+            dfap_alpha=args.dfap_alpha,
+            dfap_min_depth=args.dfap_min_depth,
+            dfap_margin=args.dfap_margin,
+            dfap_temperature=args.dfap_temperature,
+            state_credit_partition=args.state_credit_partition,
+            conv_gate_loss_alpha=args.conv_gate_loss_alpha,
+            block_summary_counterfactual_alpha=args.block_summary_counterfactual_alpha,
+            transition_credit_alpha=args.transition_credit_alpha,
+            transition_credit_max_depth=args.transition_credit_max_depth,
+            transition_credit_margin=args.transition_credit_margin,
+            transition_credit_temperature=args.transition_credit_temperature,
+            transition_credit_loss_budget=args.transition_credit_loss_budget,
+            transition2_margin_alpha=args.transition2_margin_alpha,
+            transition2_margin_floor=args.transition2_margin_floor,
+            transition2_margin_temperature=args.transition2_margin_temperature,
+            transition2_margin_loss_budget=args.transition2_margin_loss_budget,
+            prefix_bottleneck_alpha=args.prefix_bottleneck_alpha,
+            prefix_bottleneck_max_depth=args.prefix_bottleneck_max_depth,
+            prefix_bottleneck_margin_floor=args.prefix_bottleneck_margin_floor,
+            prefix_bottleneck_softmin_temperature=(
+                args.prefix_bottleneck_softmin_temperature
+            ),
+            prefix_bottleneck_loss_temperature=(args.prefix_bottleneck_loss_temperature),
+            prefix_bottleneck_loss_budget=args.prefix_bottleneck_loss_budget,
+            deep_survival_guard_alpha=args.deep_survival_guard_alpha,
+            deep_survival_guard_min_prefix=args.deep_survival_guard_min_prefix,
+            deep_survival_guard_start_depth=args.deep_survival_guard_start_depth,
+            deep_survival_guard_margin_floor=(args.deep_survival_guard_margin_floor),
+            deep_survival_guard_temperature=args.deep_survival_guard_temperature,
+            deep_survival_guard_loss_budget=(args.deep_survival_guard_loss_budget),
+            carh_recoverability_top_k=args.carh_recoverability_top_k,
+            carh_recovery_loss_alpha=args.carh_recovery_loss_alpha,
+            carh_preservation_loss_alpha=args.carh_preservation_loss_alpha,
+            carh_noop_loss_alpha=args.carh_noop_loss_alpha,
+            carh_preservation_margin=args.carh_preservation_margin,
+            carh_preservation_temperature=args.carh_preservation_temperature,
+            carh_recoverability_loss_budget=(args.carh_recoverability_loss_budget),
+            carh_gate_calibration_alpha=args.carh_gate_calibration_alpha,
+            carh_gate_noop_alpha=args.carh_gate_noop_alpha,
+            carh_gate_margin_threshold=args.carh_gate_margin_threshold,
+            carh_gate_calibration_warmup_ratio=(args.carh_gate_calibration_warmup_ratio),
+            selector_loss_alpha=args.selector_loss_alpha,
+            selector_rollout_ratio=args.selector_rollout_ratio,
+            selector_training_mode=args.selector_training_mode,
+            selector_distill_alpha=args.selector_distill_alpha,
+            selector_preservation_alpha=args.selector_preservation_alpha,
+            selector_distill_temperature=args.selector_distill_temperature,
+            selector_advantage_margin=args.selector_advantage_margin,
+            selector_teacher_warmup_ratio=args.selector_teacher_warmup_ratio,
+            selector_distill_start_ratio=args.selector_distill_start_ratio,
+            selector_consolidation_ratio=args.selector_consolidation_ratio,
+            selector_loss_budget=args.selector_loss_budget,
+            selector_margin_threshold=float(draft_model.selector_margin_threshold),
+            selector_tree_loss_alpha=args.selector_tree_loss_alpha,
+            selector_tree_branch_width=args.selector_tree_branch_width,
+            selector_tree_margin=args.selector_tree_margin,
+            selector_tree_temperature=args.selector_tree_temperature,
+            on_policy_survival_alpha=args.on_policy_survival_alpha,
+            on_policy_full_alpha=args.on_policy_full_alpha,
+            on_policy_first_rejection_max_depth=(args.on_policy_first_rejection_max_depth),
+            on_policy_boundary_max_depth=args.on_policy_boundary_max_depth,
+            on_policy_deep_alpha=args.on_policy_deep_alpha,
+            on_policy_deep_start_depth=args.on_policy_deep_start_depth,
+            on_policy_margin_floor=args.on_policy_margin_floor,
+            on_policy_temperature=args.on_policy_temperature,
+            on_policy_rollout_temperatures=args.on_policy_rollout_temperatures,
+            on_policy_rollout_temperature_probs=(args.on_policy_rollout_temperature_probs),
+            on_policy_anchor_sampling=args.on_policy_anchor_sampling,
+            on_policy_hazard_power=args.on_policy_hazard_power,
+            on_policy_flatness_power_max=args.on_policy_flatness_power_max,
+            on_policy_flatness_warmup_ratio=(args.on_policy_flatness_warmup_ratio),
+            on_policy_uniform_exploration=args.on_policy_uniform_exploration,
+            dialogue_phase_masses=args.dialogue_phase_masses,
+            dialogue_boundary_boost=args.dialogue_boundary_boost,
+            dialogue_script_transition_boost=(args.dialogue_script_transition_boost),
+            dialogue_occupancy_diagnostics=args.dialogue_occupancy_diagnostics,
+            dialogue_num_sources=1 + len(args.additional_train_data_path),
+            dialogue_token_class_lookup=dialogue_token_class_lookup,
+            dialogue_prefix_phase_weighting=(args.dialogue_prefix_phase_weighting),
+            dialogue_t2cm_boundary_weighting=(args.dialogue_t2cm_boundary_weighting),
+            dialogue_dsg_adaptive_margin=args.dialogue_dsg_adaptive_margin,
+            dialogue_dsg_late_margin_bonus=(args.dialogue_dsg_late_margin_bonus),
+            dialogue_dsg_boundary_margin_bonus=(args.dialogue_dsg_boundary_margin_bonus),
+            on_policy_distributional_top_k=args.on_policy_distributional_top_k,
+            on_policy_distributional_min_top_k=(args.on_policy_distributional_min_top_k),
+            on_policy_distributional_mass_threshold=(
+                args.on_policy_distributional_mass_threshold
+            ),
+            on_policy_distributional_alpha=args.on_policy_distributional_alpha,
+            on_policy_distributional_deep_alpha=(args.on_policy_distributional_deep_alpha),
+            on_policy_distributional_cold_start_ratio=(
+                args.on_policy_distributional_cold_start_ratio
+            ),
+            on_policy_rejection_aligned_alpha=(args.on_policy_rejection_aligned_alpha),
+            on_policy_rejection_aligned_survival_blend=(
+                args.on_policy_rejection_aligned_survival_blend
+            ),
+            on_policy_temperature_exclusive_routing=(
+                args.on_policy_temperature_exclusive_routing
+            ),
+            on_policy_mixed_kl_alpha=args.on_policy_mixed_kl_alpha,
+            on_policy_mixed_kl_accepted_weight=(args.on_policy_mixed_kl_accepted_weight),
+            on_policy_mixed_kl_rejected_weight=(args.on_policy_mixed_kl_rejected_weight),
+            on_policy_mixed_kl_rejection_decay=(args.on_policy_mixed_kl_rejection_decay),
+            on_policy_clipped_rkl_alpha=args.on_policy_clipped_rkl_alpha,
+            on_policy_clipped_rkl_clip=args.on_policy_clipped_rkl_clip,
+            on_policy_clipped_rkl_temperature_weights=(
+                args.on_policy_clipped_rkl_temperature_weights
+            ),
+            on_policy_target_distribution_temperature_floor=(
+                args.on_policy_target_distribution_temperature_floor
+            ),
+            on_policy_target_margin_alpha=args.on_policy_target_margin_alpha,
+            on_policy_target_margin_scale=args.on_policy_target_margin_scale,
+            on_policy_target_margin_offset=args.on_policy_target_margin_offset,
+            on_policy_target_margin_min=args.on_policy_target_margin_min,
+            on_policy_target_margin_max=args.on_policy_target_margin_max,
+            on_policy_target_margin_max_depth=(args.on_policy_target_margin_max_depth),
+            on_policy_deployment_top_k=args.on_policy_deployment_top_k,
+            on_policy_deployment_top_p=args.on_policy_deployment_top_p,
+            on_policy_credit_partition=args.on_policy_credit_partition,
+            on_policy_middle_max_depth=args.on_policy_middle_max_depth,
+            on_policy_middle_alpha=args.on_policy_middle_alpha,
+            on_policy_temperature_hazard_credit=(args.on_policy_temperature_hazard_credit),
+            on_policy_hazard_ema_decay=args.on_policy_hazard_ema_decay,
+            on_policy_hazard_weight_min=args.on_policy_hazard_weight_min,
+            on_policy_hazard_weight_max=args.on_policy_hazard_weight_max,
+            on_policy_marginal_value_credit=(args.on_policy_marginal_value_credit),
+            on_policy_marginal_value_temperature=(
+                args.on_policy_marginal_value_temperature
+            ),
+            on_policy_marginal_value_weight_min=(args.on_policy_marginal_value_weight_min),
+            on_policy_marginal_value_weight_max=(args.on_policy_marginal_value_weight_max),
+            on_policy_language_hazard_credit=(args.on_policy_language_hazard_credit),
+            on_policy_language_han_threshold=(args.on_policy_language_han_threshold),
+            on_policy_language_hazard_ema_decay=(args.on_policy_language_hazard_ema_decay),
+            on_policy_language_hazard_weight_min=(
+                args.on_policy_language_hazard_weight_min
+            ),
+            on_policy_language_hazard_weight_max=(
+                args.on_policy_language_hazard_weight_max
+            ),
+            on_policy_mix_ratio_max=args.on_policy_mix_ratio_max,
+            on_policy_start_step=args.on_policy_start_step,
+            on_policy_ramp_steps=args.on_policy_ramp_steps,
+            on_policy_repair_value=args.on_policy_repair_value,
+            on_policy_repair_value_horizon=args.on_policy_repair_value_horizon,
+            on_policy_interval=args.on_policy_interval,
+            on_policy_loss_budget=args.on_policy_loss_budget,
+            on_policy_preservation_alpha=args.on_policy_preservation_alpha,
+            on_policy_regression_alpha=args.on_policy_regression_alpha,
+            on_policy_regression_margin=args.on_policy_regression_margin,
+            on_policy_greedy_preservation_alpha=(args.on_policy_greedy_preservation_alpha),
+            on_policy_greedy_preservation_margin_floor=(
+                args.on_policy_greedy_preservation_margin_floor
+            ),
+            on_policy_greedy_preservation_temperature=(
+                args.on_policy_greedy_preservation_temperature
+            ),
+            on_policy_reset_replay_alpha=args.on_policy_reset_replay_alpha,
+            on_policy_reset_replay_horizon=args.on_policy_reset_replay_horizon,
+            on_policy_reset_replay_max_rejection_depth=(
+                args.on_policy_reset_replay_max_rejection_depth
+            ),
+            on_policy_reset_replay_start_ratio=(args.on_policy_reset_replay_start_ratio),
+            on_policy_reset_replay_ramp_ratio=(args.on_policy_reset_replay_ramp_ratio),
+            on_policy_reset_replay_loss_budget=(args.on_policy_reset_replay_loss_budget),
+            on_policy_reset_replay_advantage_threshold=(
+                args.on_policy_reset_replay_advantage_threshold
+            ),
+            on_policy_reset_replay_value_clip=(args.on_policy_reset_replay_value_clip),
+            on_policy_preference_alpha=args.on_policy_preference_alpha,
+            on_policy_preference_value_gap=args.on_policy_preference_value_gap,
+            on_policy_preference_temperature=args.on_policy_preference_temperature,
+            on_policy_preference_loss_budget=args.on_policy_preference_loss_budget,
+            on_policy_pareto_credit=args.on_policy_pareto_credit,
+            on_policy_pareto_ema_decay=args.on_policy_pareto_ema_decay,
+            on_policy_pareto_temperature=args.on_policy_pareto_temperature,
+            on_policy_pareto_weight_min=args.on_policy_pareto_weight_min,
+            on_policy_pareto_weight_max=args.on_policy_pareto_weight_max,
+            parallel_refiner_hazard_alpha=args.parallel_refiner_hazard_alpha,
+            parallel_refiner_recovery_alpha=args.parallel_refiner_recovery_alpha,
+            parallel_refiner_preservation_alpha=(args.parallel_refiner_preservation_alpha),
+            parallel_refiner_margin_floor=args.parallel_refiner_margin_floor,
+            parallel_refiner_temperature=args.parallel_refiner_temperature,
+            parallel_refiner_loss_budget=args.parallel_refiner_loss_budget,
+            refiner_advantage_mode=args.refiner_advantage_mode,
+            refiner_advantage_threshold=args.refiner_advantage_threshold,
+            refiner_advantage_gate_alpha=args.refiner_advantage_gate_alpha,
+            refiner_advantage_regression_alpha=(args.refiner_advantage_regression_alpha),
+            refiner_advantage_distill_alpha=args.refiner_advantage_distill_alpha,
+            refiner_advantage_preservation_alpha=(
+                args.refiner_advantage_preservation_alpha
+            ),
+            refiner_advantage_greedy_preservation_alpha=(
+                args.refiner_advantage_greedy_preservation_alpha
+            ),
+            refiner_advantage_greedy_margin_floor=(
+                args.refiner_advantage_greedy_margin_floor
+            ),
+            refiner_advantage_gate_distill_min_probability=(
+                args.refiner_advantage_gate_distill_min_probability
+            ),
+            refiner_advantage_distill_top_k=(args.refiner_advantage_distill_top_k),
+            refiner_advantage_distill_temperature=(
+                args.refiner_advantage_distill_temperature
+            ),
+            refiner_advantage_value_clip=args.refiner_advantage_value_clip,
+            refiner_advantage_distill_start_ratio=(
+                args.refiner_advantage_distill_start_ratio
+            ),
+            refiner_advantage_consolidation_ratio=(
+                args.refiner_advantage_consolidation_ratio
+            ),
+            refiner_advantage_loss_budget=args.refiner_advantage_loss_budget,
+            vat_enabled=args.vat_enabled,
+            vat_hard_loss_alpha=args.vat_hard_loss_alpha,
+            vat_soft_loss_alpha=args.vat_soft_loss_alpha,
+            vat_verification_head_alpha=args.vat_verification_head_alpha,
+            vat_post_rejection_decay_gamma=(args.vat_post_rejection_decay_gamma),
+            vat_simulation_temperature=args.vat_simulation_temperature,
+            branch_value_mode=args.branch_value_mode,
+            branch_value_top_m=args.branch_value_top_m,
+            branch_value_horizon=args.branch_value_horizon,
+            branch_value_alpha=args.branch_value_alpha,
+            branch_value_temperature=args.branch_value_temperature,
+            branch_value_loss_budget=args.branch_value_loss_budget,
+            branch_value_warmup_ratio=args.branch_value_warmup_ratio,
+            branch_value_consolidation_ratio=(args.branch_value_consolidation_ratio),
+            elastic_horizon_enabled=args.elastic_horizon_enabled,
+            elastic_short_horizon=args.elastic_short_horizon,
+            elastic_long_horizon=args.elastic_long_horizon,
+            elastic_warmup_ratio=args.elastic_warmup_ratio,
+            elastic_late_ratio=args.elastic_late_ratio,
+            elastic_consolidation_ratio=args.elastic_consolidation_ratio,
+            elastic_middle_long_prob=args.elastic_middle_long_prob,
+            elastic_late_long_prob=args.elastic_late_long_prob,
+            elastic_pair_probability=args.elastic_pair_probability,
+            elastic_projective_num_anchors=args.elastic_projective_num_anchors,
+            elastic_projective_alpha=args.elastic_projective_alpha,
+            elastic_projective_top_k=args.elastic_projective_top_k,
+            elastic_overlap_gap=args.elastic_overlap_gap,
+            elastic_margin_gap=args.elastic_margin_gap,
+            elastic_loss_budget=args.elastic_loss_budget,
+        )
+        dspark_model.configure_multi_teacher_oracle(
+            mode=args.multi_teacher_oracle_mode,
+            alpha=args.multi_teacher_oracle_alpha,
+            advantage_threshold=args.multi_teacher_oracle_advantage_threshold,
+            value_clip=args.multi_teacher_oracle_value_clip,
+            loss_budget=args.multi_teacher_oracle_loss_budget,
+        )
     configure_objective(dspark_model, tokenizer, args)
+    if is_dflash2 and resume_state is not None:
+        from .dflash2 import validate_dflash2_beta_resume
+
+        validate_dflash2_beta_resume(resume_state, draft_model)
 
     trajectory_writer = None
     if args.multi_teacher_oracle_export_dir:
@@ -1089,6 +1106,7 @@ def run_training(args):
                 dspark_model,
                 training_state_path,
                 restore_scheduler=args.resume_extension_start_step is None,
+                weights_only=is_dflash2,
             )
         else:
             # Legacy checkpoint: optimizer state was saved in
@@ -1122,7 +1140,7 @@ def run_training(args):
             )
             if dist.get_rank() == 0:
                 saved = torch.load(
-                    training_state_path, map_location="cpu", weights_only=False
+                    training_state_path, map_location="cpu", weights_only=is_dflash2
                 )
                 saved["epoch"] = resume_state["epoch"]
                 saved["global_step"] = resume_state["global_step"]
@@ -1306,9 +1324,11 @@ def run_training(args):
                 global_step + args.accumulation_steps - 1
             ) // args.accumulation_steps
             dspark_model.set_training_progress(optimizer_step, total_steps)
-            transition_conv_scale = draft_model.set_local_transition_progress(
-                optimizer_step, total_steps
-            )
+            transition_conv_scale = 1.0
+            if not is_dflash2:
+                transition_conv_scale = draft_model.set_local_transition_progress(
+                    optimizer_step, total_steps
+                )
 
             if netprefix_runtime is not None:
                 (
@@ -1424,7 +1444,7 @@ def run_training(args):
                     else:
                         dist.all_reduce(v)
                     comp_log[key] = (v / dp_size).item()
-                if draft_model.local_transition_enabled:
+                if getattr(draft_model, "local_transition_enabled", False):
                     comp_log["local_transition_conv_scale"] = transition_conv_scale
 
                 record_metrics(

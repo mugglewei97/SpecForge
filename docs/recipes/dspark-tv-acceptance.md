@@ -272,3 +272,49 @@ python -m pytest -q tests/test_utils/test_tv_acceptance.py tests/test_scripts/te
 以及真实小型 DSpark 的前向反向。训练 batch 测试检查 target 只调用一次、
 反向不重跑 target、前后向都不采样 token。远程 8 卡 FSDP/SGLang 吞吐和显存
 仍需服务器 smoke test。
+
+## Native DFlash2 的 TV-beta 训练
+
+同一入口 `scripts/train_dspark.py` 现在按 draft config 的 `architectures`
+识别 `DFlash2DraftModel`，使用独立的 DFlash2 beta 包装层。DSpark 仍使用
+原来的模型、采样、目标配置检查和 beta 计算路径；不需要修改已有 DSpark 命令。
+
+```bash
+TARGET_MODEL_PATH=/path/to/Qwen3-8B \
+TRAIN_DATA_PATH=/path/to/qwen3-8b-regenerated.jsonl \
+OUTPUT_DIR=/path/to/qwen3-8b-dflash2-tv-beta \
+bash examples/run_qwen3_8b_dflash2_tv_acceptance_beta.sh 8 flex_attention sglang \
+    --report-to wandb --wandb-offline
+```
+
+也可以在原训练命令中把 `--draft-config-path` 改成
+`configs/qwen3-8b-dflash2.json`，把 `--block-size` 改成 `8`，并使用新的
+输出目录。**删除原 DSpark 的 `--init-draft-model-path`，或者换成兼容的
+Qwen3-8B DFlash2 checkpoint。** 此功能不执行 DSpark 到 DFlash2 的权重迁移；
+两者的标签位置约定不同，不能只改 architecture 名称转换模型。
+
+本实现固定优化七个 proposal：DFlash2 的八个原生槽为一个 anchor 加七个
+预测槽；第零槽不进入 beta loss。DSpark 的七个槽则全部是预测槽。
+从已有 DFlash2 checkpoint 初始化时，checkpoint 的实际 block size 必须为 8，
+配置与 target 的 hidden size、词表、捕获层及 token IDs 必须匹配。
+
+DFlash2 的 proposal 分布由 strict unary top-k 候选和条件 selector 分数定义：
+先应用模型的 unary logit transform，再选 top-k；对当前实际采样前驱计算
+selector 分数，除以 `--tv-temperature` 后在候选集上 softmax。候选集外的
+proposal 概率为零。target 仍按完整词表归一化，不能在候选集上重归一化。
+训练温度应与计划使用的随机推理温度一致；此目标不等同于 greedy 解码目标。
+
+每次前向保存候选 IDs、proposal tokens、实际前驱和 detached `q_old`。
+反向回放同一候选集和前驱，经 selector 与 unary logits 构造全词表稀疏分布，
+复用原 beta 公式和 target suffix verification。Top-k 成员选择是离散的，
+梯度在当前候选集内传播；不对成员替换求导。卷积、backbone、selector 都参与
+优化，target head 和 embeddings 冻结；不叠加 selector CE 或 DSpark 辅助目标。
+EOS、部分尾块、监督 mask 中断和全局有效 block 归一化沿用 beta 语义。
+
+导出保留 `DFlash2DraftModel` 架构及原生参数名，不写入 DSpark 模型文件。
+`--init-draft-model-path` 严格加载完整 DFlash2 权重，重新建立 optimizer；
+`--resume` 同时恢复训练状态，并检查候选集大小、卷积配置、block 约定等
+proposal 语义。改变这些设置时应使用新的输出目录和 weight-only 初始化。
+当前支持范围为 standalone 入口、`T > 0`、`tp-size=1`、
+`accumulation-steps=1`、`micro-batch-size=0`，以及原有 FSDP 数据并行训练流程。
+统一 YAML 入口的 `training.loss_type` 尚不包含这个 beta 目标。
