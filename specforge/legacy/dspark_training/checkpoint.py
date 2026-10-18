@@ -13,6 +13,7 @@ from specforge.legacy.optimizer import save_fsdp_optimizer_state
 from specforge.utils import print_on_rank0
 
 from .config import is_dflash2_config
+from .objective import DFLASH2_NATIVE_OBJECTIVES
 
 
 def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
@@ -58,7 +59,7 @@ def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
             saved["epoch"] = epoch
             saved["global_step"] = step
             saved["args"] = vars(args) if is_dflash2 else args
-            if is_dflash2 and args.dspark_loss_type == "dflash2":
+            if is_dflash2 and args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
                 from .dflash2 import dflash2_native_resume_contract
 
                 saved["dflash2_native"] = dflash2_native_resume_contract(draft_model, args)

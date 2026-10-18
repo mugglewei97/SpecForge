@@ -1,11 +1,13 @@
 """Native DFlash2 wiring for the standalone training lifecycle."""
 
+from .objective import DFLASH2_NATIVE_OBJECTIVES
+
 
 def prepare_dflash2_config(config, args):
-    native = args.dspark_loss_type == "dflash2"
+    native = args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES
     if not native and args.dspark_loss_type != "tv-acceptance-beta":
         raise ValueError(
-            "DFlash2 requires --dspark-loss-type dflash2 or tv-acceptance-beta"
+            "DFlash2 requires --dspark-loss-type dflash2, dpace or tv-acceptance-beta"
         )
     method = dict(getattr(config, "dflash_config", None) or {})
     top_level = getattr(config, "block_size", None)
@@ -98,7 +100,7 @@ def prepare_dflash2_config(config, args):
 
 
 def build_dflash2_training_model(args, draft_model, target_components, mask_token_id):
-    if args.dspark_loss_type == "dflash2":
+    if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
         from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 
         model = OnlineDFlashModel(
@@ -110,6 +112,8 @@ def build_dflash2_training_model(args, draft_model, target_components, mask_toke
             attention_backend=args.attention_backend,
             num_anchors=args.num_anchors,
             loss_decay_gamma=args.loss_decay_gamma,
+            loss_type="dpace" if args.dspark_loss_type == "dpace" else "dflash",
+            dpace_alpha=args.dpace_alpha,
         )
         model.lm_head.requires_grad_(False)
         model.embed_tokens.requires_grad_(False)
@@ -149,17 +153,24 @@ def forward_dflash2_native(
 
 
 def dflash2_native_resume_contract(draft_model, args):
-    return {
-        "policy": "native-ce-selector-v1",
+    contract = {
         "block_size": draft_model.block_size,
         "dflash_config": dict(draft_model.config.dflash_config),
-        "loss_decay_gamma": args.loss_decay_gamma,
         "num_anchors": args.num_anchors,
     }
+    if args.dspark_loss_type == "dpace":
+        contract.update(policy="native-dpace-selector-v1", dpace_alpha=args.dpace_alpha)
+    else:
+        # Preserve the existing CE checkpoint contract exactly. D-PACE does
+        # not use loss_decay_gamma, so it is not a resume invariant for D-PACE.
+        contract.update(
+            policy="native-ce-selector-v1", loss_decay_gamma=args.loss_decay_gamma
+        )
+    return contract
 
 
 def validate_dflash2_resume(state, draft_model, args):
-    if args.dspark_loss_type == "dflash2":
+    if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
         expected = dflash2_native_resume_contract(draft_model, args)
         if state.get("dflash2_native") != expected:
             raise ValueError(

@@ -1,4 +1,4 @@
-"""CLI, resume invariants and model wiring for the TV acceptance objective."""
+"""CLI, resume invariants and model wiring for standalone training objectives."""
 
 import math
 from collections.abc import Mapping
@@ -11,6 +11,7 @@ OBJECTIVE_DEFAULTS = {
 TV_PREFIX_MODE = "teacher-forced"
 TV_BETA_PREFIX_MODE = "sampled-beta-v1"
 TV_OBJECTIVES = ("tv-acceptance", "tv-acceptance-beta")
+DFLASH2_NATIVE_OBJECTIVES = ("dflash2", "dpace")
 
 
 def add_objective_args(group):
@@ -18,9 +19,15 @@ def add_objective_args(group):
     group.set_defaults(tv_prefix_mode=TV_PREFIX_MODE)
     group.add_argument(
         "--dspark-loss-type",
-        choices=["ce-l1", "dflash2", *TV_OBJECTIVES],
+        choices=["ce-l1", *DFLASH2_NATIVE_OBJECTIVES, *TV_OBJECTIVES],
         default=OBJECTIVE_DEFAULTS["dspark_loss_type"],
-        help="dflash2: native DFlash2 CE + selector; tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
+        help="dflash2: native DFlash2 CE + selector; dpace: native DFlash2 D-PACE + selector; tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
+    )
+    group.add_argument(
+        "--dpace-alpha",
+        type=float,
+        default=0.5,
+        help="Probability smoothing floor for native DFlash2 --dspark-loss-type dpace, in [0, 1].",
     )
     group.add_argument(
         "--tv-temperature",
@@ -45,6 +52,16 @@ def add_objective_args(group):
 
 
 def validate_objective_args(args):
+    if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
+        if args.pace_mode != "none":
+            raise ValueError(
+                "--pace-mode is a DSpark option; for DFlash2 use "
+                "--dspark-loss-type dpace and --dpace-alpha"
+            )
+        if args.dspark_loss_type == "dpace" and not (
+            math.isfinite(args.dpace_alpha) and 0.0 <= args.dpace_alpha <= 1.0
+        ):
+            raise ValueError("--dpace-alpha must be finite and in [0, 1]")
     if args.dspark_loss_type not in TV_OBJECTIVES:
         return
     if args.dspark_loss_type == "tv-acceptance-beta":
@@ -113,6 +130,14 @@ def validate_objective_resume(saved_args, args):
 
 def configure_objective(model, tokenizer, args):
     """Enable target-state reuse and freeze unused heads before FSDP wrapping."""
+    if args.dspark_loss_type == "dpace":
+        from specforge.utils import print_on_rank0
+
+        print_on_rank0(
+            f"DFlash2 D-PACE + selector: dpace_alpha={model.dpace_alpha}; "
+            "dynamic position weights replace loss-decay-gamma."
+        )
+        return
     if args.dspark_loss_type not in TV_OBJECTIVES:
         return
     from transformers import AutoConfig

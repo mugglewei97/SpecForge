@@ -71,6 +71,7 @@ from .initialization import (
     resolve_mask_token_id,
 )
 from .objective import (
+    DFLASH2_NATIVE_OBJECTIVES,
     configure_objective,
     validate_objective_args,
     validate_objective_resume,
@@ -176,7 +177,7 @@ def _forward_dspark_data_batch(
             else contextlib.nullcontext()
         )
         with forward_context:
-            if args.dspark_loss_type == "dflash2":
+            if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
                 from .dflash2 import forward_dflash2_native
 
                 return forward_dflash2_native(
@@ -283,7 +284,7 @@ def run_training(args):
     device = get_local_device()
     device_type = device.type
 
-    needs_target_hidden = args.dspark_loss_type != "dflash2" and (
+    needs_target_hidden = args.dspark_loss_type not in DFLASH2_NATIVE_OBJECTIVES and (
         (args.dspark_loss_type in {"tv-acceptance", "tv-acceptance-beta"})
         or (args.offline_acceptance_objective != "none")
         or (args.bv_loss_alpha > 0)
@@ -1334,7 +1335,7 @@ def run_training(args):
             optimizer_step = (
                 global_step + args.accumulation_steps - 1
             ) // args.accumulation_steps
-            if args.dspark_loss_type != "dflash2":
+            if args.dspark_loss_type not in DFLASH2_NATIVE_OBJECTIVES:
                 dspark_model.set_training_progress(optimizer_step, total_steps)
             transition_conv_scale = 1.0
             if not is_dflash2:

@@ -60,6 +60,33 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     assert "--tv-sampling-temperature" in result.stdout
     assert "--tv-temperature" in result.stdout
     assert "--sglang-mem-fraction-static" in result.stdout
+    assert "--dpace-alpha" in result.stdout
+
+
+def test_native_dpace_cli_defaults_and_override():
+    args = training_args("--dspark-loss-type", "dpace")
+    validate_objective_args(args)
+    assert args.dpace_alpha == 0.5
+    for alpha in (0.0, 0.25, 1.0):
+        args = training_args(
+            "--dspark-loss-type", "dpace", "--dpace-alpha", str(alpha)
+        )
+        validate_objective_args(args)
+        assert args.dpace_alpha == alpha
+
+
+@pytest.mark.parametrize("alpha", ["nan", "inf", "-inf", "-0.1", "1.1"])
+def test_native_dpace_rejects_invalid_alpha(alpha):
+    args = training_args("--dspark-loss-type", "dpace", f"--dpace-alpha={alpha}")
+    with pytest.raises(ValueError, match="dpace-alpha"):
+        validate_objective_args(args)
+
+
+@pytest.mark.parametrize("objective", ["dflash2", "dpace"])
+def test_native_dflash2_rejects_dspark_pace_mode(objective):
+    args = training_args("--dspark-loss-type", objective, "--pace-mode", "token")
+    with pytest.raises(ValueError, match="--pace-mode is a DSpark option"):
+        validate_objective_args(args)
 
 
 def test_training_cli_and_objective_defaults_remain_compatible():

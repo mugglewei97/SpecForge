@@ -474,7 +474,9 @@ def test_native_masks_truncate_at_first_hole_and_empty_rank_participates():
         )
 
 
-@pytest.mark.parametrize("objective,block_size", [("tv-acceptance-beta", 8), ("dflash2", 7)])
+@pytest.mark.parametrize(
+    "objective,block_size", [("tv-acceptance-beta", 8), ("dflash2", 7), ("dpace", 7)]
+)
 def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
     tmp_path, monkeypatch, objective, block_size
 ):
@@ -489,6 +491,10 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
     target_path = tmp_path / "target"
     config.save_pretrained(target_path)
     draft_path = target_path / "config.json"
+    if objective == "dpace":
+        # Exercise the reported workflow: initialize from an existing native
+        # block-8 checkpoint, train with block 7, then resume the new objective.
+        DFlash2DraftModel(config).save_pretrained(tmp_path / "warm-start")
 
     class BF16Target(RecordingTarget):
         def set_capture_layers(self, layers):
@@ -566,6 +572,8 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
             str(tmp_path / "output"),
             "--dspark-loss-type",
             objective,
+            "--dpace-alpha",
+            "0.3",
             "--attention-backend",
             "sdpa",
             "--block-size",
@@ -584,6 +592,10 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
             "1",
             "--save-interval",
             "10",
+            *(
+                ["--init-draft-model-path", str(tmp_path / "warm-start")]
+                if objective == "dpace" and stop == 1 else []
+            ),
             *(["--resume"] if stop == 2 else []),
         )
         try:
@@ -597,6 +609,10 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
     if objective == "dflash2":
         assert state["dflash2_native"]["policy"] == "native-ce-selector-v1"
         assert state["dflash2_native"]["loss_decay_gamma"] == 4.0
+        assert "dflash2_tv_beta" not in state
+    elif objective == "dpace":
+        assert state["dflash2_native"]["policy"] == "native-dpace-selector-v1"
+        assert state["dflash2_native"]["dpace_alpha"] == 0.3
         assert "dflash2_tv_beta" not in state
     else:
         assert state["dflash2_tv_beta"]["policy"] == "strict-topk-selector-beta-v1"
