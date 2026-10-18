@@ -128,7 +128,8 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, torch.nn.Module]:
         draft_config = load_draft_config(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
         if (
-            hasattr(draft_config, "block_size")
+            args.dspark_loss_type != "dflash2"
+            and hasattr(draft_config, "block_size")
             and draft_config.block_size != args.block_size
         ):
             print_on_rank0(
@@ -167,11 +168,15 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, torch.nn.Module]:
         )
         target_model.set_capture_layers(draft_model.target_layer_ids)
         print_on_rank0(
-            f"DFlash2 TV beta: block_size={draft_model.block_size}, "
-            f"proposal_length=7, selector_top_k={draft_model.candidate_selector.top_k}, "
+            f"DFlash2 {args.dspark_loss_type}: block_size={draft_model.block_size}, "
+            f"proposal_length={draft_model.block_size - 1}, "
+            f"selector_top_k={draft_model.candidate_selector.top_k}, "
             f"attention_backend={args.attention_backend}"
         )
         return target_model, draft_model
+
+    if args.dspark_loss_type == "dflash2":
+        raise ValueError("--dspark-loss-type dflash2 requires a DFlash2DraftModel config")
 
     _apply_dspark_config(draft_config, args)
     draft_config._attn_implementation = args.attention_backend

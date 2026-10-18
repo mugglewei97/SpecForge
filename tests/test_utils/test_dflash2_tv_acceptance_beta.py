@@ -474,7 +474,10 @@ def test_native_masks_truncate_at_first_hole_and_empty_rank_participates():
         )
 
 
-def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("objective,block_size", [("tv-acceptance-beta", 8), ("dflash2", 7)])
+def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
+    tmp_path, monkeypatch, objective, block_size
+):
     """Run the actual trainer/optimizer/checkpointer with a CPU capture fixture."""
     import functools
     import torch.distributed as dist
@@ -562,11 +565,11 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(tmp_path, monke
             "--output-dir",
             str(tmp_path / "output"),
             "--dspark-loss-type",
-            "tv-acceptance-beta",
+            objective,
             "--attention-backend",
             "sdpa",
             "--block-size",
-            "8",
+            str(block_size),
             "--num-anchors",
             "2",
             "--num-epochs",
@@ -591,5 +594,12 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(tmp_path, monke
     final = tmp_path / "output" / "epoch_1_step_2"
     state = torch.load(final / "training_state.pt", weights_only=True)
     assert state["global_step"] == 2
-    assert state["dflash2_tv_beta"]["policy"] == "strict-topk-selector-beta-v1"
-    assert type(load_checkpoint_model(final)) is DFlash2DraftModel
+    if objective == "dflash2":
+        assert state["dflash2_native"]["policy"] == "native-ce-selector-v1"
+        assert state["dflash2_native"]["loss_decay_gamma"] == 4.0
+        assert "dflash2_tv_beta" not in state
+    else:
+        assert state["dflash2_tv_beta"]["policy"] == "strict-topk-selector-beta-v1"
+    restored = load_checkpoint_model(final)
+    assert type(restored) is DFlash2DraftModel
+    assert restored.block_size == block_size

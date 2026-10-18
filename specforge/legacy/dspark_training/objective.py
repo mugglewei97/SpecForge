@@ -18,9 +18,9 @@ def add_objective_args(group):
     group.set_defaults(tv_prefix_mode=TV_PREFIX_MODE)
     group.add_argument(
         "--dspark-loss-type",
-        choices=["ce-l1", *TV_OBJECTIVES],
+        choices=["ce-l1", "dflash2", *TV_OBJECTIVES],
         default=OBJECTIVE_DEFAULTS["dspark_loss_type"],
-        help="tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
+        help="dflash2: native DFlash2 CE + selector; tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
     )
     group.add_argument(
         "--tv-temperature",

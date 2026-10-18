@@ -58,7 +58,11 @@ def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
             saved["epoch"] = epoch
             saved["global_step"] = step
             saved["args"] = vars(args) if is_dflash2 else args
-            if is_dflash2:
+            if is_dflash2 and args.dspark_loss_type == "dflash2":
+                from .dflash2 import dflash2_native_resume_contract
+
+                saved["dflash2_native"] = dflash2_native_resume_contract(draft_model, args)
+            elif is_dflash2:
                 from .dflash2 import dflash2_beta_resume_contract
 
                 saved["dflash2_tv_beta"] = dflash2_beta_resume_contract(draft_model)

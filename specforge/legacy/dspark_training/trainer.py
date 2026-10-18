@@ -176,6 +176,17 @@ def _forward_dspark_data_batch(
             else contextlib.nullcontext()
         )
         with forward_context:
+            if args.dspark_loss_type == "dflash2":
+                from .dflash2 import forward_dflash2_native
+
+                return forward_dflash2_native(
+                    dspark_model,
+                    input_ids,
+                    hidden_states,
+                    loss_mask,
+                    attention_mask,
+                    last_hidden_states,
+                )
             return dspark_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
@@ -272,7 +283,7 @@ def run_training(args):
     device = get_local_device()
     device_type = device.type
 
-    needs_target_hidden = (
+    needs_target_hidden = args.dspark_loss_type != "dflash2" and (
         (args.dspark_loss_type in {"tv-acceptance", "tv-acceptance-beta"})
         or (args.offline_acceptance_objective != "none")
         or (args.bv_loss_alpha > 0)
@@ -858,9 +869,9 @@ def run_training(args):
         )
     configure_objective(dspark_model, tokenizer, args)
     if is_dflash2 and resume_state is not None:
-        from .dflash2 import validate_dflash2_beta_resume
+        from .dflash2 import validate_dflash2_resume
 
-        validate_dflash2_beta_resume(resume_state, draft_model)
+        validate_dflash2_resume(resume_state, draft_model, args)
 
     trajectory_writer = None
     if args.multi_teacher_oracle_export_dir:
@@ -1323,7 +1334,8 @@ def run_training(args):
             optimizer_step = (
                 global_step + args.accumulation_steps - 1
             ) // args.accumulation_steps
-            dspark_model.set_training_progress(optimizer_step, total_steps)
+            if args.dspark_loss_type != "dflash2":
+                dspark_model.set_training_progress(optimizer_step, total_steps)
             transition_conv_scale = 1.0
             if not is_dflash2:
                 transition_conv_scale = draft_model.set_local_transition_progress(
