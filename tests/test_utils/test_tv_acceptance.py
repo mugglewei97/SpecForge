@@ -274,6 +274,7 @@ def test_real_training_batch_uses_one_target_forward_and_no_sampling():
         source_id=torch.zeros(2),
     )
     args = SimpleNamespace(
+        dspark_loss_type="tv-acceptance",
         seed=42,
         multi_teacher_oracle_export_dir=None,
         multi_teacher_oracle_cache=None,

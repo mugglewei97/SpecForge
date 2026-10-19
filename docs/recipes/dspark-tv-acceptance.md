@@ -16,9 +16,90 @@ bash examples/run_qwen3_8b_dspark_tv_acceptance.sh 8 flex_attention sglang \
 
 从已有模型后训练时追加 `--init-draft-model-path /path/to/checkpoint`。
 模型的实际 `block_size` 必须为 7（包括从 checkpoint 加载的配置），不能
-只依据 CLI 的默认值判断。beta 沿用 `T > 0`、全词表 softmax、vanilla
-Markov head 或无 Markov head、`tp-size=1`、`accumulation-steps=1`、
-`micro-batch-size=0` 的限制，并支持 FSDP 数据并行。
+只依据 CLI 的默认值判断。beta 支持 vanilla Markov head、无 Markov head，
+以及下述单前驱 CARH；沿用 `T > 0`、全词表 softmax、`tp-size=1`、
+`accumulation-steps=1`、`micro-batch-size=0` 的限制，并支持 FSDP 数据并行。
+
+### 从 CARH + DynamicConv checkpoint 后训练
+
+`scripts/train_dspark.py` 的 beta 路径支持以下 CARH 配置组合：
+
+```json
+{
+  "block_size": 7,
+  "markov_head_type": "carh",
+  "carh_predecessor_count": 1,
+  "carh_predecessor_context_mode": "none",
+  "carh_sampled_prefix_memory_rank": 0
+}
+```
+
+CARH 的逐步采样和 block replay 都以相同的实际前驱 token、当前位置
+draft hidden、depth embedding 为条件，所以可直接使用 beta 的目标与
+梯度公式。无需转换成 vanilla、重置 CARH 或移除卷积。多前驱 CARH、
+predecessor context 和 sampled-prefix memory 尚未接入此采样路径，
+会在配置 objective 时明确报错；原 `tv-acceptance` 仍只支持 vanilla
+或无 Markov head。
+
+对于 `Qwen3DSparkModel`、CARH rank 256、5 层 draft、以下卷积配置的
+checkpoint，各部分处理如下：
+
+| checkpoint 配置 | beta 后训练行为 |
+| --- | --- |
+| `architectures=["Qwen3DSparkModel"]`、`model_type="qwen3"`、`auto_map.AutoModel="dspark.DSparkDraftModel"` | 使用仓库的 legacy DSpark 类加载，保留原配置和权重；不依赖 checkpoint 内的远程 Python 实现 |
+| `conv_mode="legacy"`、`conv_kernel_size=2`、`conv_group_size=16`、`conv_kernel_conditioning="low-rank64"`、`conv_source_rank=32` | 已有 backbone 支持，卷积权重参与 beta 训练 |
+| `conv_apply_to="attention-mlp"`、`conv_last_n_layers=0` | 全部 draft 层的 attention 和 MLP 卷积保留 |
+| `enable_confidence_head=true`、`confidence_head_with_markov=true` | 权重保留并冻结；beta 不训练 confidence loss，也不重新校准其预测 |
+| selector / refiner / recall correction / block summary 的 rank 为 0，prefix mixer 为 `none` | 不构造这些可选模块，兼容；仅 `parallel_refiner_runtime_enabled=true` 不会启用 rank 为 0 的 refiner |
+| predictive auxiliary 两个 alpha 均为 0，`elastic_horizon_enabled=false` | 与独立 beta objective 兼容 |
+
+必须提供与原草稿匹配的 **target checkpoint、tokenizer 和训练数据**。
+该草稿记录了 `hidden_size=4096`、`vocab_size=151936`、
+`num_target_layers=36`、capture layers `[1,9,17,25,33]`，不能仅凭示例
+脚本名称选择 target。beta 会对采样后分叉的前缀执行 target 验证，
+只有原序列的离线 hidden states 不足以完成此训练。
+
+下面是服务器上先跑 5 步的命令模板；替换路径，并按实际 GPU 数调整
+`--nproc_per_node`。小 batch、anchors 和词表分块用于先检查加载与更新，
+不代表正式训练的最优超参数或显存保证：
+
+```bash
+torchrun --standalone --nproc_per_node 8 scripts/train_dspark.py \
+    --target-model-path /path/to/original-target \
+    --init-draft-model-path /path/to/carh-checkpoint \
+    --train-data-path /path/to/train.jsonl \
+    --output-dir /path/to/new-carh-tv-beta-smoke \
+    --dspark-loss-type tv-acceptance-beta \
+    --target-model-backend sglang \
+    --attention-backend flex_attention \
+    --sglang-mem-fraction-static 0.3 \
+    --chat-template qwen \
+    --block-size 7 --num-anchors 8 \
+    --batch-size 1 --max-length 512 \
+    --tp-size 1 --accumulation-steps 1 --micro-batch-size 0 \
+    --tv-temperature 1.0 \
+    --tv-objective-chunk-blocks 1 \
+    --tv-verification-batch-size 4 \
+    --learning-rate 1e-5 --warmup-ratio 0 \
+    --max-steps 5 --log-interval 1 --save-interval 5
+```
+
+`--init-draft-model-path` 自动使用 checkpoint 的 `config.json`，读取完整
+draft 权重并新建 optimizer/scheduler；切换训练目标不要使用 `--resume`。
+不必额外指定 `--markov-head-type` 或卷积覆盖参数。加载器会检查缺失、
+多余和形状不匹配的权重。仅凭 config 可以判断结构兼容性，无法确认远端
+权重是否完整、来自相同实现，或实际 GPU/SGLang 环境是否可运行。
+
+CARH 回归测试覆盖非零 head 的采样/replay 概率、逐步参考梯度，以及
+缩小 hidden/vocab 后保留 CARH + 卷积结构的 checkpoint 加载和更新：
+
+```bash
+python -m pytest -q \
+    tests/test_utils/test_tv_acceptance_beta_carh.py \
+    tests/test_utils/test_tv_beta_carh_checkpoint.py
+```
+
+### Beta 目标与梯度
 
 对固定 anchor 上采到的 proposal `d_1, ..., d_K`，所有分布均以相同的
 实际 proposal 前缀为条件：
@@ -218,8 +299,8 @@ EOS 后续位置不计入。`K` 是截断后的有效预测位置数，空 block
 - 默认 `--dspark-loss-type ce-l1` 保留原有 loss。新模式只优化上述代理目标；
   `--loss-decay-gamma`、CE/L1/confidence 权重和 PACE 权重不参与新 loss。
   confidence head 冻结，target 始终不接收梯度。
-- 当前支持给定配置的 vanilla Markov head（或关闭 Markov），`T > 0`，
-  全词表 softmax；不包含实验性 CARH/selector/refiner。
+- 原 `tv-acceptance` 支持 vanilla Markov head（或关闭 Markov），`T > 0`，
+  全词表 softmax；CARH 仅支持上文的 beta 配置，selector/refiner 不在此范围。
 - 当前要求 `--tp-size 1`、`--accumulation-steps 1`、`--micro-batch-size 0`。
   支持 torchrun/FSDP 数据并行，按所有 rank 的有效 block 总数归一化。
   全部 rank 都没有有效 block 时明确报错。

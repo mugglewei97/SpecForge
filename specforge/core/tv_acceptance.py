@@ -230,9 +230,10 @@ def configure_tv_acceptance(
 ):
     """Enable the pure objective before FSDP/optimizer creation.
 
-    Initial support is the user's vanilla Markov DSpark configuration (or no
-    Markov head). Experimental recurrent, selector and refiner heads have
-    different conditioning rules and need their own objective integration.
+    Beta also supports single-predecessor CARH without predecessor context or
+    sampled-prefix memory: its step sampler and block replay use the same
+    token, hidden state and depth. Stateful CARH variants, recurrent, selector
+    and refiner heads need their own rollout/replay integration.
     """
     if not math.isfinite(temperature) or temperature <= 0 or chunk_blocks < 1:
         raise ValueError("temperature must be finite and > 0; chunk_blocks must be > 0")
@@ -244,9 +245,23 @@ def configure_tv_acceptance(
     if beta and verification_batch_size is not None and verification_batch_size < 1:
         raise ValueError("TV beta verification batch size must be positive")
     head = draft.markov_head
-    if head is not None and getattr(head, "markov_head_type", "vanilla") != "vanilla":
+    head_type = getattr(head, "markov_head_type", "vanilla")
+    if head is not None and beta and head_type == "carh":
+        if (
+            getattr(head, "predecessor_count", None) != 1
+            or getattr(head, "predecessor_context_mode", None) != "none"
+            or getattr(head, "sampled_prefix_memory_rank", None) != 0
+            or getattr(head, "sampled_prefix_memory", None) is not None
+        ):
+            raise ValueError(
+                "tv-acceptance-beta CARH requires carh_predecessor_count=1, "
+                "carh_predecessor_context_mode='none' and "
+                "carh_sampled_prefix_memory_rank=0"
+            )
+    elif head is not None and head_type != "vanilla":
         raise ValueError(
-            "tv-acceptance currently supports only the vanilla Markov head"
+            "tv-acceptance supports only the vanilla Markov head; "
+            "tv-acceptance-beta also supports stateless single-predecessor CARH"
         )
     for name in (
         "candidate_selector",
