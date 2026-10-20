@@ -45,7 +45,13 @@ class BlockRolloutCache:
                 device=keys.device,
             )
             indices = torch.arange(kv_blocks, dtype=torch.int32, device=keys.device)
-            indices = indices[None, None, None, :].expand(batch, 1, query_blocks, -1)
+            # Triton's sparse kernel flattens batch/head assuming contiguous
+            # metadata. A zero-stride expand would read past storage for batch > 1.
+            indices = (
+                indices[None, None, None, :]
+                .expand(batch, 1, query_blocks, -1)
+                .contiguous()
+            )
             # FLASH requires full-block metadata even when there are no full
             # tiles. Zero counts make the shared indices unused in that path.
             full_counts = torch.zeros_like(counts)

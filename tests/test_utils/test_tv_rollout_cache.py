@@ -169,6 +169,31 @@ def test_layout_reuse_refreshes_visibility_and_sequence_lengths(monkeypatch):
         previous, previous_dense = mask, _materialize_mask(mask)
 
 
+@pytest.mark.parametrize("batch", [1, 4, 16])
+@pytest.mark.parametrize("key_width", [8, 129, 4096])
+def test_block_indices_support_triton_batch_offsets(monkeypatch, batch, key_width):
+    monkeypatch.setenv("SPECFORGE_FLEX_ATTENTION_BACKEND", "TRITON")
+    mask = BlockRolloutCache()._block_mask(
+        torch.ones(batch, key_width, dtype=torch.bool), 7
+    )
+    for indices in (mask.kv_indices, mask.full_kv_indices):
+        # The Triton forward flattens batch/head using stride(1), assuming
+        # contiguous metadata; it does not use the tensor's batch stride.
+        # FULL_KV_IDX is also read once when full_kv_num_blocks is zero.
+        storage_size = indices.untyped_storage().nbytes() // indices.element_size()
+        for row in range(batch):
+            offset = indices.storage_offset() + row * indices.size(1) * indices.stride(
+                1
+            )
+            assert offset < storage_size, (
+                f"Kernel index load for batch row {row} is outside storage: "
+                f"offset={offset}, storage_size={storage_size}, stride={indices.stride()}"
+            )
+        assert indices.is_contiguous()
+    assert mask.kv_num_blocks.is_contiguous()
+    assert mask.full_kv_num_blocks.is_contiguous()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlexAttention")
 @pytest.mark.parametrize("backend", ["TRITON", "FLASH"])
 @pytest.mark.parametrize("query_length", [7, 8])
