@@ -175,7 +175,7 @@ def teacher_forced_tv_forward(
     return reduce_tv_terms(terms)
 
 
-def reduce_tv_terms(terms: TVAcceptanceTerms):
+def reduce_tv_terms(terms: TVAcceptanceTerms, *, allow_empty=False):
     """Normalize across ranks and return DSpark's loss/telemetry contract."""
     scalars = torch.stack(
         [terms.loss_sum.detach(), terms.length_sum.detach(), terms.block_count.detach()]
@@ -194,20 +194,21 @@ def reduce_tv_terms(terms: TVAcceptanceTerms):
         dist.all_reduce(scalars)
         dist.all_reduce(positions)
     global_loss, global_length, global_count = scalars.unbind(0)
-    if global_count.item() <= 0:
+    if global_count.item() <= 0 and not allow_empty:
         raise ValueError("tv-acceptance has no valid blocks on any rank")
     # FSDP averages rank gradients: compensate to weight every nonempty block
     # equally. The same reduced count also normalizes the detached telemetry.
-    loss = world * terms.loss_sum / global_count
+    block_denominator = global_count.clamp_min(1)
+    loss = world * terms.loss_sum / block_denominator
     overlap, correct, count = positions.unbind(0)
     position_denominator = count.clamp_min(1)
     total_positions = count.sum().clamp_min(1)
     components = {
-        "tv_acceptance_loss": global_loss / global_count,
-        "tv_acceptance_length_proxy": global_length / global_count,
+        "tv_acceptance_loss": global_loss / block_denominator,
+        "tv_acceptance_length_proxy": global_length / block_denominator,
         "tv_mean_overlap": overlap.sum() / total_positions,
         "tv_valid_blocks": global_count,
-        "tv_mean_valid_length": count.sum() / global_count,
+        "tv_mean_valid_length": count.sum() / block_denominator,
     }
     return (
         loss,

@@ -30,6 +30,18 @@ class DFlash2ProposalRollout(NamedTuple):
     previous: torch.Tensor
     valid: torch.Tensor
     candidate_ids: torch.Tensor
+    candidate_probs: torch.Tensor | None = None
+
+
+def dflash2_candidate_scores(model, hidden, previous, candidate_ids):
+    """Current selector scores on the recorded support, without a dense scatter."""
+    unary = model.draft_model.transform_unary_logits(model.lm_head(hidden))
+    return model.draft_model.candidate_selector.score_candidates(
+        candidate_ids=candidate_ids,
+        unary_logits=unary.gather(-1, candidate_ids),
+        hidden_states=hidden,
+        predecessor_ids=previous,
+    )
 
 
 def dflash2_proposal_logits(model, hidden, previous, candidate_ids):
@@ -50,7 +62,9 @@ def dflash2_proposal_logits(model, hidden, previous, candidate_ids):
 
 
 @torch.no_grad()
-def sample_dflash2_beta_proposals(model, hidden, anchor_tokens, valid):
+def sample_dflash2_beta_proposals(
+    model, hidden, anchor_tokens, valid, *, retain_candidate_probs=False
+):
     count, width, _ = hidden.shape
     selector = model.draft_model.candidate_selector
     tokens = torch.zeros_like(valid, dtype=torch.long)
@@ -58,6 +72,11 @@ def sample_dflash2_beta_proposals(model, hidden, anchor_tokens, valid):
     old_log_probs = torch.zeros(valid.shape, device=hidden.device, dtype=torch.float32)
     candidates = torch.empty(
         (*valid.shape, selector.top_k), device=hidden.device, dtype=torch.long
+    )
+    candidate_probs = (
+        torch.zeros(candidates.shape, device=hidden.device, dtype=torch.float32)
+        if retain_candidate_probs
+        else None
     )
     valid = valid.bool().int().cumprod(-1).bool().clone()
     chunk = model.tv_objective_chunk_blocks
@@ -79,6 +98,8 @@ def sample_dflash2_beta_proposals(model, hidden, anchor_tokens, valid):
             active = valid[start:end, depth]
             scores = torch.where(active[:, None], scores.float(), 0.0)
             log_q = torch.log_softmax(scores / model.tv_temperature, -1)
+            if candidate_probs is not None:
+                candidate_probs[start:end, depth] = log_q.exp()
             index = torch.multinomial(log_q.exp(), 1)
             sampled = ids[:, depth].gather(-1, index).squeeze(-1)
             tokens[start:end, depth] = sampled
@@ -89,7 +110,9 @@ def sample_dflash2_beta_proposals(model, hidden, anchor_tokens, valid):
                     eos |= sampled == token_id
                 valid[start:end, depth + 1 :] &= (~eos & active)[:, None]
             prev = sampled
-    return DFlash2ProposalRollout(tokens, old_log_probs, previous, valid, candidates)
+    return DFlash2ProposalRollout(
+        tokens, old_log_probs, previous, valid, candidates, candidate_probs
+    )
 
 
 class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
@@ -110,7 +133,15 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
         self.embed_tokens.requires_grad_(False)
 
     def configure_beta(
-        self, *, temperature, chunk_blocks, eos_token_ids, verification_batch_size
+        self,
+        *,
+        temperature,
+        chunk_blocks,
+        eos_token_ids,
+        verification_batch_size,
+        anchor_mode="random",
+        rollout_max_tokens=256,
+        max_sequence_length=4096,
     ):
         if not math.isfinite(temperature) or temperature <= 0 or chunk_blocks < 1:
             raise ValueError(
@@ -122,6 +153,21 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
         self.tv_objective_chunk_blocks = int(chunk_blocks)
         self.tv_eos_token_ids = tuple(eos_token_ids)
         self.tv_verification_batch_size = verification_batch_size
+        if anchor_mode not in ("random", "on-policy"):
+            raise ValueError("Unknown TV beta anchor mode")
+        if rollout_max_tokens < 1 or max_sequence_length < 2:
+            raise ValueError("TV rollout and sequence budgets must be positive")
+        if anchor_mode == "on-policy" and (
+            self.num_anchors < 1
+            or getattr(self.draft_model.config, "attention_dropout", 0.0) != 0.0
+            or self.draft_model.sliding_window is not None
+        ):
+            raise ValueError(
+                "On-policy beta requires anchors > 0, zero draft dropout and full attention"
+            )
+        self.tv_anchor_mode = anchor_mode
+        self.tv_rollout_max_tokens = int(rollout_max_tokens)
+        self.tv_max_sequence_length = int(max_sequence_length)
 
     def set_training_progress(self, global_step, total_steps):
         # Pure beta has no auxiliary-loss schedule. The shared trainer calls
@@ -146,9 +192,18 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
         sample_ids=None,
         source_ids=None,
         tv_verification_session=None,
+        tv_on_policy_session=None,
     ):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
+        if self.tv_anchor_mode == "on-policy":
+            from specforge.core.dflash2_on_policy import on_policy_dflash2_forward
+
+            if tv_on_policy_session is None:
+                raise ValueError("On-policy beta requires a target rollout session")
+            return on_policy_dflash2_forward(
+                self, input_ids, attention_mask, loss_mask, tv_on_policy_session
+            )
         if (
             input_ids.ndim != 2
             or input_ids.size(1) < 1

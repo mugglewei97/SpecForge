@@ -78,6 +78,12 @@ class DFlashTargetEngine(TargetEngine):
 
         return ProposalVerificationSession(self)
 
+    def on_policy_rollout(self):
+        """Create an incremental speculative-rollout target session."""
+        raise NotImplementedError(
+            "on-policy rollout currently requires a full-attention Qwen3 HF or SGLang target"
+        )
+
     @abstractmethod
     def score_proposal_tokens(
         self,
@@ -168,6 +174,15 @@ class SGLangDFlashTargetEngine(DFlashTargetEngine):
             return SGLangProposalVerificationSession(self)
         return super().proposal_verification()
 
+    def on_policy_rollout(self):
+        from .proposal_verification import supports_qwen3_prefix_cache
+
+        if supports_qwen3_prefix_cache(self._backend.hf_config):
+            from .sglang_backend.on_policy import SGLangOnPolicyTargetSession
+
+            return SGLangOnPolicyTargetSession(self)
+        return super().on_policy_rollout()
+
     def score_proposal_distribution(
         self,
         input_ids,
@@ -236,6 +251,14 @@ class HFDFlashTargetEngine(DFlashTargetEngine):
         if supports_qwen3_prefix_cache(self.model.config):
             return HFProposalVerificationSession(self)
         return super().proposal_verification()
+
+    def on_policy_rollout(self):
+        from .on_policy import HFOnPolicyTargetSession
+        from .proposal_verification import supports_qwen3_prefix_cache
+
+        if supports_qwen3_prefix_cache(self.model.config):
+            return HFOnPolicyTargetSession(self)
+        return super().on_policy_rollout()
 
     @torch.no_grad()
     def score_proposal_tokens(self, input_ids, attention_mask):

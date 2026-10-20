@@ -134,7 +134,7 @@ r_tilde_i(theta) = min(p_i(d_i), q_theta,i(d_i)) / stopgrad(q_old,i(d_i))
 采样分布变化的梯度。只对 `min(1,p/q_theta)` 反传或 detach
 前缀权重，都不能得到相同梯度。
 
-anchors 仍从监督区域选取。padding、序列尾部或监督 mask 的首个
+默认 `--tv-anchor-mode random` 时，anchors 仍从监督区域选取。padding、序列尾部或监督 mask 的首个
 无效位置限制该 anchor 的预测范围；实际采样的 EOS 计入当前位，
 其后不再计分。reference EOS 不替代 proposal EOS 判断。
 有效长度不足 7 时，loss 分母仍为 7；空 block 不参与均值。
@@ -191,7 +191,7 @@ loss 尺度与裁剪阈值是否合适，不改变 loss。全局梯度范数出�
 时会终止更新，保留模型参数、Adam 状态和学习率调度进度，避免写入坏权重。
 
 beta checkpoint 保存 `tv_prefix_mode=sampled-beta-v1`。切换 loss
-类型、前缀语义或温度不能直接恢复 optimizer；使用
+类型、前缀语义、anchor 模式或温度不能直接恢复 optimizer；使用
 `--init-draft-model-path` 和新的输出目录重新开始。分块和验证批量
 可以调整，但 beta 的分块变化可能改变随机数消费顺序，不保证逐步
 复现同一条采样轨迹。
@@ -214,6 +214,120 @@ SGLang 的 CPU 测试使用模拟分页 allocator 检查页隔离、int64 索引
 训练速度、显存峰值及实际解码收益仍需 GPU 实测。应使用相同模型、
 batch、anchors 和序列长度，对比旧模式与 beta 的完整 step 吞吐，
 并观察前缀命中率和分叉位置；当前不承诺接近旧模式速度。
+
+## DFlash2 beta：真实推理起点与完整 proposal replay
+
+原生 DFlash2 的 `tv-acceptance-beta` 可启用 `--tv-anchor-mode on-policy`。
+默认仍是 `random`，原 DSpark 和随机 anchor 实验不变。新模式要求
+原生 `DFlash2DraftModel`、8 个槽位（1 个 anchor + 7 个 proposal）、
+全注意力 Qwen3 target，以及 HF 或 SGLang backend；不支持 DSpark、
+原 `tv-acceptance` 或 native CE / D-PACE loss。
+
+设计参考 [Draft-OPD 论文的 rollout / replay](https://arxiv.org/html/2605.29343v3#S4.SS2)
+和[官方实现](https://github.com/Simplified-Reasoning/Draft-OPD)：使用真实
+verification 起点，并保留被拒绝的 draft block。本实现继续使用上述
+beta 接收长度目标；论文对 accepted / rejected tokens 分别使用的
+KL 与位置衰减不加入这里的 loss，以免改变已验证有效的 beta 梯度。
+
+使用已有 epoch-5 checkpoint 的服务器命令：
+
+```bash
+cd /ossfs/workspace/SpecForge
+bash examples/run_qwen3_8b_dflash2_tv_beta_on_policy.sh 8 flex_attention sglang
+```
+
+示例保留 batch 4、学习率 `2e-4`、warmup 0.04、梯度裁剪 1、
+最大长度 4096、512 轮上限、100 个数据处理进程、SGLang memory
+fraction 0.3，以及 W&B offline。默认输出目录在原实验名后增加
+`-onpolicy`；不会执行进程清理或自动覆盖旧实验。target、训练集、
+checkpoint、输出目录可分别通过 `TARGET_MODEL_PATH`、
+`TRAIN_DATA_PATH`、`INIT_DRAFT_MODEL_PATH`、`OUTPUT_DIR` 覆盖。
+`NUM_EPOCHS` 默认 1，`TV_ROLLOUT_MAX_TOKENS` 默认 256，
+`TV_TEMPERATURE` 默认 1.0；脚本末尾仍可追加 CLI 覆盖参数。
+
+```bash
+TV_ROLLOUT_MAX_TOKENS=64 OUTPUT_DIR=/path/to/onpolicy-smoke \
+bash examples/run_qwen3_8b_dflash2_tv_beta_on_policy.sh 8 flex_attention sglang \
+    --batch-size 1 --num-anchors 8 --max-steps 5 \
+    --log-interval 1 --save-interval 5
+```
+
+数据中的 reference response 不作为 rollout continuation：每条输入保留
+首个监督 token 之前的 prompt。frozen target 先从该 prompt 的下一词分布
+采样首个 response token，作为原生 DFlash 的首轮 anchor，再运行当前
+draft + frozen target 的真实随机 speculative decoding。下一轮 anchor 来自本轮
+实际提交的 accepted prefix 和 target correction / bonus，不再从
+reference response 随机抽位置。多轮对话样本使用首段 assistant
+response 之前的上下文，不把后面的 reference 对话当成在线生成结果。
+若输入从第 0 个 token 就开始监督（如无聊天 prompt 的连续文本），
+则保留第 0 个 token 作为必需的非空 prefix，其余内容丢弃。
+
+`--tv-rollout-max-tokens` 限制每个 prompt 新提交的 token 数，包含首个
+target seed 和之后的 correction / bonus；`--num-anchors` 在此模式下限制每个 prompt
+最多采集的 verification 轮数。`--max-length` 同时限制 prompt +
+新 continuation 的总长度。EOS、token 预算、总长度或轮数上限到达时
+停止采集，避免单个训练 step 随生成长度无界增长。默认 token 预算 256
+时，每条 prompt 最多还有 255 轮；`num-anchors=512` 是上限，不保证收集
+512 个 anchor。FSDP 各 rank 同步执行相同数量的 draft 轮次，已完成行
+只占空占位，因此长尾 prompt 会影响整个训练 step 的用时。
+
+proposal 使用 strict unary top-k selector 定义的真实分布 `q` 随机
+采样；target 使用全词表分布 `p`，两者共享 `--tv-temperature > 0`。
+接收概率为 `min(1, p(d)/q(d))`，首拒位置从归一化的
+`(p-q)_+` 采样 correction，全接受时从 target 采样 bonus。
+这里的温度同时用于 rollout、verification 和 loss replay；不是
+greedy proposal 配上未经变换的 softmax TV，也不叠加额外 top-p 截断。
+
+每一轮保留全部有效 proposal token、采样时的 `q_old` log probability
+及对应 target 的 candidate log probability，包括首拒 token 和拒绝后的未提交后缀。
+后缀继续为 beta 的单轮期望提供信号，但不加入实际 verified
+continuation。EOS 与预算仍可限制有效范围。loss 保持上文 beta
+公式，分母固定为 **7**，不按接受长度或首拒位置重归一化，也不改成
+first-reject-only。bonus 影响下一轮起点，不计入 beta 的单轮 reward。
+
+一次采集对应一次训练，rollout 与 replay 使用同版本参数、相同
+proposal 和 selector support；不存在跨 optimizer step 的旧 top-k
+replay buffer。target 始终冻结。其 verified prefix KV 和 draft 所需
+auxiliary hidden 在轮次间复用；draft 也增量缓存已提交上下文的 KV，
+每轮丢弃 noise block 的临时 KV。验证分支在回滚前保存 selector
+candidate IDs 对应的 `log p`，保留 **target 全词表 softmax 的归一化常数**，
+不会把 candidate 内的 target 概率重新归一化。replay 使用这些已保存的
+teacher 概率，不以 correction 后的分布替换 rejected-prefix 分布，
+也不重算 target 的词表投影；只重算 draft 及其 candidate logits/loss。
+target KV 在反向前释放，不重新抽样或运行 target Transformer。
+target prefill 之后，每轮只执行一次增量 verification：correction /
+bonus 暂存为 pending anchor，与下一轮 proposal 一起处理。SGLang
+共享完整 prefix KV 页；HF 虽然省去 prefix Transformer 重算，仍需
+复制和整理 prefix KV，因此两种后端的实际性能并不相同。
+
+无偏性仍限定于**给定 anchor 的单轮期望及其梯度**。真实 rollout
+改善了训练起点的访问分布，但本实现不对参数变化如何改变后续
+anchor 访问分布求梯度，因此不声称是整条生成轨迹吞吐的完整无偏
+梯度；接收长度和 wall-clock 加速仍需独立推理评估。
+
+checkpoint 保存并比较 `tv_anchor_mode`、温度；on-policy 还比较
+`tv_rollout_max_tokens`、`num_anchors` 和 `max_length`。random 与
+on-policy 不能互相 `--resume`，改变采集预算也不能直接恢复旧 optimizer。
+切换时使用 `--init-draft-model-path` 和新输出目录。缺少新字段的旧
+beta checkpoint 按 random 解释，仍可恢复原实验。词表 chunk 可在相同
+语义下调整。on-policy 每轮验证当前活跃 prompt batch，
+`--tv-verification-batch-size` 在此模式不生效；它仅控制 random-anchor
+beta 的候选验证批次。
+
+新增日志 `tv_rollout_accepted_length` 是采集过程实际每轮接受的
+proposal 数（不含 seed/correction/bonus），与估计量
+`tv_acceptance_length_estimate` 分开记录。`tv_rollout_rounds`、
+`tv_rollout_generated_tokens`、`tv_rollout_round_limit_count` 分别记录
+全局轮数、生成 token 数和因轮数上限仍未结束的行数。
+全局没有有效 block 时执行零梯度 backward，但跳过 Adam、weight
+decay 和学习率调度更新；数据步计数仍推进。
+
+本机验证包含候选集与全词表 beta 的数值及梯度等价性、精确残差
+采样、EOS/预算、真实 tiny Qwen3 的增量 KV 与整段计算等价性、
+draft 增量采样与 packed replay 概率一致、两 rank CPU FSDP，
+以及实际 trainer 保存和恢复。SGLang 使用 CPU 分页 allocator
+测试；Flex Attention mask 通过 CPU 等价计算检查，不替代 CUDA
+kernel、8 卡显存和吞吐测试。
 
 ## 原 tv-acceptance 模式
 

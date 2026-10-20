@@ -475,22 +475,36 @@ def test_native_masks_truncate_at_first_hole_and_empty_rank_participates():
 
 
 @pytest.mark.parametrize(
-    "objective,block_size", [("tv-acceptance-beta", 8), ("dflash2", 7), ("dpace", 7)]
+    "objective,block_size,anchor_mode,rollout_budget",
+    [
+        ("tv-acceptance-beta", 8, "random", 9),
+        ("tv-acceptance-beta", 8, "on-policy", 9),
+        ("tv-acceptance-beta", 8, "on-policy", 1),
+        ("dflash2", 7, "random", 9),
+        ("dpace", 7, "random", 9),
+    ],
 )
 def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
-    tmp_path, monkeypatch, objective, block_size
+    tmp_path, monkeypatch, objective, block_size, anchor_mode, rollout_budget
 ):
-    """Run the actual trainer/optimizer/checkpointer with a CPU capture fixture."""
+    """Run the real trainer/checkpointer, with a real HF target for on-policy."""
+    import copy
     import functools
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from transformers import Qwen3ForCausalLM
+
+    from specforge.inference.target_engine.dflash_target_model import (
+        HFDFlashTargetEngine,
+    )
     from specforge.legacy.dspark_training import setup, trainer
 
     config = tiny_config()
     config.eos_token_id = 14
     target_path = tmp_path / "target"
     config.save_pretrained(target_path)
-    draft_path = target_path / "config.json"
+    draft_path = tmp_path / "draft-config.json"
+    config.to_json_file(draft_path)
     if objective == "dpace":
         # Exercise the reported workflow: initialize from an existing native
         # block-8 checkpoint, train with block 7, then resume the new objective.
@@ -510,11 +524,51 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
             return output
 
     target = BF16Target(16)
+    captured_prefixes = []
+    if anchor_mode == "on-policy":
+        target_config = Qwen3Config(
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            head_dim=4,
+            max_position_embeddings=64,
+            vocab_size=16,
+            layer_types=["full_attention"] * 2,
+            # Keep both optimizer steps nonempty regardless of sampled tokens.
+            eos_token_id=None,
+        )
+        target_config._attn_implementation = "sdpa"
+        target_config.save_pretrained(target_path)
+        target_template = (
+            Qwen3ForCausalLM(target_config).bfloat16().eval().requires_grad_(False)
+        )
+
+    def build_target(**_kwargs):
+        nonlocal target
+        if anchor_mode == "on-policy":
+            # Each trainer run receives fresh modules with identical frozen
+            # weights, rather than modules already owned by an earlier FSDP.
+            target = HFDFlashTargetEngine(copy.deepcopy(target_template))
+
+            def record_prefill(_module, _args, kwargs):
+                if kwargs.get("past_key_values") is None:
+                    captured_prefixes.append(kwargs["input_ids"].detach().clone())
+
+            target.model.model.register_forward_pre_hook(
+                record_prefill, with_kwargs=True
+            )
+        return target
+
     ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    loss_mask = torch.ones_like(ids)
+    if anchor_mode == "on-policy":
+        loss_mask[:, :3] = 0
     batch = dict(
         input_ids=ids,
         attention_mask=torch.ones_like(ids),
-        loss_mask=torch.ones_like(ids),
+        loss_mask=loss_mask,
         sample_id=torch.tensor([0]),
         source_id=torch.tensor([0]),
     )
@@ -522,7 +576,7 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
     class Loader(list):
         sampler = SimpleNamespace(set_epoch=lambda epoch: None)
 
-    monkeypatch.setattr(setup, "get_dflash_target_model", lambda **kwargs: target)
+    monkeypatch.setattr(setup, "get_dflash_target_model", build_target)
     monkeypatch.setattr(trainer, "get_local_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(trainer, "get_dp_group", lambda: None)
     monkeypatch.setattr(trainer, "destroy_distributed", dist.destroy_process_group)
@@ -542,8 +596,16 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
         trainer.TargetEmbeddingsAndHead,
         "from_pretrained",
         lambda *args, **kwargs: SimpleNamespace(
-            lm_head=nn.Linear(16, 16, bias=False).bfloat16(),
-            embed_tokens=nn.Embedding(16, 16).bfloat16(),
+            lm_head=(
+                target.model.lm_head
+                if anchor_mode == "on-policy"
+                else nn.Linear(16, 16, bias=False).bfloat16()
+            ),
+            embed_tokens=(
+                target.model.model.embed_tokens
+                if anchor_mode == "on-policy"
+                else nn.Embedding(16, 16).bfloat16()
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -572,6 +634,14 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
             str(tmp_path / "output"),
             "--dspark-loss-type",
             objective,
+            "--tv-anchor-mode",
+            anchor_mode,
+            "--tv-rollout-max-tokens",
+            str(rollout_budget),
+            "--max-length",
+            "24",
+            "--target-model-backend",
+            "hf",
             "--dpace-alpha",
             "0.3",
             "--attention-backend",
@@ -616,6 +686,30 @@ def test_shared_trainer_native_dflash2_fsdp_step_save_and_resume(
         assert "dflash2_tv_beta" not in state
     else:
         assert state["dflash2_tv_beta"]["policy"] == "strict-topk-selector-beta-v1"
+    if anchor_mode == "on-policy":
+        assert len(captured_prefixes) == 2
+        for prefix in captured_prefixes:
+            torch.testing.assert_close(prefix, ids[:, :3])
+        assert state["args"]["tv_anchor_mode"] == "on-policy"
+        assert state["args"]["tv_rollout_max_tokens"] == rollout_budget
+        assert state["args"]["num_anchors"] == 2
+        assert state["args"]["max_length"] == 24
+        first_state = torch.load(
+            tmp_path / "output" / "epoch_0_step_1" / "training_state.pt",
+            weights_only=True,
+        )
+        for checkpoint, expected_step in ((first_state, 1), (state, 2)):
+            adam_states = checkpoint["optimizer_state_dict"]["state"]
+            if rollout_budget == 1:
+                assert not adam_states
+            else:
+                assert adam_states
+                assert {int(value["step"]) for value in adam_states.values()} == {
+                    expected_step
+                }
+        if rollout_budget == 1:
+            assert first_state["scheduler_state_dict"] == state["scheduler_state_dict"]
+        assert all(parameter.grad is None for parameter in target.model.parameters())
     restored = load_checkpoint_model(final)
     assert type(restored) is DFlash2DraftModel
     assert restored.block_size == block_size

@@ -61,6 +61,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     assert "--tv-temperature" in result.stdout
     assert "--sglang-mem-fraction-static" in result.stdout
     assert "--dpace-alpha" in result.stdout
+    assert "--tv-anchor-mode" in result.stdout
+    assert "--tv-rollout-max-tokens" in result.stdout
 
 
 def test_native_dpace_cli_defaults_and_override():
@@ -68,9 +70,7 @@ def test_native_dpace_cli_defaults_and_override():
     validate_objective_args(args)
     assert args.dpace_alpha == 0.5
     for alpha in (0.0, 0.25, 1.0):
-        args = training_args(
-            "--dspark-loss-type", "dpace", "--dpace-alpha", str(alpha)
-        )
+        args = training_args("--dspark-loss-type", "dpace", "--dpace-alpha", str(alpha))
         validate_objective_args(args)
         assert args.dpace_alpha == alpha
 
@@ -113,6 +113,8 @@ def test_training_cli_and_objective_defaults_remain_compatible():
     assert args.tv_objective_chunk_blocks == 8
     assert args.tv_verification_batch_size is None
     assert args.tv_prefix_mode == "teacher-forced"
+    assert args.tv_anchor_mode == "random"
+    assert args.tv_rollout_max_tokens == 256
 
 
 @pytest.mark.parametrize("flag", ["--tv-temperature", "--tv-sampling-temperature"])
@@ -213,6 +215,179 @@ def test_beta_cli_rejects_unsupported_options(flag, value, match):
     with pytest.raises(ValueError, match=match):
         validate_objective_args(
             training_args("--dspark-loss-type", "tv-acceptance-beta", flag, value)
+        )
+
+
+def on_policy_args(*extra):
+    return training_args(
+        "--dspark-loss-type",
+        "tv-acceptance-beta",
+        "--tv-anchor-mode",
+        "on-policy",
+        *extra,
+    )
+
+
+@pytest.mark.parametrize("backend", ["hf", "sglang"])
+def test_on_policy_cli_preserves_beta_and_limits_rollout(backend):
+    args = on_policy_args("--target-model-backend", backend)
+    validate_objective_args(args)
+    assert args.tv_prefix_mode == "sampled-beta-v1"
+    assert args.tv_sampling_temperature == 1.0
+    assert args.tv_rollout_max_tokens == 256
+    assert args.num_anchors == 512
+
+
+@pytest.mark.parametrize(
+    "flag,value,match",
+    [
+        ("--tv-rollout-max-tokens", "0", "rollout-max-tokens"),
+        ("--tv-rollout-max-tokens", "-1", "rollout-max-tokens"),
+        ("--num-anchors", "0", "num-anchors"),
+        ("--max-length", "1", "max-length"),
+        ("--dspark-loss-type", "dflash2", "tv-acceptance-beta"),
+        ("--dspark-loss-type", "tv-acceptance", "tv-acceptance-beta"),
+    ],
+)
+def test_on_policy_cli_rejects_invalid_scope_and_budget(flag, value, match):
+    with pytest.raises(ValueError, match=match):
+        validate_objective_args(on_policy_args(flag, value))
+
+
+@pytest.mark.parametrize("as_namespace", [False, True])
+def test_on_policy_resume_preserves_sampling_and_rollout_contract(as_namespace):
+    args = on_policy_args()
+    validate_objective_args(args)
+    saved = vars(args).copy()
+    wrap = argparse.Namespace if as_namespace else dict
+    validate_objective_resume(wrap(**saved), args)
+    for key, value in (
+        ("tv_anchor_mode", "random"),
+        ("tv_sampling_temperature", 0.7),
+        ("tv_rollout_max_tokens", 128),
+        ("num_anchors", 256),
+        ("max_length", 2048),
+    ):
+        with pytest.raises(ValueError, match=key):
+            validate_objective_resume(wrap(**{**saved, key: value}), args)
+    for key in ("tv_anchor_mode", "tv_rollout_max_tokens", "num_anchors", "max_length"):
+        incomplete = saved.copy()
+        incomplete.pop(key)
+        with pytest.raises(ValueError, match=key):
+            validate_objective_resume(wrap(**incomplete), args)
+    random = training_args("--dspark-loss-type", "tv-acceptance-beta")
+    validate_objective_args(random)
+    with pytest.raises(ValueError, match="tv_anchor_mode"):
+        validate_objective_resume(vars(args), random)
+
+
+def test_old_random_beta_checkpoint_remains_compatible():
+    args = training_args("--dspark-loss-type", "tv-acceptance-beta")
+    validate_objective_args(args)
+    saved = vars(args).copy()
+    saved.pop("tv_anchor_mode")
+    saved.pop("tv_rollout_max_tokens")
+    validate_objective_resume(saved, args)
+
+
+def test_on_policy_resume_allows_memory_tuning():
+    args = on_policy_args()
+    validate_objective_args(args)
+    validate_objective_resume(
+        {
+            **vars(args),
+            "tv_objective_chunk_blocks": 32,
+            "tv_verification_batch_size": 2,
+        },
+        args,
+    )
+
+
+def test_on_policy_rejects_dspark_before_loading_target():
+    from specforge.legacy.dspark_training.objective import configure_objective
+
+    model = SimpleNamespace(
+        draft_model=SimpleNamespace(
+            config=SimpleNamespace(architectures=["DSparkDraftModel"])
+        )
+    )
+    with pytest.raises(ValueError, match="native DFlash2"):
+        configure_objective(model, SimpleNamespace(eos_token_id=1), on_policy_args())
+
+
+@pytest.mark.parametrize(
+    "model_type,layer_type,supported",
+    [
+        ("qwen3", "full_attention", True),
+        ("qwen3", "sliding_attention", False),
+        ("llama", "full_attention", False),
+    ],
+)
+def test_on_policy_wiring_requires_full_attention_qwen3(
+    monkeypatch, model_type, layer_type, supported
+):
+    import transformers
+
+    from specforge.legacy.dspark_training.objective import configure_objective
+
+    target_config = SimpleNamespace(
+        model_type=model_type,
+        eos_token_id=[1, 2],
+        layer_types=[layer_type],
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *a, **k: target_config
+    )
+    monkeypatch.setattr("specforge.utils.print_on_rank0", lambda *args: None)
+    captured = {}
+    model = SimpleNamespace(
+        draft_model=SimpleNamespace(
+            config=SimpleNamespace(architectures=["DFlash2DraftModel"])
+        ),
+        configure_beta=lambda **kwargs: captured.update(kwargs),
+    )
+    args = on_policy_args("--max-length", "1024", "--tv-rollout-max-tokens", "128")
+    if not supported:
+        with pytest.raises(ValueError, match="full-attention Qwen3"):
+            configure_objective(model, SimpleNamespace(eos_token_id=1), args)
+        assert not captured
+        return
+    configure_objective(model, SimpleNamespace(eos_token_id=1), args)
+    assert captured == {
+        "temperature": 1.0,
+        "chunk_blocks": 8,
+        "eos_token_ids": [1, 2],
+        "verification_batch_size": None,
+        "anchor_mode": "on-policy",
+        "rollout_max_tokens": 128,
+        "max_sequence_length": 1024,
+    }
+
+
+def test_on_policy_dflash2_config_keeps_native_eight_slots():
+    from specforge.legacy.dspark_training.dflash2 import prepare_dflash2_config
+
+    def config(block_size):
+        return SimpleNamespace(
+            block_size=block_size,
+            dflash_config={
+                "block_size": block_size,
+                "conv_kernel_size": 2,
+                "conv_group_size": 16,
+                "selector_rank": 4,
+                "selector_top_k": 8,
+            },
+        )
+
+    args = on_policy_args()
+    draft_config = config(8)
+    prepare_dflash2_config(draft_config, args)
+    assert args.block_size == draft_config.block_size == 8
+    with pytest.raises(ValueError, match="block_size=8"):
+        prepare_dflash2_config(config(7), on_policy_args())
+    with pytest.raises(ValueError, match="tv-acceptance-beta"):
+        prepare_dflash2_config(
+            config(8), on_policy_args("--dspark-loss-type", "dflash2")
         )
 
 
@@ -369,3 +544,84 @@ def test_example_forwards_post_training_options_without_starting_training(
     if block_size == 8:
         assert args.dspark_loss_type == "tv-acceptance-beta"
         assert args.draft_config_path.endswith("qwen3-8b-dflash2.json")
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_on_policy_recipe_preserves_server_settings_without_starting_training(
+    tmp_path, override
+):
+    root = Path(__file__).resolve().parents[2]
+    executable = tmp_path / "torchrun"
+    executable.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    executable.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+    }
+    for name in (
+        "TARGET_MODEL_PATH",
+        "INIT_DRAFT_MODEL_PATH",
+        "TRAIN_DATA_PATH",
+        "OUTPUT_DIR",
+        "NUM_EPOCHS",
+        "TV_ROLLOUT_MAX_TOKENS",
+        "TV_TEMPERATURE",
+        "SPECFORGE_DATA_NUM_PROC",
+    ):
+        environment.pop(name, None)
+    if override:
+        environment.update(
+            TARGET_MODEL_PATH="/target with spaces; literal",
+            INIT_DRAFT_MODEL_PATH="/checkpoint with spaces",
+            TRAIN_DATA_PATH="/dataset with spaces.jsonl",
+            OUTPUT_DIR="/output with spaces",
+            TV_ROLLOUT_MAX_TOKENS="64",
+        )
+    result = subprocess.run(
+        ["bash", "examples/run_qwen3_8b_dflash2_tv_beta_on_policy.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    forwarded = result.stdout.splitlines()
+    assert forwarded[:4] == [
+        "--standalone",
+        "--nproc_per_node",
+        "8",
+        "scripts/train_dspark.py",
+    ]
+    args = parse_args(forwarded[4:])
+    validate_objective_args(args)
+    expected = {
+        "dspark_loss_type": "tv-acceptance-beta",
+        "tv_anchor_mode": "on-policy",
+        "tv_rollout_max_tokens": 64 if override else 256,
+        "batch_size": 4,
+        "learning_rate": 2e-4,
+        "warmup_ratio": 0.04,
+        "max_grad_norm": 1.0,
+        "max_length": 4096,
+        "block_size": 8,
+        "num_anchors": 512,
+        "build_dataset_num_proc": 100,
+        "sglang_mem_fraction_static": 0.3,
+        "attention_backend": "flex_attention",
+        "target_model_backend": "sglang",
+        "report_to": "wandb",
+        "wandb_offline": True,
+        "save_interval": 1000,
+        "log_interval": 10,
+    }
+    for name, value in expected.items():
+        assert getattr(args, name) == value
+    if override:
+        assert args.target_model_path == "/target with spaces; literal"
+        assert args.init_draft_model_path == "/checkpoint with spaces"
+        assert args.train_data_path == "/dataset with spaces.jsonl"
+        assert args.output_dir == "/output with spaces"
+    else:
+        assert args.init_draft_model_path.endswith("/epoch_5_step_322000")
+        assert args.output_dir.endswith("-onpolicy")
+        assert args.train_data_path.endswith("_20260929_regenerate_nothink.jsonl")

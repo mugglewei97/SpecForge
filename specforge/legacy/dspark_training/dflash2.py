@@ -5,6 +5,10 @@ from .objective import DFLASH2_NATIVE_OBJECTIVES
 
 def prepare_dflash2_config(config, args):
     native = args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES
+    if getattr(args, "tv_anchor_mode", "random") == "on-policy" and native:
+        raise ValueError(
+            "On-policy DFlash2 anchors require --dspark-loss-type tv-acceptance-beta"
+        )
     if not native and args.dspark_loss_type != "tv-acceptance-beta":
         raise ValueError(
             "DFlash2 requires --dspark-loss-type dflash2, dpace or tv-acceptance-beta"
@@ -26,9 +30,7 @@ def prepare_dflash2_config(config, args):
             "DFlash2 tv-acceptance-beta requires block_size=8 (anchor + 7 proposals)"
         )
     if method.get("shift_label", False) or method.get("pure_draft_prefix_len", 0):
-        raise ValueError(
-            "DFlash2 requires the native same-position anchor layout"
-        )
+        raise ValueError("DFlash2 requires the native same-position anchor layout")
     # These are architecture switches shared with the legacy CLI, but DFlash2
     # stores them together in dflash_config, not in DSpark's top-level fields.
     for name in (

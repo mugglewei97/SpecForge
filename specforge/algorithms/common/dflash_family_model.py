@@ -700,16 +700,34 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        *,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len,
-            loss_mask,
-            device,
-            max_valid_anchors=max_valid_anchors,
-        )
+        if anchor_positions is None:
+            if block_keep_mask is not None:
+                raise ValueError("Explicit block mask requires explicit anchors")
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len,
+                loss_mask,
+                device,
+                max_valid_anchors=max_valid_anchors,
+            )
+        elif (
+            anchor_positions.ndim != 2
+            or anchor_positions.shape[0] != bsz
+            or block_keep_mask is None
+            or block_keep_mask.shape != anchor_positions.shape
+            or anchor_positions.dtype != torch.long
+            or block_keep_mask.dtype != torch.bool
+            or anchor_positions.device != device
+            or block_keep_mask.device != device
+            or ((anchor_positions < 0) | (anchor_positions >= seq_len)).any()
+        ):
+            raise ValueError("Explicit draft anchors and keep mask are misaligned")
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask

@@ -148,6 +148,21 @@ def _forward_dspark_data_batch(
     if args.multi_teacher_oracle_export_dir or args.multi_teacher_oracle_cache:
         torch.manual_seed(rollout_seed)
     beta = getattr(args, "dspark_loss_type", "ce-l1") == "tv-acceptance-beta"
+    if beta and getattr(args, "tv_anchor_mode", "random") == "on-policy":
+        if args.step_seeded_rollouts:
+            torch.manual_seed(rollout_seed)
+        # The model extracts prompts before target prefill. The original
+        # responses are never exposed as rollout context or teacher labels.
+        with target_model.on_policy_rollout() as session:
+            return dspark_model(
+                input_ids=input_ids,
+                hidden_states=None,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                sample_ids=sample_ids,
+                source_ids=source_ids,
+                tv_on_policy_session=session,
+            )
     if beta:
         session_context = target_model.proposal_verification()
     else:
@@ -1407,7 +1422,17 @@ def run_training(args):
                     )
 
             if netprefix_runtime is None and global_step % args.accumulation_steps == 0:
-                optimizer.step()
+                if (
+                    getattr(args, "tv_anchor_mode", "random") == "on-policy"
+                    and loss_components["tv_valid_blocks"].item() == 0
+                ):
+                    # All prompts may terminate at their first target token.
+                    # Complete the zero backward for FSDP, but do not change
+                    # Adam moments, weight decay or the optimizer scheduler.
+                    dspark_model.zero_grad(set_to_none=True)
+                    optimizer.optimizer.zero_grad(set_to_none=True)
+                else:
+                    optimizer.step()
 
             if global_step % args.log_interval == 0:
                 # Average over the DP group (not the full world, which includes

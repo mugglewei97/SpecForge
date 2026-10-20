@@ -7,6 +7,8 @@ OBJECTIVE_DEFAULTS = {
     "dspark_loss_type": "ce-l1",
     "tv_sampling_temperature": 1.0,
     "tv_objective_chunk_blocks": 8,
+    "tv_anchor_mode": "random",
+    "tv_rollout_max_tokens": 256,
 }
 TV_PREFIX_MODE = "teacher-forced"
 TV_BETA_PREFIX_MODE = "sampled-beta-v1"
@@ -30,6 +32,18 @@ def add_objective_args(group):
         help="Probability smoothing floor for native DFlash2 --dspark-loss-type dpace, in [0, 1].",
     )
     group.add_argument(
+        "--tv-anchor-mode",
+        choices=["random", "on-policy"],
+        default=OBJECTIVE_DEFAULTS["tv_anchor_mode"],
+        help="Beta anchor selection: random supervised positions, or actual speculative rollout round starts (DFlash2 only).",
+    )
+    group.add_argument(
+        "--tv-rollout-max-tokens",
+        type=int,
+        default=OBJECTIVE_DEFAULTS["tv_rollout_max_tokens"],
+        help="On-policy beta: maximum new committed tokens per prompt; --num-anchors also caps rollout rounds per prompt.",
+    )
+    group.add_argument(
         "--tv-temperature",
         "--tv-sampling-temperature",
         dest="tv_sampling_temperature",
@@ -47,11 +61,28 @@ def add_objective_args(group):
         "--tv-verification-batch-size",
         type=int,
         default=None,
-        help="Beta candidate verification batch size (default: 64 with SGLang prefix KV, 4 otherwise); ignored by teacher-forced TV.",
+        help="Random-anchor beta verification batch size (default: 64 with SGLang prefix KV, 4 otherwise); ignored by teacher-forced TV and on-policy beta.",
     )
 
 
 def validate_objective_args(args):
+    if args.tv_rollout_max_tokens < 1:
+        raise ValueError("--tv-rollout-max-tokens must be positive")
+    if args.tv_anchor_mode == "on-policy":
+        if args.dspark_loss_type != "tv-acceptance-beta":
+            raise ValueError("--tv-anchor-mode on-policy requires tv-acceptance-beta")
+        if args.num_anchors < 1:
+            raise ValueError(
+                "On-policy --num-anchors must be a positive rollout-round limit"
+            )
+        if args.max_length < 2:
+            raise ValueError(
+                "On-policy --max-length must leave room for a prefix and generation"
+            )
+        if args.target_model_backend not in ("hf", "sglang"):
+            raise ValueError(
+                "On-policy TV beta requires the HF or SGLang target backend"
+            )
     if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
         if args.pace_mode != "none":
             raise ValueError(
@@ -119,9 +150,14 @@ def validate_objective_resume(saved_args, args):
         )
     # Memory knobs do not change the objective and may be retuned. Beta chunk
     # size can change RNG ordering, so this does not promise bitwise replay.
-    for name in ("dspark_loss_type", "tv_sampling_temperature"):
-        default = OBJECTIVE_DEFAULTS[name]
-        if saved.get(name, default) != getattr(args, name):
+    invariants = ["dspark_loss_type", "tv_sampling_temperature", "tv_anchor_mode"]
+    if args.tv_anchor_mode == "on-policy":
+        invariants.extend(("tv_rollout_max_tokens", "num_anchors", "max_length"))
+    for name in invariants:
+        default = OBJECTIVE_DEFAULTS.get(name)
+        if (args.tv_anchor_mode == "on-policy" and name not in saved) or saved.get(
+            name, default
+        ) != getattr(args, name):
             raise ValueError(
                 f"Cannot resume with changed {name}; "
                 "use --init-draft-model-path for a new objective"
@@ -140,6 +176,14 @@ def configure_objective(model, tokenizer, args):
         return
     if args.dspark_loss_type not in TV_OBJECTIVES:
         return
+    from .config import is_dflash2_config
+
+    is_dflash2 = is_dflash2_config(model.draft_model.config)
+    if args.tv_anchor_mode == "on-policy" and not is_dflash2:
+        raise ValueError(
+            "--tv-anchor-mode on-policy requires a native DFlash2 draft; "
+            "DSpark is unsupported"
+        )
     from transformers import AutoConfig
 
     from specforge.core.tv_acceptance import configure_tv_acceptance
@@ -148,14 +192,21 @@ def configure_objective(model, tokenizer, args):
     config = AutoConfig.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
+    if args.tv_anchor_mode == "on-policy":
+        from specforge.inference.target_engine.proposal_verification import (
+            supports_qwen3_prefix_cache,
+        )
+
+        if not supports_qwen3_prefix_cache(config):
+            raise ValueError(
+                "On-policy TV beta currently requires a full-attention Qwen3 target"
+            )
     eos_ids = getattr(config, "eos_token_id", tokenizer.eos_token_id)
     if eos_ids is None:
         eos_ids = ()
     elif isinstance(eos_ids, int):
         eos_ids = (eos_ids,)
-    from .config import is_dflash2_config
-
-    if is_dflash2_config(model.draft_model.config):
+    if is_dflash2:
         if args.dspark_loss_type != "tv-acceptance-beta":
             raise ValueError("DFlash2 requires tv-acceptance-beta in this entrypoint")
         model.configure_beta(
@@ -163,11 +214,27 @@ def configure_objective(model, tokenizer, args):
             chunk_blocks=args.tv_objective_chunk_blocks,
             eos_token_ids=eos_ids,
             verification_batch_size=args.tv_verification_batch_size,
+            anchor_mode=args.tv_anchor_mode,
+            rollout_max_tokens=args.tv_rollout_max_tokens,
+            max_sequence_length=args.max_length,
         )
         print_on_rank0(
             "DFlash2 TV beta: 8 native slots, 7 proposals; strict unary top-k "
             "selector sampling/replay, full-vocabulary target normalization."
         )
+        if args.tv_anchor_mode == "on-policy":
+            print_on_rank0(
+                "On-policy anchors: actual sampled speculative round starts; "
+                f"at most {args.tv_rollout_max_tokens} new tokens and "
+                f"{args.num_anchors} rounds per prompt. Replay retains rejected "
+                "proposal suffixes; fixed denominator 7. Conditional single-round "
+                "gradient only; no gradient through the anchor visitation distribution."
+            )
+            if args.tv_verification_batch_size is not None:
+                print_on_rank0(
+                    "--tv-verification-batch-size is ignored by on-policy beta: "
+                    "each round verifies its active prompt batch."
+                )
         return
     configure_tv_acceptance(
         model,
