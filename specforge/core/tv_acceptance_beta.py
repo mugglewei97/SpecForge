@@ -20,6 +20,7 @@ class ProposalRollout(NamedTuple):
     log_probs: torch.Tensor
     previous: torch.Tensor
     valid: torch.Tensor
+    probabilities: torch.Tensor | None = None
 
 
 def tv_acceptance_beta_terms(
@@ -87,13 +88,22 @@ def _proposal_logits(model, hidden, previous):
 
 
 @torch.no_grad()
-def sample_beta_proposals(model, hidden, anchor_tokens, valid):
+def sample_beta_proposals(model, hidden, anchor_tokens, valid, *, retain_probs=False):
     """Sample autoregressive Markov predecessors from the SAME backbone states."""
     count, width, _ = hidden.shape
     tokens = torch.zeros_like(valid, dtype=torch.long)
     previous = torch.zeros_like(tokens)
     dtype = torch.float64 if hidden.dtype == torch.float64 else torch.float32
     old_log_probs = torch.zeros(valid.shape, device=hidden.device, dtype=dtype)
+    probabilities = (
+        torch.empty(
+            (*valid.shape, model.lm_head.weight.size(0)),
+            device=hidden.device,
+            dtype=dtype,
+        )
+        if retain_probs
+        else None
+    )
     valid = valid.bool().int().cumprod(-1).bool().clone()
     chunk = model.tv_objective_chunk_blocks
     for start in range(0, count, chunk):
@@ -111,7 +121,10 @@ def sample_beta_proposals(model, hidden, anchor_tokens, valid):
             active = valid[start:end, depth]
             logits = torch.where(active[:, None], logits.to(dtype), 0.0)
             log_q = torch.log_softmax(logits / model.tv_temperature, -1)
-            sampled = torch.multinomial(log_q.exp(), 1).squeeze(-1)
+            probs = log_q.exp()
+            if probabilities is not None:
+                probabilities[start:end, depth] = probs
+            sampled = torch.multinomial(probs, 1).squeeze(-1)
             tokens[start:end, depth] = sampled
             old_log_probs[start:end, depth] = log_q.gather(
                 -1, sampled[:, None]
@@ -122,7 +135,7 @@ def sample_beta_proposals(model, hidden, anchor_tokens, valid):
                     eos |= sampled == token_id
                 valid[start:end, depth + 1 :] &= (~eos & active)[:, None]
             prev = sampled
-    return ProposalRollout(tokens, old_log_probs, previous, valid)
+    return ProposalRollout(tokens, old_log_probs, previous, valid, probabilities)
 
 
 @torch.no_grad()

@@ -215,13 +215,103 @@ SGLang 的 CPU 测试使用模拟分页 allocator 检查页隔离、int64 索引
 batch、anchors 和序列长度，对比旧模式与 beta 的完整 step 吞吐，
 并观察前缀命中率和分叉位置；当前不承诺接近旧模式速度。
 
+## DSpark beta：真实推理起点与完整 proposal replay
+
+DSpark 的 `tv-acceptance-beta` 现在可启用 `--tv-anchor-mode on-policy`。
+默认仍为 `random`。新模式保留原 DSpark checkpoint 的 **7 个 proposal**
+布局、全词表 softmax、vanilla Markov head、无 Markov head，或前文的
+单前驱无状态 CARH 及兼容卷积。不能把原 DSpark checkpoint 换成
+DFlash2 的 8 槽位配置；selector、refiner、有状态 CARH 等未支持的
+组合仍会报错。target 必须是全注意力 Qwen3，backend 为 HF 或 SGLang，
+draft 使用 `--attention-backend sdpa` 或 `flex_attention`，并要求全注意力、
+零 attention/fusion/mixer dropout。DSpark on-policy 不支持 `eager` 或
+`flash_attention_2`；当前只为上述两种 backend 提供增量 rollout
+与 packed replay 一致的 mask 路径，其他 backend 会明确报错。
+
+使用与原 DSpark checkpoint 匹配的 target、tokenizer 和 reference JSONL：
+
+```bash
+TARGET_MODEL_PATH=/path/to/original-target \
+INIT_DRAFT_MODEL_PATH=/path/to/original-dspark-checkpoint \
+TRAIN_DATA_PATH=/path/to/train.jsonl \
+OUTPUT_DIR=/path/to/new-dspark-tv-beta-onpolicy \
+bash examples/run_qwen3_8b_dspark_tv_beta_on_policy.sh 8 flex_attention sglang
+```
+
+前三个环境变量必须显式提供。脚本从 checkpoint 读取完整模型配置，
+新建 optimizer/scheduler；默认模板为 `qwen3-instruct`，适合对应的
+Qwen3 non-thinking 数据。每卡 batch 4、8 卡时每次更新采集 32 条输入；
+学习率为 `2e-4`、warmup 0.04、最大总长度 4096、每条最多 512 轮、
+新 token 预算默认 256。通过 `TV_ROLLOUT_MAX_TOKENS=4096` 可扩大预算，
+实际生成上限仍是 `min(预算, 4096 - prompt 长度)`，并受 EOS 和轮数上限限制。
+新 token 预算包含首个 target seed、接受的 proposal 以及 correction / bonus。
+`--num-anchors 512` 表示到第 512 轮即停止生成，**不做 reservoir sampling**，
+也不保证生成到 token 预算耗尽。
+
+先用较小 batch 和轮数验证服务器环境：
+
+```bash
+TARGET_MODEL_PATH=/path/to/original-target \
+INIT_DRAFT_MODEL_PATH=/path/to/original-dspark-checkpoint \
+TRAIN_DATA_PATH=/path/to/train.jsonl \
+OUTPUT_DIR=/path/to/new-dspark-tv-beta-smoke \
+TV_ROLLOUT_MAX_TOKENS=64 \
+bash examples/run_qwen3_8b_dspark_tv_beta_on_policy.sh 8 flex_attention sglang \
+    --batch-size 1 --num-anchors 8 \
+    --stop-after-steps 5 --log-interval 1 --save-interval 5
+```
+
+在线闭环为：从 reference 中提取首个监督 token 前的 prompt → frozen
+target 采样首 token 作为 root → 当前 draft 生成真实 proposal →
+target 验证、接受前缀并采样 correction / bonus → 保存各轮记录 →
+同一个 draft 实例 replay / backward → 一次 optimizer step。
+proposal 与 replay 使用同版本的全部 draft 参数，包括 Markov/CARH 和卷积；
+没有外部 draft 服务副本，因此不需要额外权重传输和版本 ACK。
+FSDP 使各 rank 同步执行轮次和更新，replay、draft cache 和 target session
+均不跨 optimizer step；每批只训练一次。
+
+每轮保留原 proposal、实际前驱 `[root,d1,...]`、采样时的 `log q_old`、
+真实验证前缀上的 teacher final hidden 和 anchor。首拒 token 以及未提交的
+proposal suffix 仍参与 beta loss；backbone 输入只使用合法已提交上下文，
+不把 correction 后的序列冒充原 proposal 前缀。target Transformer 的
+verification 结果直接复用，不在 backward 重新采集。DSpark replay
+从保存的 teacher hidden 计算全词表 target 分布，draft 与 target
+共享 `--tv-temperature`，不添加 top-k/top-p 截断。
+
+目标保持前文 beta 公式：只 detach `q_old` 分母，prefix survival 保留梯度，
+EOS 本身计入有效位置，固定除以 7；各 rank 按整步有效 block 总数归一化。
+因此仍要求 `--tp-size 1 --accumulation-steps 1 --micro-batch-size 0`。
+无偏性限于给定 round 起点和预算下的单轮目标，不包含后续 anchor
+访问分布变化的梯度。是否提高实际接收长度，需在相同部署采样设置下单独评估。
+
+`tv_rollout_accepted_length` 记录实际每轮接受的 proposal 数，
+`tv_acceptance_length_estimate` 记录 beta 估计量，
+`tv_rollout_round_limit_count` 记录因轮数上限而提前结束的行数。
+扩大到 4096 预算会增加逐轮 target 验证和 FSDP 等待；
+`--tv-objective-chunk-blocks 8` 只限制 logits/loss 分块，
+不会把全部 packed backbone 激活限制为 8 个 block。长轨迹显存和吞吐需 GPU 实测。
+
+reference completion 不参与 rollout，但当前 loader 仍根据 reference
+的 `loss_mask` 识别 prompt，并过滤掉监督 token 少于 `2 * block_size`
+的样本；不能直接用没有监督边界的纯 prompt JSONL 替换输入。
+随机 anchor 切换到 on-policy，或改变 token/轮数/总长度预算时，
+应使用 `--init-draft-model-path` 和新输出目录，不能直接恢复旧 optimizer。
+脚本本身是 warm start 入口，不应再追加 `--resume`。
+恢复同一次 on-policy 实验时，直接用 `scripts/train_dspark.py` 的原始训练参数，
+移除 `--init-draft-model-path` 并添加 `--resume`，保持原 `--output-dir`、
+数据、模板、batch、训练调度及采集预算；如从 pilot 恢复，应移除或提高
+`--stop-after-steps`。改过 batch 或采集预算的 smoke run 应作为独立实验，
+正式运行使用新输出目录重新 warm start。
+重复启动同一输出目录可能覆盖同名 checkpoint；长 rollout 实验可缩短
+`--save-interval`，避免依赖正常结束时的最终保存。
+
 ## DFlash2 beta：真实推理起点与完整 proposal replay
 
 原生 DFlash2 的 `tv-acceptance-beta` 可启用 `--tv-anchor-mode on-policy`。
-默认仍是 `random`，原 DSpark 和随机 anchor 实验不变。新模式要求
+默认仍是 `random`，随机 anchor 实验不变。原生 DFlash2 路径要求
 原生 `DFlash2DraftModel`、8 个槽位（1 个 anchor + 7 个 proposal）、
-全注意力 Qwen3 target，以及 HF 或 SGLang backend；不支持 DSpark、
-原 `tv-acceptance` 或 native CE / D-PACE loss。
+全注意力 Qwen3 target，以及 HF 或 SGLang backend；DSpark 使用前述独立路径，
+原 `tv-acceptance` 或 native CE / D-PACE loss 不支持此模式。
 
 设计参考 [Draft-OPD 论文的 rollout / replay](https://arxiv.org/html/2605.29343v3#S4.SS2)
 和[官方实现](https://github.com/Simplified-Reasoning/Draft-OPD)：使用真实
@@ -239,7 +329,7 @@ bash examples/run_qwen3_8b_dflash2_tv_beta_on_policy.sh 8 flex_attention sglang
 示例保留 batch 4、学习率 `2e-4`、warmup 0.04、梯度裁剪 1、
 最大长度 4096、512 轮上限、100 个数据处理进程、SGLang memory
 fraction 0.3，以及 W&B offline。默认输出目录在原实验名后增加
-`-onpolicy`；不会执行进程清理或自动覆盖旧实验。target、训练集、
+`-onpolicy`；应使用新目录，重复启动可能覆盖同名 checkpoint。target、训练集、
 checkpoint、输出目录可分别通过 `TARGET_MODEL_PATH`、
 `TRAIN_DATA_PATH`、`INIT_DRAFT_MODEL_PATH`、`OUTPUT_DIR` 覆盖。
 `NUM_EPOCHS` 默认 1，`TV_ROLLOUT_MAX_TOKENS` 默认 256，

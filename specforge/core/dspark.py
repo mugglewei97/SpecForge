@@ -5882,6 +5882,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         sample_ids: Optional[torch.Tensor] = None,
         source_ids: Optional[torch.Tensor] = None,
         tv_verification_session=None,
+        tv_on_policy_session=None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -5918,6 +5919,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
         paired_projective = self._elastic_pair_enabled()
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
+        if getattr(self, "tv_anchor_mode", "random") == "on-policy":
+            from specforge.core.dspark_on_policy import on_policy_dspark_forward
+
+            if tv_on_policy_session is None:
+                raise ValueError("On-policy beta requires a target rollout session")
+            return on_policy_dspark_forward(
+                self, input_ids, attention_mask, loss_mask, tv_on_policy_session
+            )
 
         # ---- DFlash backbone (identical construction to OnlineDFlashModel.forward) ----
         if getattr(self, "tv_acceptance_enabled", False):

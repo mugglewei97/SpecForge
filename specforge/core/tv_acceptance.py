@@ -228,6 +228,9 @@ def configure_tv_acceptance(
     eos_token_ids,
     beta=False,
     verification_batch_size=None,
+    anchor_mode="random",
+    rollout_max_tokens=256,
+    max_sequence_length=4096,
 ):
     """Enable the pure objective before FSDP/optimizer creation.
 
@@ -245,6 +248,31 @@ def configure_tv_acceptance(
         raise ValueError("tv-acceptance-beta requires actual model block_size=7")
     if beta and verification_batch_size is not None and verification_batch_size < 1:
         raise ValueError("TV beta verification batch size must be positive")
+    if anchor_mode not in ("random", "on-policy"):
+        raise ValueError("Unknown TV beta anchor mode")
+    if anchor_mode == "on-policy":
+        if not beta:
+            raise ValueError("On-policy anchors require tv-acceptance-beta")
+        if model.attention_backend not in ("sdpa", "flex_attention"):
+            raise ValueError("On-policy DSpark beta requires sdpa or flex_attention")
+        if rollout_max_tokens < 1 or max_sequence_length < 2 or model.num_anchors < 1:
+            raise ValueError(
+                "On-policy rollout, sequence and anchor budgets must be positive"
+            )
+        method = getattr(draft.config, "dflash_config", None) or {}
+        if (
+            getattr(draft.config, "attention_dropout", 0.0) != 0.0
+            or getattr(draft, "target_layer_fusion_source_dropout", 0.0) != 0.0
+            or method.get("cross_depth_mixer_dropout", 0.0) != 0.0
+            or any(
+                getattr(layer.self_attn, "sliding_window", None) is not None
+                for layer in draft.layers
+            )
+        ):
+            raise ValueError(
+                "On-policy DSpark beta requires zero attention/fusion/mixer dropout "
+                "and full attention"
+            )
     head = draft.markov_head
     head_type = getattr(head, "markov_head_type", "vanilla")
     if head is not None and beta and head_type == "carh":
@@ -283,3 +311,6 @@ def configure_tv_acceptance(
     model.tv_acceptance_enabled = True
     model.tv_acceptance_beta = bool(beta)
     model.tv_verification_batch_size = verification_batch_size
+    model.tv_anchor_mode = anchor_mode
+    model.tv_rollout_max_tokens = int(rollout_max_tokens)
+    model.tv_max_sequence_length = int(max_sequence_length)

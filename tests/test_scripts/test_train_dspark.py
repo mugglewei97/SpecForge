@@ -303,18 +303,7 @@ def test_on_policy_resume_allows_memory_tuning():
     )
 
 
-def test_on_policy_rejects_dspark_before_loading_target():
-    from specforge.legacy.dspark_training.objective import configure_objective
-
-    model = SimpleNamespace(
-        draft_model=SimpleNamespace(
-            config=SimpleNamespace(architectures=["DSparkDraftModel"])
-        )
-    )
-    with pytest.raises(ValueError, match="native DFlash2"):
-        configure_objective(model, SimpleNamespace(eos_token_id=1), on_policy_args())
-
-
+@pytest.mark.parametrize("architecture", ["DSparkDraftModel", "DFlash2DraftModel"])
 @pytest.mark.parametrize(
     "model_type,layer_type,supported",
     [
@@ -324,7 +313,7 @@ def test_on_policy_rejects_dspark_before_loading_target():
     ],
 )
 def test_on_policy_wiring_requires_full_attention_qwen3(
-    monkeypatch, model_type, layer_type, supported
+    monkeypatch, architecture, model_type, layer_type, supported
 ):
     import transformers
 
@@ -342,9 +331,17 @@ def test_on_policy_wiring_requires_full_attention_qwen3(
     captured = {}
     model = SimpleNamespace(
         draft_model=SimpleNamespace(
-            config=SimpleNamespace(architectures=["DFlash2DraftModel"])
+            config=SimpleNamespace(architectures=[architecture])
         ),
         configure_beta=lambda **kwargs: captured.update(kwargs),
+    )
+
+    def configure_dspark(actual_model, **kwargs):
+        assert actual_model is model
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "specforge.core.tv_acceptance.configure_tv_acceptance", configure_dspark
     )
     args = on_policy_args("--max-length", "1024", "--tv-rollout-max-tokens", "128")
     if not supported:
@@ -353,7 +350,7 @@ def test_on_policy_wiring_requires_full_attention_qwen3(
         assert not captured
         return
     configure_objective(model, SimpleNamespace(eos_token_id=1), args)
-    assert captured == {
+    expected = {
         "temperature": 1.0,
         "chunk_blocks": 8,
         "eos_token_ids": [1, 2],
@@ -362,6 +359,9 @@ def test_on_policy_wiring_requires_full_attention_qwen3(
         "rollout_max_tokens": 128,
         "max_sequence_length": 1024,
     }
+    if architecture == "DSparkDraftModel":
+        expected["beta"] = True
+    assert captured == expected
 
 
 def test_on_policy_dflash2_config_keeps_native_eight_slots():
@@ -625,3 +625,87 @@ def test_on_policy_recipe_preserves_server_settings_without_starting_training(
         assert args.init_draft_model_path.endswith("/epoch_5_step_322000")
         assert args.output_dir.endswith("-onpolicy")
         assert args.train_data_path.endswith("_20260929_regenerate_nothink.jsonl")
+
+
+@pytest.mark.parametrize("rollout_budget", [None, "4096"])
+def test_dspark_on_policy_recipe_forwards_checkpoint_and_rollout_budget(
+    tmp_path, rollout_budget
+):
+    root = Path(__file__).resolve().parents[2]
+    executable = tmp_path / "torchrun"
+    executable.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    executable.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "TARGET_MODEL_PATH": "/target with spaces; literal",
+        "INIT_DRAFT_MODEL_PATH": "/original DSpark checkpoint",
+        "TRAIN_DATA_PATH": "/training data.jsonl",
+        "OUTPUT_DIR": "/new on-policy output",
+    }
+    for name in ("TV_ROLLOUT_MAX_TOKENS", "TV_TEMPERATURE", "NUM_EPOCHS"):
+        environment.pop(name, None)
+    if rollout_budget is not None:
+        environment["TV_ROLLOUT_MAX_TOKENS"] = rollout_budget
+    result = subprocess.run(
+        [
+            "bash",
+            "examples/run_qwen3_8b_dspark_tv_beta_on_policy.sh",
+            "8",
+            "sdpa",
+            "hf",
+            "--batch-size",
+            "2",
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    forwarded = result.stdout.splitlines()
+    assert forwarded[:4] == [
+        "--standalone",
+        "--nproc_per_node",
+        "8",
+        "scripts/train_dspark.py",
+    ]
+    args = parse_args(forwarded[4:])
+    validate_objective_args(args)
+    assert args.dspark_loss_type == "tv-acceptance-beta"
+    assert args.tv_anchor_mode == "on-policy"
+    assert args.tv_rollout_max_tokens == int(rollout_budget or "256")
+    assert args.max_length == 4096 and args.num_anchors == 512
+    assert args.block_size == 7 and args.batch_size == 2
+    assert args.chat_template == "qwen3-instruct"
+    assert args.attention_backend == "sdpa" and args.target_model_backend == "hf"
+    assert args.draft_config_path is None
+    assert args.target_model_path == environment["TARGET_MODEL_PATH"]
+    assert args.init_draft_model_path == environment["INIT_DRAFT_MODEL_PATH"]
+    assert args.train_data_path == environment["TRAIN_DATA_PATH"]
+    assert args.output_dir == environment["OUTPUT_DIR"]
+    assert not args.resume
+
+
+def test_dspark_on_policy_recipe_requires_original_checkpoint(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    executable = tmp_path / "torchrun"
+    executable.write_text('#!/bin/sh\nprintf "unexpected launch\\n"\n')
+    executable.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "TARGET_MODEL_PATH": "/target",
+        "TRAIN_DATA_PATH": "/training.jsonl",
+    }
+    environment.pop("INIT_DRAFT_MODEL_PATH", None)
+    result = subprocess.run(
+        ["bash", "examples/run_qwen3_8b_dspark_tv_beta_on_policy.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "Set INIT_DRAFT_MODEL_PATH to the original DSpark checkpoint" in result.stderr
+    assert "unexpected launch" not in result.stdout

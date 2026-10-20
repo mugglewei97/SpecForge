@@ -35,7 +35,7 @@ def add_objective_args(group):
         "--tv-anchor-mode",
         choices=["random", "on-policy"],
         default=OBJECTIVE_DEFAULTS["tv_anchor_mode"],
-        help="Beta anchor selection: random supervised positions, or actual speculative rollout round starts (DFlash2 only).",
+        help="Beta anchor selection: random supervised positions, or actual speculative rollout round starts (DSpark and native DFlash2).",
     )
     group.add_argument(
         "--tv-rollout-max-tokens",
@@ -179,11 +179,6 @@ def configure_objective(model, tokenizer, args):
     from .config import is_dflash2_config
 
     is_dflash2 = is_dflash2_config(model.draft_model.config)
-    if args.tv_anchor_mode == "on-policy" and not is_dflash2:
-        raise ValueError(
-            "--tv-anchor-mode on-policy requires a native DFlash2 draft; "
-            "DSpark is unsupported"
-        )
     from transformers import AutoConfig
 
     from specforge.core.tv_acceptance import configure_tv_acceptance
@@ -243,15 +238,32 @@ def configure_objective(model, tokenizer, args):
         eos_token_ids=eos_ids,
         beta=args.dspark_loss_type == "tv-acceptance-beta",
         verification_batch_size=args.tv_verification_batch_size,
+        anchor_mode=args.tv_anchor_mode,
+        rollout_max_tokens=args.tv_rollout_max_tokens,
+        max_sequence_length=args.max_length,
     )
     if args.dspark_loss_type == "tv-acceptance-beta":
         print_on_rank0(
             "TV acceptance beta: actual proposal prefixes, same-version rollout/replay, "
             "differentiable min(p(d),q(d))/stopgrad(q_old(d)) prefix factors, "
             "loss=mean_blocks(1-(a1+r1*a2+r1*r2*a3+...)/7). "
-            "Fixed anchors; excludes bonus tokens and future round-start gradients. "
+            "Conditional on each anchor; excludes bonus tokens and future round-start gradients. "
             "Reuse target hidden and full-attention Qwen3 prefix KV when available."
         )
+        if args.tv_anchor_mode == "on-policy":
+            print_on_rank0(
+                "DSpark on-policy anchors: current training draft generates seven "
+                "full-vocabulary proposals per round; one rollout/replay per update. "
+                f"At most {args.tv_rollout_max_tokens} new tokens and "
+                f"{args.num_anchors} rounds per prompt; the round limit stops "
+                "generation, not reservoir sampling. Rejected proposal suffixes "
+                "remain in replay; fixed denominator 7."
+            )
+            if args.tv_verification_batch_size is not None:
+                print_on_rank0(
+                    "--tv-verification-batch-size is ignored by on-policy beta: "
+                    "each round verifies its active prompt batch."
+                )
         return
     if args.tv_verification_batch_size is not None:
         print_on_rank0(
