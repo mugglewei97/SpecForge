@@ -96,7 +96,19 @@ def test_draft_incremental_cache_matches_dense_blocks_with_ragged_advances(
                 input_ids=ids, attention_mask=mask, hidden_states=captured.hidden_states
             )
             active = torch.tensor(active)
-            anchors, actual = cache.forward(model, output, active)
+            with patch(
+                "torch.nn.attention.flex_attention.create_block_mask",
+                side_effect=AssertionError(
+                    "Rollout must not derive a dense block mask"
+                ),
+            ):
+                anchors, actual = cache.forward(
+                    model,
+                    output,
+                    active,
+                    lengths=torch.tensor(lengths),
+                    lengths_cpu=tuple(lengths),
+                )
             _, _, dense = model._forward_draft_blocks(
                 ids,
                 captured.hidden_states,

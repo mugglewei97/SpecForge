@@ -21,6 +21,7 @@ class _Branch:
     aux: torch.Tensor
     final: torch.Tensor
     cache: object
+    cpu_tokens: list[int] | None = None
 
 
 class OnPolicyTargetSession:
@@ -36,6 +37,13 @@ class OnPolicyTargetSession:
         self._seed_available = True
         self._capacity = None
         self._buffers = None
+        # Only backends with a CPU request API populate this mirror. It includes
+        # the pending seed/correction/bonus, just like each committed tensor row.
+        self._cpu_tokens = None
+        # Read-only snapshots for rollout sizing, including any pending anchor.
+        # Replace the device vector on append; consumers may retain old lengths.
+        self.lengths = None
+        self.lengths_cpu = ()
 
     def __enter__(self):
         return self
@@ -48,6 +56,9 @@ class OnPolicyTargetSession:
         self._pending = []
         self._branches = None
         self._buffers = None
+        self._cpu_tokens = None
+        self.lengths = None
+        self.lengths_cpu = ()
         self.output = None
         self.closed = True
 
@@ -87,11 +98,14 @@ class OnPolicyTargetSession:
             )
         if input_ids.size(0) == 0 or input_ids.size(1) == 0:
             raise ValueError("on-policy capture requires nonempty prefixes")
-        lengths = right_padded_lengths(attention_mask).cpu().tolist()
+        device_lengths = right_padded_lengths(attention_mask)
+        lengths = device_lengths.cpu().tolist()
         if self._capacity is not None and max(lengths) > self._capacity:
             raise ValueError("on-policy storage capacity is smaller than the prefix")
         try:
-            captured = self._capture(input_ids, attention_mask, loss_mask)
+            captured = self._capture(
+                input_ids, attention_mask, loss_mask, lengths=lengths
+            )
             if captured.last_hidden_states is None:
                 raise ValueError(
                     "on-policy capture requires target final hidden states"
@@ -109,13 +123,17 @@ class OnPolicyTargetSession:
                 for i, length in enumerate(lengths)
             ]
             self._pending = [False] * len(lengths)
+            self.lengths = device_lengths
             return self._pack()
         except BaseException:
             self.close()
             raise
 
     def _pack(self):
-        batch, width = len(self._rows), max(len(row[0]) for row in self._rows)
+        # Tensor row shapes already reflect validated seed/commit metadata.
+        # Reading their lengths needs neither a mask reduction nor a D2H copy.
+        self.lengths_cpu = tuple(len(row[0]) for row in self._rows)
+        batch, width = len(self._rows), max(self.lengths_cpu)
         ids, aux, final, loss = self._rows[0]
         if self._buffers is None:
             capacity = self._capacity or width
@@ -194,17 +212,22 @@ class OnPolicyTargetSession:
             )
         if next_tokens.shape != (len(self._rows),) or active.shape != next_tokens.shape:
             raise ValueError("seed requires one token and active flag per row")
-        enabled_rows = active.bool().cpu().tolist()
+        if next_tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("seed requires integer token IDs")
+        metadata = torch.stack((active.bool(), next_tokens), -1).cpu().tolist()
         if self._capacity is not None and any(
             enabled and len(self._rows[row][0]) + 1 > self._capacity
-            for row, enabled in enumerate(enabled_rows)
+            for row, (enabled, _) in enumerate(metadata)
         ):
             raise ValueError("seed would exceed reserved on-policy capacity")
-        for row, enabled in enumerate(enabled_rows):
+        for row, (enabled, token) in enumerate(metadata):
             if enabled:
                 ids, aux, final, _ = self._rows[row]
                 self._append_row(row, ids[:0], aux[:0], final[:0], next_tokens[row])
+                if self._cpu_tokens is not None:
+                    self._cpu_tokens[row].append(token)
                 self._pending[row] = True
+        self.lengths = self.lengths + active.bool().to(self.lengths)
         self._seed_available = False
         return self._pack()
 
@@ -229,22 +252,43 @@ class OnPolicyTargetSession:
             raise ValueError(
                 "on-policy verification requires aligned tokens, valid and active"
             )
+        if tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("on-policy verification requires integer token IDs")
         contiguous = valid.bool().int().cumprod(-1).bool()
-        if not torch.equal(valid.bool(), contiguous):
+        # One transfer for all rows, including the validity check. SGLang also
+        # needs the new proposal IDs, but never needs to reread the GPU prefix.
+        metadata = torch.stack(
+            (
+                contiguous.sum(-1),
+                active.bool(),
+                (valid.bool() == contiguous).all(-1),
+            ),
+            -1,
+        )
+        if self._cpu_tokens is not None:
+            metadata = torch.cat((metadata, tokens), -1)
+        metadata = metadata.cpu().tolist()
+        if not all(values[2] for values in metadata):
             raise ValueError("proposal validity must be a contiguous prefix")
         self._seed_available = False
-        counts = contiguous.sum(-1).cpu().tolist()
-        active_rows = active.bool().cpu().tolist()
+        counts = [values[0] for values in metadata]
         suffixes, rows = [], []
-        for row, enabled in enumerate(active_rows):
+        suffixes_cpu = [] if self._cpu_tokens is not None else None
+        for row, values in enumerate(metadata):
+            count, enabled = values[:2]
             if enabled:
                 prefix = (
                     self._rows[row][0][-1:] if self._pending[row] else tokens[row, :0]
                 )
-                suffixes.append(torch.cat((prefix, tokens[row, : counts[row]])))
+                suffixes.append(torch.cat((prefix, tokens[row, :count])))
+                if suffixes_cpu is not None:
+                    prefix_cpu = (
+                        self._cpu_tokens[row][-1:] if self._pending[row] else []
+                    )
+                    suffixes_cpu.append(prefix_cpu + values[3 : 3 + count])
                 rows.append(row)
         try:
-            branches = self._verify(rows, suffixes)
+            branches = self._verify(rows, suffixes, suffixes_cpu=suffixes_cpu)
             final = self._rows[0][2]
             result = final.new_zeros((batch, tokens.size(1) + 1, final.size(-1)))
             self._branches = {}
@@ -260,6 +304,9 @@ class OnPolicyTargetSession:
                     branch.aux,
                     branch.final,
                     branch.cache,
+                    metadata[row][3 : 3 + counts[row]]
+                    if self._cpu_tokens is not None
+                    else None,
                 )
             return result
         except BaseException:
@@ -278,9 +325,22 @@ class OnPolicyTargetSession:
             for value in (accepted_counts, next_tokens, active, emit_next)
         ):
             raise ValueError("commit requires one accepted count/token/flag per row")
-        enabled = active.bool().cpu().tolist()
-        counts = accepted_counts.cpu().tolist()
-        emits = emit_next.bool().cpu().tolist()
+        if accepted_counts.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "accepted counts must be integers within each proposal block"
+            )
+        if next_tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("commit requires integer token IDs")
+        # Keep integer IDs/counts exact; packing through float would lose large
+        # token IDs. The next token is reused by the CPU mirror at commit time.
+        metadata = (
+            torch.stack(
+                (active.bool(), accepted_counts, emit_next.bool(), next_tokens), -1
+            )
+            .cpu()
+            .tolist()
+        )
+        enabled, counts, emits, next_ids = zip(*metadata)
         if {row for row, flag in enumerate(enabled) if flag} != set(self._branches):
             raise ValueError("commit active rows must match the verified block")
         if any(
@@ -308,7 +368,15 @@ class OnPolicyTargetSession:
                     branch.final[:consumed],
                     next_tokens[row] if emits[row] else None,
                 )
-                self._pending[row] = emits[row]
+                if self._cpu_tokens is not None:
+                    self._cpu_tokens[row].extend(branch.cpu_tokens[: counts[row]])
+                    if emits[row]:
+                        self._cpu_tokens[row].append(next_ids[row])
+                self._pending[row] = bool(emits[row])
+            increment = torch.where(
+                active.bool(), accepted_counts + emit_next.bool(), 0
+            )
+            self.lengths = self.lengths + increment.to(self.lengths)
             self._branches = None
             return self._pack()
         except BaseException:
@@ -327,7 +395,7 @@ class HFOnPolicyTargetSession(OnPolicyTargetSession):
         self._cache_rows = []
         super().close()
 
-    def _capture(self, input_ids, attention_mask, loss_mask):
+    def _capture(self, input_ids, attention_mask, loss_mask, *, lengths):
         output = DFlashCapturePolicy().hf_capture(
             self.engine.model,
             self.engine.capture_layer_ids,
@@ -336,7 +404,6 @@ class HFOnPolicyTargetSession(OnPolicyTargetSession):
             loss_mask,
             use_cache=True,
         )
-        lengths = attention_mask.bool().sum(-1).cpu().tolist()
         self._cache_rows = [
             [
                 (
@@ -350,7 +417,7 @@ class HFOnPolicyTargetSession(OnPolicyTargetSession):
         output.past_key_values = None
         return output
 
-    def _verify(self, rows, suffixes):
+    def _verify(self, rows, suffixes, *, suffixes_cpu=None):
         from transformers.cache_utils import DynamicCache
 
         branches = {}

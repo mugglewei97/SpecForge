@@ -172,7 +172,19 @@ def test_incremental_cache_keeps_all_seven_dspark_slots_and_ragged_context(
                 hidden_states=captured.hidden_states,
             )
             active = torch.tensor(flags)
-            anchors, incremental = cache.forward(model, output, active)
+            with patch(
+                "torch.nn.attention.flex_attention.create_block_mask",
+                side_effect=AssertionError(
+                    "Rollout must not derive a dense block mask"
+                ),
+            ):
+                anchors, incremental = cache.forward(
+                    model,
+                    output,
+                    active,
+                    lengths=torch.tensor(lengths),
+                    lengths_cpu=tuple(lengths),
+                )
             packed = forward_dspark_blocks(
                 model,
                 ids,

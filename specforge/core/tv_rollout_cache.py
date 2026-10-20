@@ -21,22 +21,82 @@ class BlockRolloutCache:
         self.proposal_start = proposal_start
         self.kv = DynamicCache()
         self.lengths = None
+        self.lengths_cpu = None
         self.valid_keys = None
+        self._block_layout = None
+
+    def _block_mask(self, keys, query_length):
+        """Build a forward-only mask without evaluating a dense Q x KV mask."""
+        from torch.nn.attention.flex_attention import BlockMask
+
+        block_size = (256, 128) if flex_attention_backend() == "FLASH" else (128, 128)
+        batch, key_width = keys.shape
+        query_blocks = (query_length + block_size[0] - 1) // block_size[0]
+        kv_blocks = (key_width + block_size[1] - 1) // block_size[1]
+        layout_key = (keys.device, batch, query_blocks, kv_blocks, block_size)
+        if self._block_layout is None or self._block_layout[0] != layout_key:
+            # All queries share the same visible keys. Visit every KV tile as
+            # partial: marking tiles full would bypass the physical-padding and
+            # inactive-row checks in mask_mod. No device values need inspection.
+            counts = torch.full(
+                (batch, 1, query_blocks),
+                kv_blocks,
+                dtype=torch.int32,
+                device=keys.device,
+            )
+            indices = torch.arange(kv_blocks, dtype=torch.int32, device=keys.device)
+            indices = indices[None, None, None, :].expand(batch, 1, query_blocks, -1)
+            # FLASH requires full-block metadata even when there are no full
+            # tiles. Zero counts make the shared indices unused in that path.
+            full_counts = torch.zeros_like(counts)
+            self._block_layout = (layout_key, counts, indices, full_counts)
+        _, counts, indices, full_counts = self._block_layout
+
+        def mask_mod(b, h, q, k):
+            return (
+                (q < query_length)
+                & (k < key_width)
+                & keys[b, k.clamp(max=key_width - 1)]
+            )
+
+        # Reuse only the layout within a tile-size bucket, never the closure:
+        # keys (including active rows) and exact sequence lengths change each round.
+        return BlockMask.from_kv_blocks(
+            counts,
+            indices,
+            full_kv_num_blocks=full_counts,
+            full_kv_indices=indices,
+            BLOCK_SIZE=block_size,
+            mask_mod=mask_mod,
+            seq_lengths=(query_length, key_width),
+            compute_q_blocks=False,  # Rollout runs under no_grad; replay has its own mask.
+        )
 
     @torch.no_grad()
-    def forward(self, model, output, active):
+    def forward(self, model, output, active, *, lengths, lengths_cpu):
+        """Use matching device/CPU committed-length snapshots from the session."""
         ids, features = output.input_ids, output.hidden_states
-        anchors = output.attention_mask.long().sum(-1) - 1
         batch = ids.size(0)
+        if lengths.shape != (batch,) or len(lengths_cpu) != batch:
+            raise ValueError("Committed lengths must have one entry per row")
+        if any(length < 1 or length > ids.size(1) for length in lengths_cpu):
+            raise ValueError("Committed lengths must fit the nonempty token rows")
+        anchors_cpu = tuple(length - 1 for length in lengths_cpu)
+        previous_cpu = self.lengths_cpu or (0,) * batch
+        delta_cpu = tuple(
+            current - previous
+            for current, previous in zip(anchors_cpu, previous_cpu, strict=True)
+        )
+        if any(delta < 0 for delta in delta_cpu):
+            raise ValueError("Committed draft context cannot move backwards")
+        width = max(delta_cpu)
+        anchors = lengths - 1
         if self.lengths is None:
             self.lengths = torch.zeros_like(anchors)
             self.valid_keys = torch.zeros(
                 (batch, 0), device=ids.device, dtype=torch.bool
             )
         delta = anchors - self.lengths
-        if (delta < 0).any():
-            raise ValueError("Committed draft context cannot move backwards")
-        width = int(delta.max().item())
         offsets = torch.arange(width, device=ids.device)[None]
         positions = self.lengths[:, None] + offsets
         new_valid = offsets < delta[:, None]
@@ -55,26 +115,7 @@ class BlockRolloutCache:
         position_ids = torch.cat((positions, noise_positions), -1)
         kwargs = {}
         if model.attention_backend == "flex_attention":
-            from torch.nn.attention.flex_attention import create_block_mask
-
-            key_width = keys.size(1)
-
-            def mask_mod(b, h, q, k):
-                return (
-                    (q < model.block_size)
-                    & (k < key_width)
-                    & keys[b, k.clamp(max=key_width - 1)]
-                )
-
-            mask = create_block_mask(
-                mask_mod,
-                B=batch,
-                H=None,
-                Q_LEN=model.block_size,
-                KV_LEN=key_width,
-                device=ids.device,
-                BLOCK_SIZE=(256, 128) if flex_attention_backend() == "FLASH" else 128,
-            )
+            mask = self._block_mask(keys, model.block_size)
             kwargs["kernel_options"] = (
                 {"BACKEND": "TRITON"}
                 if torch.__version__ >= "2.11"
@@ -93,5 +134,6 @@ class BlockRolloutCache:
         )
         self.kv.crop(context_keys.size(1))
         self.lengths = anchors
+        self.lengths_cpu = anchors_cpu
         self.valid_keys = context_keys
         return anchors, hidden[:, self.proposal_start :]

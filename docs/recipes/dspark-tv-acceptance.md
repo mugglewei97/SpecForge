@@ -270,6 +270,31 @@ proposal 与 replay 使用同版本的全部 draft 参数，包括 Markov/CARH �
 FSDP 使各 rank 同步执行轮次和更新，replay、draft cache 和 target session
 均不跨 optimizer step；每批只训练一次。
 
+SGLang session 在初始 capture 时保存 CPU token 前缀，之后只追加实际
+提交的 proposal 和 seed / correction / bonus。每轮 verify 将各行
+proposal、长度、active 和有效性检查结果合并回传，commit 将接受长度、
+active、emit 标志和下一 token 合并回传，不再逐行拷贝完整 GPU 前缀。
+这只合并 session 层的 metadata 传输，不代表 acceptance、KV 页管理和
+跨 rank 检查中的同步也已消除。
+
+DSpark / DFlash2 的增量 draft rollout 直接构造 FlexAttention `BlockMask`，
+不再每轮调用 `create_block_mask()` 推导稠密 mask。KV tile 数不变时复用
+block 索引，每轮刷新 token 有效位；所有 tile 都保留逐 token 检查，屏蔽
+ragged KV cache 的中间 padding 空洞和 inactive 行。rollout 不生成反向
+block 索引，replay 继续使用独立的训练 mask。此路径仍遍历完全无效的 KV
+tile，实际端到端收益需 GPU 实测。
+
+session 在 capture 时初始化 CPU / GPU 已提交长度（包含 pending anchor），
+seed / commit 使用已有的接受长度和 emit 标志更新两侧状态。draft rollout
+直接使用这些长度，以 CPU 长度差检查倒退并确定新增 KV 宽度，不再每轮对
+attention mask 求长度、读取 `(delta < 0).any()` 或执行 `delta.max().item()`。
+inactive 行长度保持不变；长度快照按轮替换，避免修改历史轮次状态。
+
+SGLang backend 初始化时缓存 logits processor 引用；之后仅在请求的
+`return_last_hidden_states / return_logits / shard_returns` 组合变化时更新
+属性。同一 rollout 的后续轮次不再遍历 target 模块树或重复设置 flags。
+若 setter 中途失败，flags 缓存失效，下一次调用会重新应用设置。
+
 每轮保留原 proposal、实际前驱 `[root,d1,...]`、采样时的 `log q_old`、
 真实验证前缀上的 teacher final hidden 和 anchor。首拒 token 以及未提交的
 proposal suffix 仍参与 beta loss；backbone 输入只使用合法已提交上下文，

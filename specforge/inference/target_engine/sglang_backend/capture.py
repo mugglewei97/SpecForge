@@ -102,6 +102,14 @@ class SGLangCaptureBackend:
     def __init__(self, model_runner: SGLangRunner, hf_config=None):
         self.model_runner = model_runner
         self.hf_config = hf_config
+        # build() wraps processors before constructing this backend. The frozen
+        # target's module tree is stable for the backend's lifetime.
+        self._eagle3_logits_processors = tuple(
+            module
+            for module in model_runner.model.modules()
+            if isinstance(module, LogitsProcessorForEAGLE3)
+        )
+        self._eagle3_logits_flags = None
         # VLM-specific attributes (initialized from hf_config if available)
         self._init_vlm_attributes()
 
@@ -329,12 +337,17 @@ class SGLangCaptureBackend:
     def _set_eagle3_logits_flags(
         self, return_last_hidden_states: bool, return_logits: bool, shard_returns: bool
     ):
-        # set the logits processor for the model runner
-        for name, module in self.model_runner.model.named_modules():
-            if isinstance(module, LogitsProcessorForEAGLE3):
-                module.return_last_hidden_states = return_last_hidden_states
-                module.return_logits = return_logits
-                module.shard_returns = shard_returns
+        flags = (return_last_hidden_states, return_logits, shard_returns)
+        if self._eagle3_logits_flags == flags:
+            return
+        # A setter (notably shard_returns) can raise after changing a processor.
+        # Do not retain the old flags or cache the new flags after a partial update.
+        self._eagle3_logits_flags = None
+        for module in self._eagle3_logits_processors:
+            module.return_last_hidden_states = return_last_hidden_states
+            module.return_logits = return_logits
+            module.shard_returns = shard_returns
+        self._eagle3_logits_flags = flags
 
     # --- EAGLE3 extend (text) ----------------------------------------------
 

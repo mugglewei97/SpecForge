@@ -37,15 +37,17 @@ class SGLangOnPolicyTargetSession(OnPolicyTargetSession):
             self._indices = []
             super().close()
 
-    def _capture(self, input_ids, attention_mask, loss_mask):
+    def _capture(self, input_ids, attention_mask, loss_mask, *, lengths):
         if not self.owns_pools:
             raise RuntimeError("SGLang on-policy capture requires a context manager")
-        lengths = attention_mask.bool().sum(-1).cpu().tolist()
+        self._cpu_tokens = [
+            ids[:length]
+            for ids, length in zip(input_ids.cpu().tolist(), lengths, strict=True)
+        ]
+        # Requests may release or mutate their inputs; the session owns its
+        # committed prefix independently of the backend's request lifecycle.
         requests = [
-            self._request(ids[:length], i)
-            for i, (ids, length) in enumerate(
-                zip(input_ids.cpu().tolist(), lengths, strict=True)
-            )
+            self._request(ids.copy(), i) for i, ids in enumerate(self._cpu_tokens)
         ]
         output = self._forward(requests)
         if output.last_hidden_states is None or output.aux_hidden_states is None:
@@ -77,11 +79,11 @@ class SGLangOnPolicyTargetSession(OnPolicyTargetSession):
             aux[i, :length], final[i, :length] = a, f
         return DFlashTargetOutput(aux, input_ids, attention_mask, loss_mask, final)
 
-    def _verify(self, rows, suffixes):
+    def _verify(self, rows, suffixes, *, suffixes_cpu):
         runner = self.backend.model_runner
         page_size = runner.server_args.page_size
         branches, requests, work = {}, [], []
-        for row, suffix in zip(rows, suffixes, strict=True):
+        for row, suffix, suffix_cpu in zip(rows, suffixes, suffixes_cpu, strict=True):
             if not len(suffix):
                 branches[row] = _Branch(
                     suffix,
@@ -92,7 +94,7 @@ class SGLangOnPolicyTargetSession(OnPolicyTargetSession):
                 continue
             prefix = len(self._indices[row])
             shared = prefix // page_size * page_size
-            tokens = self._rows[row][0][:prefix].cpu().tolist() + suffix.cpu().tolist()
+            tokens = self._cpu_tokens[row][:prefix] + suffix_cpu
             requests.append(self._request(tokens, row, self._indices[row][:shared]))
             work.append((row, suffix, len(tokens), len(tokens) - shared))
         if requests:

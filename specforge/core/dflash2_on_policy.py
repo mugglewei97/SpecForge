@@ -136,7 +136,13 @@ def collect_dflash2_rollout(model, input_ids, attention_mask, loss_mask, session
         if not _globally_active(active):
             break
         output.hidden_states = output.hidden_states.to(model.lm_head.weight)
-        anchors, hidden = cache.forward(model, output, active)
+        anchors, hidden = cache.forward(
+            model,
+            output,
+            active,
+            lengths=session.lengths,
+            lengths_cpu=session.lengths_cpu,
+        )
         valid = (
             torch.arange(BETA_BLOCK_SIZE, device=ids.device)[None] < remaining[:, None]
         ) & active[:, None]
@@ -208,7 +214,7 @@ def collect_dflash2_rollout(model, input_ids, attention_mask, loss_mask, session
         zeros = torch.zeros(shape, device=ids.device, dtype=torch.long)
         history.append(
             (
-                output.attention_mask.sum(-1).long() - 1,
+                session.lengths - 1,
                 torch.zeros(batch, device=ids.device, dtype=torch.bool),
                 zeros,
                 zeros.clone(),

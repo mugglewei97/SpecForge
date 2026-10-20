@@ -35,6 +35,73 @@ def _assert_committed(engine, session):
             assert aux[-1].count_nonzero() == final[-1].count_nonzero() == 0
 
 
+@pytest.mark.parametrize("backend", ["hf", "sglang"])
+@pytest.mark.parametrize("reserve", [False, True])
+def test_committed_length_snapshots_follow_seed_and_commit(
+    sglang_session_class, backend, reserve
+):
+    session = (
+        make_target().on_policy_rollout()
+        if backend == "hf"
+        else sglang_session_class(SimpleNamespace(_backend=Backend(4)))
+    )
+    snapshots = []
+
+    def check(expected):
+        assert session.lengths_cpu == expected
+        assert session.lengths.tolist() == list(expected)
+        assert session.lengths.dtype == torch.long
+        assert session.lengths.device == session.output.input_ids.device
+        assert tuple(session.output.attention_mask.sum(-1).tolist()) == expected
+        if session._cpu_tokens is not None:
+            assert tuple(map(len, session._cpu_tokens)) == expected
+        snapshots.append((session.lengths, session.lengths_cpu))
+        for device_lengths, cpu_lengths in snapshots:
+            assert tuple(device_lengths.tolist()) == cpu_lengths
+
+    with session:
+        assert session.lengths is None and session.lengths_cpu == ()
+        if reserve:
+            session.reserve_capacity(32)
+        ids = torch.tensor([[1, 2, 3], [4, 0, 0]])
+        mask = torch.tensor([[1, 1, 1], [1, 0, 0]])
+        session.capture(ids, mask, mask.float())
+        check((3, 1))
+        session.seed(torch.tensor([10, 9]), torch.tensor([True, False]))
+        check((4, 1))
+        proposals = torch.tensor([[11, 12], [13, 14]])
+        for active, accepted, emit, expected in (
+            # Rejection + correction in row 0; unseeded row 1 accepts without bonus.
+            ([True, True], [0, 2], [True, False], (5, 3)),
+            # Inactive rows ignore both counts and emit flags.
+            ([True, False], [2, -999], [True, True], (8, 3)),
+            ([False, False], [-999, 999], [True, True], (8, 3)),
+            # Consuming a pending anchor without appending must not grow lengths.
+            ([True, True], [0, 0], [False, False], (8, 3)),
+        ):
+            active = torch.tensor(active)
+            before = session.lengths
+            session.verify(proposals, torch.ones_like(proposals), active)
+            assert session.lengths is before
+            if active[0]:
+                with pytest.raises(ValueError, match="accepted counts"):
+                    session.commit(
+                        torch.tensor([3, 0]), torch.tensor([15, 16]), active, active
+                    )
+                assert session.lengths is before
+                check(tuple(before.tolist()))
+            session.commit(
+                torch.tensor(accepted),
+                torch.tensor([15, 16]),
+                active,
+                torch.tensor(emit),
+            )
+            check(expected)
+    assert session.lengths is None and session.lengths_cpu == ()
+    for device_lengths, cpu_lengths in snapshots:
+        assert tuple(device_lengths.tolist()) == cpu_lengths
+
+
 @pytest.mark.parametrize("reserve", [False, True])
 def test_hf_ragged_seed_reject_bonus_and_inactive_rows_match_full_causal_forward(
     reserve,
@@ -56,6 +123,7 @@ def test_hf_ragged_seed_reject_bonus_and_inactive_rows_match_full_causal_forward
         if reserve:
             session.reserve_capacity(32)
         session.capture(ids, mask, mask.float())
+        assert session._cpu_tokens is None
         storage = session.output.hidden_states.untyped_storage().data_ptr()
         session.seed(torch.tensor([10, 11]), torch.ones(2, dtype=torch.bool))
         assert forward.call_count == 1
@@ -217,8 +285,10 @@ def test_sglang_rounds_preserve_partial_pages_and_release_rejected_suffix(
         if reserve:
             session.reserve_capacity(64)
         session.capture(ids, mask, mask.float())
+        assert session._cpu_tokens == [[1, 2, 3, 4, 5], [6, 7]]
         storage = session.output.hidden_states.untyped_storage().data_ptr()
         session.seed(torch.tensor([8, 9]), torch.tensor([True, True]))
+        assert session._cpu_tokens == [[1, 2, 3, 4, 5, 8], [6, 7, 9]]
         for step in range(5):
             active = torch.tensor([True, step != 1])
             proposals = torch.tensor(
@@ -261,6 +331,7 @@ def test_sglang_rounds_preserve_partial_pages_and_release_rejected_suffix(
             for row, indices in enumerate(session._indices):
                 live.update((indices // page_size).tolist())
                 actual_ids, aux, final, _ = session._rows[row]
+                assert session._cpu_tokens[row] == actual_ids.tolist()
                 count = len(actual_ids) - int(session._pending[row])
                 assert len(indices) == count
                 torch.testing.assert_close(
@@ -275,6 +346,137 @@ def test_sglang_rounds_preserve_partial_pages_and_release_rejected_suffix(
             assert allocator.live_pages == live
             assert len(backend.model_runner.req_to_token_pool.available) == 19
     assert session.closed and backend.clears == 1 and not allocator.live_pages
+    assert session._cpu_tokens is None
+
+
+@pytest.mark.parametrize("prefix_width", [16, 80])
+@pytest.mark.parametrize("batch", [1, 4])
+def test_sglang_round_transfers_only_new_tokens_and_batched_metadata(
+    sglang_session_class, prefix_width, batch
+):
+    backend = Backend(4)
+    ids = torch.arange(1, prefix_width + 1).expand(batch, -1).clone()
+    lengths = prefix_width - torch.arange(batch)
+    mask = torch.arange(prefix_width)[None] < lengths[:, None]
+    expected = [row[:length].tolist() for row, length in zip(ids, lengths)]
+    transfers = []
+    original_cpu = torch.Tensor.cpu
+
+    def record_cpu(tensor, *args, **kwargs):
+        transfers.append(tuple(tensor.shape))
+        return original_cpu(tensor, *args, **kwargs)
+
+    # Real SGLang owns the Req inputs. Ensure even an in-place mutation of that
+    # list cannot corrupt the session's independently owned CPU prefix.
+    original_forward = backend._forward_extend
+
+    def consume_requests(requests):
+        output = original_forward(requests)
+        for request in requests:
+            request.origin_input_ids.clear()
+        return output
+
+    backend._forward_extend = consume_requests
+    with sglang_session_class(SimpleNamespace(_backend=backend)) as session:
+        session.reserve_capacity(128)
+        session.capture(ids, mask, mask.float())
+        assert session._cpu_tokens == expected
+        seed = torch.arange(batch) + 100
+        active = torch.ones(batch, dtype=torch.bool)
+        with patch.object(torch.Tensor, "cpu", record_cpu):
+            session.seed(seed, active)
+        assert transfers == [(batch, 2)]
+        for row in range(batch):
+            expected[row].append(int(seed[row]))
+        for step in range(4):
+            transfers.clear()
+            proposals = torch.arange(3 * batch).reshape(batch, 3) + 200 + 10 * step
+            valid = torch.ones_like(proposals, dtype=torch.bool)
+            valid[-1, -1] = False
+            active = torch.ones(batch, dtype=torch.bool)
+            if batch > 1:
+                active[-1] = step != 1
+            if step == 3:
+                active.zero_()
+            accepted = torch.ones(batch, dtype=torch.long)
+            accepted[~active] = 0
+            emit = active & (step != 1)
+            next_tokens = torch.arange(batch) + 300 + step
+            proposals_before = proposals.clone()
+            with patch.object(torch.Tensor, "cpu", record_cpu):
+                session.verify(proposals, valid, active)
+                # Both the GPU branch and CPU proposal snapshot must remain
+                # independent of caller-owned sampling buffers.
+                proposals.fill_(-1)
+                session.commit(accepted, next_tokens, active, emit)
+            assert transfers == [(batch, 6), (batch, 4)]
+            for row in range(batch):
+                if active[row]:
+                    expected[row].extend(
+                        proposals_before[row, : accepted[row]].tolist()
+                    )
+                    if emit[row]:
+                        expected[row].append(int(next_tokens[row]))
+                assert session._cpu_tokens[row] == expected[row]
+                assert session._rows[row][0].tolist() == expected[row]
+    assert session._cpu_tokens is None
+
+
+@pytest.mark.parametrize("reserve", [False, True])
+def test_sglang_cpu_tokens_preserve_large_integer_ids_and_empty_proposals(
+    sglang_session_class, reserve
+):
+    backend = Backend(4)
+    large = 2**53 + 1
+    with sglang_session_class(SimpleNamespace(_backend=backend)) as session:
+        if reserve:
+            session.reserve_capacity(8)
+        session.capture(torch.tensor([[large]]), torch.ones(1, 1), torch.ones(1, 1))
+        empty = torch.empty(1, 0, dtype=torch.long)
+        active = torch.tensor([True])
+        # Exercise the unseeded, empty-suffix path and bonus-only commit.
+        session.verify(empty, empty.bool(), active)
+        session.commit(torch.tensor([0]), torch.tensor([large + 1]), active, active)
+        session.verify(torch.tensor([[large + 2, large + 3]]), torch.ones(1, 2), active)
+        session.commit(torch.tensor([1]), torch.tensor([large + 4]), active, active)
+        expected = [large, large + 1, large + 2, large + 4]
+        assert session._cpu_tokens == [expected]
+        assert session._rows[0][0].tolist() == expected
+
+
+def test_sglang_rejected_metadata_leaves_cpu_prefix_and_branch_retryable(
+    sglang_session_class,
+):
+    backend = Backend(4)
+    with sglang_session_class(SimpleNamespace(_backend=backend)) as session:
+        session.reserve_capacity(5)
+        session.capture(torch.tensor([[1, 2]]), torch.ones(1, 2), torch.ones(1, 2))
+        active = torch.tensor([True])
+        session.seed(torch.tensor([3]), active)
+        proposals = torch.tensor([[4, 5, 6]])
+        for tokens, valid, error in (
+            (proposals.float(), torch.ones(1, 3), "integer token IDs"),
+            (proposals, torch.tensor([[1, 0, 1]]), "contiguous prefix"),
+        ):
+            with pytest.raises(ValueError, match=error):
+                session.verify(tokens, valid, active)
+            assert session._cpu_tokens == [[1, 2, 3]]
+            assert session._branches is None
+        session.verify(proposals, torch.ones(1, 3), active)
+        for count, enabled, error in (
+            (torch.tensor([1.5]), active, "accepted counts"),
+            (torch.tensor([4]), active, "accepted counts"),
+            (torch.tensor([1]), ~active, "active rows"),
+            (torch.tensor([2]), active, "exceed reserved"),
+        ):
+            with pytest.raises(ValueError, match=error):
+                session.commit(count, torch.tensor([7]), enabled, active)
+            assert session._cpu_tokens == [[1, 2, 3]]
+            assert session._rows[0][0].tolist() == [1, 2, 3]
+            assert session._branches is not None
+        session.commit(torch.tensor([1]), torch.tensor([7]), active, active)
+        assert session._cpu_tokens == [[1, 2, 3, 4, 7]]
+        assert session._rows[0][0].tolist() == [1, 2, 3, 4, 7]
 
 
 def test_reserved_capacity_overflow_does_not_partially_commit():
@@ -315,5 +517,6 @@ def test_sglang_failure_after_partial_allocation_cleans_all_pools(
                 torch.tensor([[3, 4, 5]]), torch.ones(1, 3), torch.tensor([True])
             )
     assert session.closed and backend.clears == 1
+    assert session._cpu_tokens is None
     assert not backend._proposal_session_active
     assert not backend.model_runner.token_to_kv_pool_allocator.live_pages
