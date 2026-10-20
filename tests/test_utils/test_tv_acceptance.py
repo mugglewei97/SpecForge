@@ -500,6 +500,73 @@ def test_checkpoint_post_training_preserves_weights_and_takes_tv_step(
     assert not torch.equal(model.draft_model.markov_head.markov_w2.weight, before)
 
 
+def test_pre_dspark_warm_start_adds_markov_and_confidence_heads(tmp_path):
+    from specforge.legacy.dspark import DSparkConfig, DSparkDraftModel
+    from specforge.legacy.dspark_training.initialization import (
+        initialize_draft_weights,
+        prepare_warm_start,
+    )
+
+    def draft_config(**overrides):
+        values = dict(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            head_dim=4,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            layer_types=["full_attention"],
+            block_size=7,
+            num_target_layers=4,
+            dflash_config={"target_layer_ids": [1]},
+        )
+        values.update(overrides)
+        config = DSparkConfig(**values)
+        config._attn_implementation = "sdpa"
+        return config
+
+    torch.manual_seed(7)
+    source = DSparkDraftModel(
+        draft_config(markov_rank=0, enable_confidence_head=False)
+    )
+    source.save_pretrained(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    # Mimic a pre-DSpark DFlash export: a plain Qwen3 config that predates the
+    # Markov/confidence research modules entirely.
+    for key in ("markov_rank", "markov_head_type", "enable_confidence_head"):
+        config.pop(key, None)
+    config.update(model_type="qwen3", architectures=["DFlashDraftModel"])
+    config_path.write_text(json.dumps(config))
+
+    draft = DSparkDraftModel(
+        draft_config(
+            markov_rank=4,
+            enable_confidence_head=True,
+            confidence_head_with_markov=True,
+        )
+    )
+    args = SimpleNamespace(
+        init_draft_model_path=str(tmp_path),
+        resume=False,
+        output_dir=str(tmp_path / "new-run"),
+        allow_conv_position_pruning=False,
+    )
+    prepare_warm_start(args)
+    with patch("specforge.utils.print_on_rank0"):
+        initialize_draft_weights(draft, args)
+    assert draft.markov_head is not None
+    assert draft.confidence_head is not None
+    draft_state = draft.state_dict()
+    for key, expected in source.state_dict().items():
+        torch.testing.assert_close(draft_state[key], expected, rtol=0, atol=0)
+    # The fresh bigram head starts as an exact no-op: logits match the
+    # checkpoint until gradient updates move markov_w2 away from zero.
+    assert torch.count_nonzero(draft.markov_head.markov_w2.weight) == 0
+
+
 @pytest.mark.parametrize("invalid", ["missing", "unexpected"])
 def test_warm_start_rejects_silently_reinitialized_source_weights(tmp_path, invalid):
     from safetensors.torch import load_file, save_file
