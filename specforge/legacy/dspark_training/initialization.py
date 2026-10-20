@@ -203,6 +203,17 @@ def _load_draft_state_allowing_selector_expansion(
             expanded_depth_embeddings.append(key)
     incompatible = draft_model.load_state_dict(loaded_state, strict=False)
     unexpected = list(incompatible.unexpected_keys)
+    # A pre-DSpark DFlash checkpoint has no Markov/confidence head at all; the
+    # newly built heads stay at their identity initializations (markov_w2 is
+    # zero-filled, so the added bigram bias is an exact no-op at warm start).
+    adding_markov_head = (
+        getattr(draft_model, "markov_head", None) is not None
+        and getattr(loaded_model, "markov_head", None) is None
+    )
+    adding_confidence_head = (
+        getattr(draft_model, "confidence_head", None) is not None
+        and getattr(loaded_model, "confidence_head", None) is None
+    )
     adding_second_predecessor = (
         getattr(draft_model.markov_head, "predecessor_count", 1) >= 2
         and getattr(loaded_model.markov_head, "predecessor_count", 1) == 1
@@ -233,6 +244,8 @@ def _load_draft_state_allowing_selector_expansion(
             )
         )
         and ".local_transition_attention." not in key
+        and not (adding_markov_head and key.startswith("markov_head."))
+        and not (adding_confidence_head and key.startswith("confidence_head."))
         and not (
             adding_second_predecessor and key == "markov_head.second_prev_proj.weight"
         )
@@ -253,6 +266,16 @@ def _load_draft_state_allowing_selector_expansion(
         print_on_rank0(
             "Warm start predates optional research modules; initialized the "
             f"following parameters from scratch: {incompatible.missing_keys}"
+        )
+    if adding_markov_head:
+        print_on_rank0(
+            "DFlash warm start: added a fresh Markov head; markov_w2 stays "
+            "zero-initialized so initial logits exactly match the checkpoint."
+        )
+    if adding_confidence_head:
+        print_on_rank0(
+            "DFlash warm start: added a fresh confidence head with random "
+            "initialization."
         )
     if dropped_dynamic_conv:
         print_on_rank0(
