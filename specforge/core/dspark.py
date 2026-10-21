@@ -114,6 +114,37 @@ def _distributed_any(value: torch.Tensor) -> bool:
     return bool(result.item())
 
 
+def dpace_suffix_credit(
+    quality: torch.Tensor,
+    eval_mask: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Detached official D-PACE suffix credit over the block axis.
+
+    Mirrors ``OnlineDFlashModel._dpace_weight`` (loss_type="dpace") from the
+    D-PACE release: ``quality`` is the draft probability on the target token,
+    smoothed as ``alpha + (1 - alpha) * q``; invalid positions are
+    multiplicative identities inside the prefix product and excluded from the
+    suffix sums.  Returns ``suffix * eval_mask`` with no per-sample weight-mass
+    renormalization, so a sample's total credit grows with its expected
+    continuation length (the release semantics; pair with a per-sequence loss
+    denominator).
+    """
+    with torch.no_grad():
+        valid = eval_mask.bool()
+        q = quality.detach().float().clamp(0.0, 1.0)
+        smooth_q = alpha + (1.0 - alpha) * q
+        smooth_q = torch.where(valid, smooth_q, torch.ones_like(smooth_q))
+        survival = torch.cumprod(smooth_q, dim=-1)
+        credit = torch.flip(
+            torch.cumsum(
+                torch.flip(survival * eval_mask, dims=[-1]), dim=-1
+            ),
+            dims=[-1],
+        )
+        return credit * eval_mask
+
+
 def _carh_predecessor_context_kwargs(
     markov_head: nn.Module, block_hidden: torch.Tensor, depth: int
 ) -> dict:
@@ -178,6 +209,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         pace_residual_beta: float = 0.5,
         pace_residual_min: float = 0.9,
         pace_residual_max: float = 1.1,
+        official_dpace: bool = False,
+        official_dpace_alpha: float = 0.5,
         prefix_credit_mode: str = "none",
         prefix_credit_alpha: float = 0.0,
         prefix_credit_warmup_ratio: float = 0.10,
@@ -650,6 +683,44 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.pace_residual_beta = float(pace_residual_beta)
         self.pace_residual_min = float(pace_residual_min)
         self.pace_residual_max = float(pace_residual_max)
+        if not 0.0 <= official_dpace_alpha <= 1.0:
+            raise ValueError(
+                f"official_dpace_alpha must be in [0, 1], "
+                f"got {official_dpace_alpha}"
+            )
+        if official_dpace:
+            # Official D-PACE is a pure weighted-CE objective: per-sequence
+            # normalization, no weight-mass matching, no blend schedule, and
+            # none of DSpark's auxiliary losses.
+            official_dpace_conflicts = []
+            if pace_mode != "none":
+                official_dpace_conflicts.append("pace_mode")
+            if l1_loss_alpha > 0:
+                official_dpace_conflicts.append("l1_loss_alpha")
+            if bv_loss_alpha > 0:
+                official_dpace_conflicts.append("bv_loss_alpha")
+            if confidence_head_alpha > 0:
+                official_dpace_conflicts.append("confidence_head_alpha")
+            if offline_acceptance_objective != "none":
+                official_dpace_conflicts.append("offline_acceptance_objective")
+            if vat_enabled:
+                official_dpace_conflicts.append("vat_enabled")
+            if (
+                pace_warmup_ratio != 0.0
+                or pace_ramp_ratio != 0.0
+                or pace_decay_start_ratio != 1.0
+                or pace_blend_max != 1.0
+            ):
+                official_dpace_conflicts.append("pace blend schedule")
+            if official_dpace_conflicts:
+                raise ValueError(
+                    "official_dpace is the release D-PACE objective (detached "
+                    "suffix credit, per-sequence normalization, pure CE); "
+                    "disable the conflicting DSpark options explicitly: "
+                    + ", ".join(official_dpace_conflicts)
+                )
+        self.official_dpace = bool(official_dpace)
+        self.dpace_alpha = float(official_dpace_alpha)
         if prefix_credit_mode not in {"none", "full", "residual-only", "partial"}:
             raise ValueError(
                 "prefix_credit_mode must be none/full/residual-only/partial, "
@@ -5635,38 +5706,47 @@ class OnlineDSparkModel(OnlineDFlashModel):
         quality: torch.Tensor,
         eval_mask: torch.Tensor,
         reference_weights: torch.Tensor,
+        mass_match: bool = True,
+        alpha: Optional[float] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Build detached continuation credit and preserve baseline loss mass.
 
         ``quality`` is a per-position acceptance proxy.  Its smoothed prefix
         product estimates survival through each depth; a reverse cumulative
-        sum assigns each position the expected continuation it supports.  The
-        result is matched per sample to DSpark's original exponential weight
-        mass, so changing credit allocation does not change the effective LR.
+        sum assigns each position the expected continuation it supports.  With
+        ``mass_match=True`` the result is matched per sample to DSpark's
+        original exponential weight mass, so changing credit allocation does
+        not change the effective LR.  With ``mass_match=False`` the raw
+        official D-PACE suffix credit is returned instead, so a sample's
+        total credit grows with its expected continuation length.  ``alpha``
+        defaults to ``self.pace_alpha``; official D-PACE passes its own
+        smoothing floor.
         """
+        alpha = self.pace_alpha if alpha is None else float(alpha)
         with torch.no_grad():
-            valid = eval_mask.bool()
             q = quality.detach().float().clamp(0.0, 1.0)
-            smooth_q = self.pace_alpha + (1.0 - self.pace_alpha) * q
+            raw_weights = dpace_suffix_credit(q, eval_mask, alpha)
+            if mass_match:
+                reduce_dims = tuple(range(1, raw_weights.dim()))
+                reference_mass = reference_weights.sum(
+                    dim=reduce_dims, keepdim=True
+                )
+                raw_mass = raw_weights.sum(dim=reduce_dims, keepdim=True)
+                mass_scale = reference_mass / raw_mass.clamp_min(1e-6)
+                mass_scale = torch.where(
+                    raw_mass > 0, mass_scale, torch.zeros_like(mass_scale)
+                )
+                weights = raw_weights * mass_scale
+                mass_scale_mean = mass_scale.sum() / mass_scale.gt(
+                    0
+                ).float().sum().clamp_min(1.0)
+            else:
+                weights = raw_weights
+                mass_scale_mean = raw_weights.new_ones(())
+            valid = eval_mask.bool()
+            smooth_q = alpha + (1.0 - alpha) * q
             smooth_q = torch.where(valid, smooth_q, torch.ones_like(smooth_q))
             survival = torch.cumprod(smooth_q, dim=-1)
-            raw_credit = torch.flip(
-                torch.cumsum(
-                    torch.flip(survival * eval_mask, dims=[-1]), dim=-1
-                ),
-                dims=[-1],
-            )
-            raw_weights = raw_credit * eval_mask
-            reduce_dims = tuple(range(1, raw_weights.dim()))
-            reference_mass = reference_weights.sum(
-                dim=reduce_dims, keepdim=True
-            )
-            raw_mass = raw_weights.sum(dim=reduce_dims, keepdim=True)
-            mass_scale = reference_mass / raw_mass.clamp_min(1e-6)
-            mass_scale = torch.where(
-                raw_mass > 0, mass_scale, torch.zeros_like(mass_scale)
-            )
-            weights = raw_weights * mass_scale
             valid_count = eval_mask.sum().clamp_min(1.0)
             diagnostics = {
                 "pace_quality_mean": (q * eval_mask).sum() / valid_count,
@@ -5674,8 +5754,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 / valid_count,
                 "pace_weight_mass_ratio": weights.sum()
                 / reference_weights.sum().clamp_min(1e-6),
-                "pace_mass_scale_mean": mass_scale.sum()
-                / mass_scale.gt(0).float().sum().clamp_min(1.0),
+                "pace_mass_scale_mean": mass_scale_mean,
             }
         return weights, diagnostics
 
@@ -6416,7 +6495,22 @@ class OnlineDSparkModel(OnlineDFlashModel):
         pace_diagnostics = {}
         l1_weight_mask = decay_weight_mask
         rollout_aux_num = base_logits.new_zeros((), dtype=torch.float32)
-        if self.pace_mode == "rollout-residual":
+        if self.official_dpace:
+            # Release D-PACE: raw detached suffix credit fully replaces the
+            # fixed depth prior; per-sequence normalization happens at the
+            # loss aggregation below (ce_den), not via weight-mass matching.
+            pace_weight_mask, pace_diagnostics = self._pace_weights(
+                torch.exp(-ce_per_token.detach().float()),
+                eval_mask,
+                decay_weight_mask,
+                mass_match=False,
+                alpha=self.dpace_alpha,
+            )
+            ce_weight_mask = pace_weight_mask
+            pace_diagnostics["pace_effective_blend"] = torch.tensor(
+                1.0, device=device, dtype=torch.float32
+            )
+        elif self.pace_mode == "rollout-residual":
             rollout_quality = self._rollout_quality(
                 base_logits_4d, hidden_4d, anchor_token_ids, target_ids
             )
@@ -8268,6 +8362,18 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if dp_size > 1:
             dist.all_reduce(global_den, op=dist.ReduceOp.SUM, group=dp_group)
         global_den = global_den + 1e-6
+        if self.official_dpace:
+            # Official D-PACE divides the weighted CE sum by the number of
+            # sequences (per rank), not by the weight mass.  With FSDP's mean
+            # gradient reduction and the outer `* dp_size`, an all-reduced
+            # sequence count reproduces that objective exactly: the effective
+            # global loss is sum_all(CE * w) / (dp_size * bsz).
+            ce_den = local_den.new_tensor(float(bsz))
+            if dp_size > 1:
+                dist.all_reduce(ce_den, op=dist.ReduceOp.SUM, group=dp_group)
+            ce_den = ce_den.clamp_min(1.0)
+        else:
+            ce_den = global_den
         bv_loss = base_logits.new_zeros((), dtype=torch.float32)
         if bv_terms is not None:
             # BV is a mean over valid BLOCKS, separate from CE/aux token mass.
@@ -8340,7 +8446,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             offline_lk_loss = offline_lk_num.new_zeros(())
             offline_e2e_loss = offline_e2e_num.new_zeros(())
             loss = (
-                hard_loss_alpha * ce_num / global_den
+                hard_loss_alpha * ce_num / ce_den
                 + auxiliary_loss
                 + self.l1_loss_alpha * l1_num / global_den
                 + self.bv_loss_alpha * bv_loss
@@ -8382,6 +8488,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
         # Per-component loss values (per-rank local means) for logging only — lets
         # you watch L1 fall while the greedy-CE proxy plateaus.
         local_den_eps = local_den + 1e-6
+        # Keep the logged CE on the same denominator as the optimized loss:
+        # per-sequence for official D-PACE, weight-mass otherwise.
+        local_ce_den = (
+            local_den.new_tensor(float(bsz))
+            if self.official_dpace
+            else local_den_eps
+        )
         loss_components = {
             "source_semantic_loss": (semantic_num / predictive_den.clamp_min(1e-6)).detach(),
             "reference_calibration_loss": (reference_num / predictive_den.clamp_min(1e-6)).detach(),
@@ -8392,7 +8505,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "source_semantic_effective_alpha": local_den.new_tensor(predictive_scale * self.conv_source_semantic_alpha),
             "reference_calibration_effective_alpha": local_den.new_tensor(predictive_scale * self.carh_reference_calibration_alpha),
             "block_summary_counterfactual_loss": counterfactual_summary_loss.detach(),
-            "ce_loss": (ce_num / local_den_eps).detach(),
+            "ce_loss": (ce_num / local_ce_den).detach(),
             "carh_sampled_prefix_memory_scale": base_logits.new_tensor(
                 getattr(memory_head, "sampled_prefix_memory_scale", 0.0)
                 if getattr(memory_head, "sampled_prefix_memory", None) is not None

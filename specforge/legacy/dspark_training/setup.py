@@ -128,8 +128,12 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, torch.nn.Module]:
     if args.draft_config_path:
         draft_config = load_draft_config(args.draft_config_path)
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
+        native_dflash2 = (
+            args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES
+            and is_dflash2_config(draft_config)
+        )
         if (
-            args.dspark_loss_type not in DFLASH2_NATIVE_OBJECTIVES
+            not native_dflash2
             and hasattr(draft_config, "block_size")
             and draft_config.block_size != args.block_size
         ):
@@ -176,10 +180,13 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, torch.nn.Module]:
         )
         return target_model, draft_model
 
-    if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
+    if args.dspark_loss_type == "dflash2":
         raise ValueError(
-            f"--dspark-loss-type {args.dspark_loss_type} requires a DFlash2DraftModel config"
+            "--dspark-loss-type dflash2 requires a DFlash2DraftModel config"
         )
+    # "dpace" is dual-mode: DFlash2 configs use the native objective above;
+    # DFlash/DSpark configs get the official D-PACE semantics from
+    # OnlineDSparkModel (trainer passes official_dpace=True).
 
     _apply_dspark_config(draft_config, args)
     draft_config._attn_implementation = args.attention_backend

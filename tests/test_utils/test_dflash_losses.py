@@ -984,3 +984,73 @@ class TestDFlashLosses(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- Standalone unit tests for dpace_suffix_credit ----
+
+
+def _naive_dpace_suffix_credit(prob, eval_mask, alpha):
+    """Reference implementation matching the D-PACE release ``_dpace_weight``."""
+    smooth = (1.0 - alpha) * prob + alpha
+    smooth = torch.where(eval_mask > 0, smooth, torch.ones_like(smooth))
+    prefix = torch.cumprod(smooth, dim=-1)
+    suffix = torch.flip(
+        torch.cumsum(torch.flip(prefix * eval_mask, dims=[-1]), dim=-1),
+        dims=[-1],
+    )
+    return suffix * eval_mask
+
+
+class TestDpaceSuffixCredit(unittest.TestCase):
+    """Tests for ``specforge.core.dspark.dpace_suffix_credit``."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Import dpace_suffix_credit lazily so the rest of this file's heavy
+        # module patching doesn't interfere.
+        from specforge.core.dspark import dpace_suffix_credit as _fn
+
+        cls._fn = staticmethod(_fn)
+
+    def test_matches_naive_reference_on_random_inputs(self):
+        torch.manual_seed(42)
+        for _ in range(30):
+            bsz, n_blocks, block_size = 2, 3, 7
+            prob = torch.rand(bsz, n_blocks, block_size, dtype=torch.float64)
+            eval_mask = (torch.rand(bsz, n_blocks, block_size) > 0.3).double()
+            alpha = float(torch.rand(1).item())
+            got = self._fn(prob, eval_mask, alpha)
+            want = _naive_dpace_suffix_credit(prob, eval_mask, alpha)
+            # dpace_suffix_credit computes in fp32 internally; allow
+            # corresponding rounding tolerance even when inputs are fp64.
+            torch.testing.assert_close(got.double(), want, rtol=1e-6, atol=1e-7)
+
+    def test_all_invalid_positions_yield_zero_weights(self):
+        prob = torch.rand(2, 2, 5)
+        eval_mask = torch.zeros(2, 2, 5)
+        for alpha in (0.0, 0.5, 1.0):
+            got = self._fn(prob, eval_mask, alpha)
+            assert (got == 0).all(), f"alpha={alpha}: expected all zeros"
+
+    def test_single_valid_position(self):
+        eval_mask = torch.zeros(1, 1, 5)
+        eval_mask[0, 0, 2] = 1.0
+        prob = torch.tensor([[[0.3, 0.5, 0.9, 0.1, 0.7]]])
+        alpha = 0.5
+        got = self._fn(prob, eval_mask, alpha)
+        # Only position 2 is valid: smooth = 0.5 + 0.5*0.9 = 0.95
+        # prefix at position 2: cumprod of [1, 1, 0.95] = 0.95
+        # suffix sum at position 2: 0.95 * 1 (only valid token)
+        expected = torch.zeros(1, 1, 5)
+        expected[0, 0, 2] = 0.95
+        torch.testing.assert_close(got, expected, rtol=0, atol=1e-6)
+
+    def test_no_mass_matching_credit_grows_with_confidence(self):
+        """Official D-PACE: higher confidence -> larger total credit mass."""
+        eval_mask = torch.ones(1, 1, 5)
+        alpha = 0.5
+        low_q = torch.full((1, 1, 5), 0.4)
+        high_q = torch.full((1, 1, 5), 0.9)
+        low_sum = self._fn(low_q, eval_mask, alpha).sum()
+        high_sum = self._fn(high_q, eval_mask, alpha).sum()
+        assert high_sum > low_sum, "credit mass should grow with confidence"

@@ -23,13 +23,13 @@ def add_objective_args(group):
         "--dspark-loss-type",
         choices=["ce-l1", *DFLASH2_NATIVE_OBJECTIVES, *TV_OBJECTIVES],
         default=OBJECTIVE_DEFAULTS["dspark_loss_type"],
-        help="dflash2: native DFlash2 CE + selector; dpace: native DFlash2 D-PACE + selector; tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
+        help="dflash2: native DFlash2 CE + selector; dpace: official D-PACE objective — native DFlash2 D-PACE + selector on DFlash2 configs, release-semantics D-PACE (detached suffix credit, per-sequence normalization, pure CE) on DFlash/DSpark checkpoints; tv-acceptance: ground-truth-prefix proxy; tv-acceptance-beta: sampled-prefix single-round accepted length.",
     )
     group.add_argument(
         "--dpace-alpha",
         type=float,
         default=0.5,
-        help="Probability smoothing floor for native DFlash2 --dspark-loss-type dpace, in [0, 1].",
+        help="Probability smoothing floor for --dspark-loss-type dpace, in [0, 1]. Applies to both the native DFlash2 objective and the official-semantics D-PACE mode on DFlash/DSpark checkpoints.",
     )
     group.add_argument(
         "--tv-anchor-mode",
@@ -86,8 +86,9 @@ def validate_objective_args(args):
     if args.dspark_loss_type in DFLASH2_NATIVE_OBJECTIVES:
         if args.pace_mode != "none":
             raise ValueError(
-                "--pace-mode is a DSpark option; for DFlash2 use "
-                "--dspark-loss-type dpace and --dpace-alpha"
+                "--pace-mode cannot be combined with --dspark-loss-type "
+                f"{args.dspark_loss_type}; the official D-PACE objective is "
+                "selected with --dspark-loss-type dpace and --dpace-alpha"
             )
         if args.dspark_loss_type == "dpace" and not (
             math.isfinite(args.dpace_alpha) and 0.0 <= args.dpace_alpha <= 1.0
@@ -151,6 +152,10 @@ def validate_objective_resume(saved_args, args):
     # Memory knobs do not change the objective and may be retuned. Beta chunk
     # size can change RNG ordering, so this does not promise bitwise replay.
     invariants = ["dspark_loss_type", "tv_sampling_temperature", "tv_anchor_mode"]
+    if args.dspark_loss_type == "dpace":
+        # The smoothing floor defines the D-PACE objective on both the native
+        # DFlash2 and the DSpark official-semantics paths.
+        invariants.append("dpace_alpha")
     if args.tv_anchor_mode == "on-policy":
         invariants.extend(("tv_rollout_max_tokens", "num_anchors", "max_length"))
     for name in invariants:
@@ -169,10 +174,19 @@ def configure_objective(model, tokenizer, args):
     if args.dspark_loss_type == "dpace":
         from specforge.utils import print_on_rank0
 
-        print_on_rank0(
-            f"DFlash2 D-PACE + selector: dpace_alpha={model.dpace_alpha}; "
-            "dynamic position weights replace loss-decay-gamma."
-        )
+        from .config import is_dflash2_config
+
+        if is_dflash2_config(model.draft_model.config):
+            print_on_rank0(
+                f"DFlash2 D-PACE + selector: dpace_alpha={model.dpace_alpha}; "
+                "dynamic position weights replace loss-decay-gamma."
+            )
+        else:
+            print_on_rank0(
+                f"DSpark official D-PACE: dpace_alpha={model.dpace_alpha}; "
+                "detached suffix credit replaces loss-decay-gamma, CE is "
+                "normalized per sequence (no weight-mass matching)."
+            )
         return
     if args.dspark_loss_type not in TV_OBJECTIVES:
         return

@@ -83,9 +83,9 @@ def test_native_dpace_rejects_invalid_alpha(alpha):
 
 
 @pytest.mark.parametrize("objective", ["dflash2", "dpace"])
-def test_native_dflash2_rejects_dspark_pace_mode(objective):
+def test_native_dpace_rejects_dspark_pace_mode(objective):
     args = training_args("--dspark-loss-type", objective, "--pace-mode", "token")
-    with pytest.raises(ValueError, match="--pace-mode is a DSpark option"):
+    with pytest.raises(ValueError, match="--pace-mode"):
         validate_objective_args(args)
 
 
@@ -709,3 +709,75 @@ def test_dspark_on_policy_recipe_requires_original_checkpoint(tmp_path):
     assert result.returncode != 0
     assert "Set INIT_DRAFT_MODEL_PATH to the original DSpark checkpoint" in result.stderr
     assert "unexpected launch" not in result.stdout
+
+
+# ---- Official D-PACE for DFlash/DSpark checkpoints ----
+
+
+class TestOfficialDpaceModelConflicts:
+    """OnlineDSparkModel rejects conflicting DSpark auxiliary losses."""
+
+    @staticmethod
+    def _make_model(**extra):
+        import torch.nn as nn
+
+        from specforge.core.dspark import OnlineDSparkModel
+
+        vocab_size = 64
+
+        class _StubDraft(nn.Module):
+            sliding_window = None
+
+            def forward(self, **kw):
+                raise NotImplementedError
+
+        return OnlineDSparkModel(
+            draft_model=_StubDraft(),
+            target_lm_head=nn.Linear(4, vocab_size, bias=False),
+            target_embed_tokens=nn.Embedding(vocab_size, 4),
+            mask_token_id=0,
+            block_size=4,
+            attention_backend="sdpa",
+            num_anchors=4,
+            official_dpace=True,
+            official_dpace_alpha=0.5,
+            recall_partition_top_k=16,
+            **extra,
+        )
+
+    def test_official_dpace_rejects_pace_mode(self):
+        with pytest.raises(ValueError, match="pace_mode"):
+            self._make_model(pace_mode="token")
+
+    def test_official_dpace_rejects_l1_loss(self):
+        with pytest.raises(ValueError, match="l1_loss_alpha"):
+            self._make_model(l1_loss_alpha=0.9)
+
+    def test_official_dpace_rejects_confidence_head(self):
+        with pytest.raises(ValueError, match="confidence_head_alpha"):
+            self._make_model(confidence_head_alpha=1.0)
+
+    def test_official_dpace_rejects_bv_loss(self):
+        # BV validation runs before official_dpace checks and rejects
+        # bv>0 with l1>0.  Passing l1=0 reaches the official_dpace guard.
+        with pytest.raises(ValueError, match="bv_loss_alpha"):
+            self._make_model(bv_loss_alpha=0.5, l1_loss_alpha=0.0)
+
+    def test_official_dpace_rejects_offline_acceptance(self):
+        with pytest.raises(ValueError, match="offline_acceptance_objective"):
+            self._make_model(offline_acceptance_objective="angel-lk-e2e")
+
+    def test_official_dpace_rejects_blend_schedule(self):
+        with pytest.raises(ValueError, match="pace blend schedule"):
+            self._make_model(pace_blend_max=0.8)
+
+
+def test_dpace_resume_rejects_alpha_change():
+    args = training_args("--dspark-loss-type", "dpace")
+    validate_objective_args(args)
+    saved = vars(args).copy()
+    validate_objective_resume(saved, args)
+    changed = saved.copy()
+    changed["dpace_alpha"] = 0.7
+    with pytest.raises(ValueError, match="dpace_alpha"):
+        validate_objective_resume(changed, args)

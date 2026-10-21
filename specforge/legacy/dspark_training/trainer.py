@@ -622,6 +622,8 @@ def run_training(args):
             pace_residual_beta=args.pace_residual_beta,
             pace_residual_min=args.pace_residual_min,
             pace_residual_max=args.pace_residual_max,
+            official_dpace=args.dspark_loss_type == "dpace",
+            official_dpace_alpha=args.dpace_alpha,
             prefix_credit_mode=args.prefix_credit_mode,
             prefix_credit_alpha=args.prefix_credit_alpha,
             prefix_credit_warmup_ratio=args.prefix_credit_warmup_ratio,
