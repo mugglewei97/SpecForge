@@ -19,6 +19,7 @@ from specforge.core.tv_acceptance import (
 )
 from specforge.core.tv_acceptance_beta import (
     BETA_BLOCK_SIZE,
+    TV_BETA_ABLATIONS,
     tv_acceptance_beta_terms,
     verify_beta_proposals,
 )
@@ -142,11 +143,14 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
         anchor_mode="random",
         rollout_max_tokens=256,
         max_sequence_length=4096,
+        ablation="none",
     ):
         if not math.isfinite(temperature) or temperature <= 0 or chunk_blocks < 1:
             raise ValueError(
                 "temperature must be finite and > 0; chunk_blocks must be > 0"
             )
+        if ablation not in TV_BETA_ABLATIONS:
+            raise ValueError("Unknown TV beta ablation")
         if verification_batch_size is not None and verification_batch_size < 1:
             raise ValueError("TV beta verification batch size must be positive")
         self.tv_temperature = float(temperature)
@@ -155,6 +159,8 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
         self.tv_verification_batch_size = verification_batch_size
         if anchor_mode not in ("random", "on-policy"):
             raise ValueError("Unknown TV beta anchor mode")
+        if ablation != "none" and anchor_mode == "on-policy":
+            raise ValueError("TV beta ablations are only wired for random anchors")
         if rollout_max_tokens < 1 or max_sequence_length < 2:
             raise ValueError("TV rollout and sequence budgets must be positive")
         if anchor_mode == "on-policy" and (
@@ -168,6 +174,7 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
         self.tv_anchor_mode = anchor_mode
         self.tv_rollout_max_tokens = int(rollout_max_tokens)
         self.tv_max_sequence_length = int(max_sequence_length)
+        self.tv_beta_ablation = ablation
 
     def set_training_progress(self, global_step, total_steps):
         # Pure beta has no auxiliary-loss schedule. The shared trainer calls
@@ -262,7 +269,13 @@ class OnlineDFlash2TVBetaModel(OnlineDFlashModel):
                 target_logits = self.lm_head(target_h)
             return tuple(
                 tv_acceptance_beta_terms(
-                    logits, target_logits, mask, tokens, old, self.tv_temperature
+                    logits,
+                    target_logits,
+                    mask,
+                    tokens,
+                    old,
+                    self.tv_temperature,
+                    ablation=self.tv_beta_ablation,
                 )
             )
 

@@ -131,6 +131,7 @@ def _forward_dspark_data_batch(
     needs_target_hidden,
     global_step,
     micro_index=0,
+    is_dflash2=True,
 ):
     # Slice on CPU before calling this function: neither target nor drafter
     # materializes the whole logical batch on GPU in microbatch mode.
@@ -202,6 +203,7 @@ def _forward_dspark_data_batch(
                     loss_mask,
                     attention_mask,
                     last_hidden_states,
+                    is_dflash2=is_dflash2,
                 )
             return dspark_model(
                 input_ids=input_ids,
@@ -1226,6 +1228,7 @@ def run_training(args):
                 dspark_model,
                 needs_target_hidden,
                 seed,
+                is_dflash2=is_dflash2,
             ),
         )
         dspark_model.fixed_prefix_reference_runtime = reference_runtime
@@ -1305,6 +1308,7 @@ def run_training(args):
                 dspark_model,
                 needs_target_hidden,
                 seed,
+                is_dflash2=is_dflash2,
             ),
             control_batches,
             audit_loader,
@@ -1383,6 +1387,7 @@ def run_training(args):
                         needs_target_hidden,
                         global_step,
                         micro_index=index,
+                        is_dflash2=is_dflash2,
                     ),
                 )
             else:
@@ -1403,6 +1408,7 @@ def run_training(args):
                     dspark_model,
                     needs_target_hidden,
                     global_step,
+                    is_dflash2=is_dflash2,
                 )
 
             if args.multi_teacher_oracle_export_dir:

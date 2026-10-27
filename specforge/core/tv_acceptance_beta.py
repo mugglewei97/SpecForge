@@ -14,6 +14,11 @@ from specforge.core.tv_acceptance import TVAcceptanceTerms, reduce_tv_terms
 
 BETA_BLOCK_SIZE = 7
 
+# D-REAL (Full) ablations. "no-score-grad" replaces the sampled ratio r_theta,t
+# with stopgrad(alpha_theta,t), keeping only the pathwise overlap derivative;
+# "no-prefix-weight" drops the sequence-dependent prefix factors entirely.
+TV_BETA_ABLATIONS = ("none", "no-score-grad", "no-prefix-weight")
+
 
 class ProposalRollout(NamedTuple):
     tokens: torch.Tensor
@@ -30,6 +35,8 @@ def tv_acceptance_beta_terms(
     proposal_tokens,
     old_log_probs,
     temperature=1.0,
+    *,
+    ablation="none",
 ):
     """R = a1 + r1*a2 + ...; r = min(p(d), q(d))/stopgrad(q_old(d)).
 
@@ -37,7 +44,14 @@ def tv_acceptance_beta_terms(
     are supported here for formula tests; the training model must have K=7.
     Do not clamp r to one or detach its prefix products: either changes the
     policy gradient, even when the on-policy forward value is unchanged.
+
+    Ablations: "no-score-grad" replaces the sampled ratio with
+    stopgrad(alpha_theta,t) (the per-depth expected acceptance overlap), so the
+    prefix factors carry no gradient and only the pathwise overlap derivative
+    remains; "no-prefix-weight" drops prefix factors and optimizes sum_t a_t.
     """
+    if ablation not in TV_BETA_ABLATIONS:
+        raise ValueError("Unknown TV beta ablation")
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("TV beta temperature must be finite and positive")
     if draft_logits.ndim < 3 or draft_logits.shape != target_logits.shape:
@@ -55,13 +69,21 @@ def tv_acceptance_beta_terms(
     log_p = torch.log_softmax(p_logits / temperature, -1)
     overlap = torch.minimum(log_p.exp(), log_q.exp()).sum(-1).clamp(0, 1)
     overlap = torch.where(valid, overlap, 0.0)
-    tokens = torch.where(valid, proposal_tokens, 0).long()[..., None]
-    log_mass = torch.minimum(log_p.gather(-1, tokens), log_q.gather(-1, tokens))
-    old = torch.where(valid, old_log_probs.detach().to(dtype), 0.0)
-    ratios = torch.exp(log_mass.squeeze(-1) - old)
-    ratios = torch.where(valid, ratios, 0.0)
-    prefix = torch.cat((torch.ones_like(ratios[..., :1]), ratios[..., :-1]), -1)
-    length = (prefix.cumprod(-1) * overlap).sum(-1)
+    if ablation == "no-prefix-weight":
+        length = overlap.sum(-1)
+    else:
+        if ablation == "no-score-grad":
+            ratios = overlap.detach()
+        else:
+            tokens = torch.where(valid, proposal_tokens, 0).long()[..., None]
+            log_mass = torch.minimum(
+                log_p.gather(-1, tokens), log_q.gather(-1, tokens)
+            )
+            old = torch.where(valid, old_log_probs.detach().to(dtype), 0.0)
+            ratios = torch.exp(log_mass.squeeze(-1) - old)
+            ratios = torch.where(valid, ratios, 0.0)
+        prefix = torch.cat((torch.ones_like(ratios[..., :1]), ratios[..., :-1]), -1)
+        length = (prefix.cumprod(-1) * overlap).sum(-1)
     nonempty = valid.any(-1)
     loss = torch.where(nonempty, 1 - length / BETA_BLOCK_SIZE, 0.0)
     dims = tuple(range(valid.ndim - 1))
@@ -263,6 +285,7 @@ def sampled_tv_beta_forward(
                 tokens,
                 old,
                 model.tv_temperature,
+                ablation=getattr(model, "tv_beta_ablation", "none"),
             )
         )
 

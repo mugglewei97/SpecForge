@@ -3,12 +3,15 @@
 import math
 from collections.abc import Mapping
 
+from specforge.core.tv_acceptance_beta import TV_BETA_ABLATIONS
+
 OBJECTIVE_DEFAULTS = {
     "dspark_loss_type": "ce-l1",
     "tv_sampling_temperature": 1.0,
     "tv_objective_chunk_blocks": 8,
     "tv_anchor_mode": "random",
     "tv_rollout_max_tokens": 256,
+    "tv_beta_ablation": "none",
 }
 TV_PREFIX_MODE = "teacher-forced"
 TV_BETA_PREFIX_MODE = "sampled-beta-v1"
@@ -63,6 +66,15 @@ def add_objective_args(group):
         default=None,
         help="Random-anchor beta verification batch size (default: 64 with SGLang prefix KV, 4 otherwise); ignored by teacher-forced TV and on-policy beta.",
     )
+    group.add_argument(
+        "--tv-beta-ablation",
+        choices=TV_BETA_ABLATIONS,
+        default=OBJECTIVE_DEFAULTS["tv_beta_ablation"],
+        help="D-REAL ablations for tv-acceptance-beta with random anchors: "
+        "no-score-grad replaces the sampled prefix ratio r_theta,t with "
+        "stopgrad(alpha_theta,t) (drops the score-function term); "
+        "no-prefix-weight optimizes sum_t a_theta,t without prefix factors.",
+    )
 
 
 def validate_objective_args(args):
@@ -95,6 +107,10 @@ def validate_objective_args(args):
         ):
             raise ValueError("--dpace-alpha must be finite and in [0, 1]")
     if args.dspark_loss_type not in TV_OBJECTIVES:
+        if args.tv_beta_ablation != "none":
+            raise ValueError(
+                "--tv-beta-ablation requires --dspark-loss-type tv-acceptance-beta"
+            )
         return
     if args.dspark_loss_type == "tv-acceptance-beta":
         args.tv_prefix_mode = TV_BETA_PREFIX_MODE
@@ -103,6 +119,13 @@ def validate_objective_args(args):
             and args.tv_verification_batch_size < 1
         ):
             raise ValueError("TV beta verification batch size must be positive")
+    if args.tv_beta_ablation != "none":
+        if args.dspark_loss_type != "tv-acceptance-beta":
+            raise ValueError(
+                "--tv-beta-ablation requires --dspark-loss-type tv-acceptance-beta"
+            )
+        if args.tv_anchor_mode == "on-policy":
+            raise ValueError("--tv-beta-ablation is only wired for random anchors")
     if (
         not math.isfinite(args.tv_sampling_temperature)
         or args.tv_sampling_temperature <= 0
@@ -151,7 +174,12 @@ def validate_objective_resume(saved_args, args):
         )
     # Memory knobs do not change the objective and may be retuned. Beta chunk
     # size can change RNG ordering, so this does not promise bitwise replay.
-    invariants = ["dspark_loss_type", "tv_sampling_temperature", "tv_anchor_mode"]
+    invariants = [
+        "dspark_loss_type",
+        "tv_sampling_temperature",
+        "tv_anchor_mode",
+        "tv_beta_ablation",
+    ]
     if args.dspark_loss_type == "dpace":
         # The smoothing floor defines the D-PACE objective on both the native
         # DFlash2 and the DSpark official-semantics paths.
@@ -226,11 +254,22 @@ def configure_objective(model, tokenizer, args):
             anchor_mode=args.tv_anchor_mode,
             rollout_max_tokens=args.tv_rollout_max_tokens,
             max_sequence_length=args.max_length,
+            ablation=args.tv_beta_ablation,
         )
         print_on_rank0(
             "DFlash2 TV beta: 8 native slots, 7 proposals; strict unary top-k "
             "selector sampling/replay, full-vocabulary target normalization."
         )
+        if args.tv_beta_ablation != "none":
+            print_on_rank0(
+                f"TV beta ablation {args.tv_beta_ablation}: "
+                + (
+                    "prefix factors use stopgrad(alpha_theta,t); the "
+                    "score-function gradient term is removed."
+                    if args.tv_beta_ablation == "no-score-grad"
+                    else "prefix weighting removed; optimizing sum_t a_theta,t."
+                )
+            )
         if args.tv_anchor_mode == "on-policy":
             print_on_rank0(
                 "On-policy anchors: actual sampled speculative round starts; "
@@ -255,6 +294,7 @@ def configure_objective(model, tokenizer, args):
         anchor_mode=args.tv_anchor_mode,
         rollout_max_tokens=args.tv_rollout_max_tokens,
         max_sequence_length=args.max_length,
+        ablation=args.tv_beta_ablation,
     )
     if args.dspark_loss_type == "tv-acceptance-beta":
         print_on_rank0(

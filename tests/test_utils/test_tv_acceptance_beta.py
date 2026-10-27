@@ -107,6 +107,95 @@ def test_beta_formula_fixed_denominator_and_no_ratio_clamp():
     assert unclamped.length_sum > terms.length_sum
 
 
+def test_beta_no_score_grad_ablation_removes_ratio_gradient():
+    """sg[alpha] prefix factors: value drops sampling noise, gradient loses the
+    score-function term but keeps the pathwise overlap derivative."""
+    torch.manual_seed(19)
+    q = torch.randn(2, 3, 5, dtype=torch.double, requires_grad=True)
+    p = torch.randn(2, 3, 5, dtype=torch.double)
+    tokens = torch.tensor([[1, 2, 3], [3, 0, 1]])
+    old = torch.log_softmax(q.detach(), -1).gather(-1, tokens[..., None]).squeeze(-1)
+    mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    terms = tv_acceptance_beta_terms(
+        q, p, mask, tokens, old, ablation="no-score-grad"
+    )
+    terms.loss_sum.backward()
+    ablated_grad = q.grad.clone()
+
+    # Independent reference: prefix products of detached expected acceptances.
+    q.grad = None
+    valid = mask.bool().int().cumprod(-1).bool()
+    log_q = torch.log_softmax(q, -1)
+    log_p = torch.log_softmax(p, -1)
+    overlap = torch.minimum(log_p.exp(), log_q.exp()).sum(-1).clamp(0, 1)
+    overlap = torch.where(valid, overlap, 0.0)
+    prefix = torch.cat(
+        (torch.ones_like(overlap[..., :1]), overlap.detach()[..., :-1]), -1
+    )
+    ref_length = (prefix.cumprod(-1) * overlap).sum(-1)
+    nonempty = valid.any(-1)
+    ref_loss = torch.where(nonempty, 1 - ref_length / 7, ref_length.new_zeros(())).sum()
+    torch.testing.assert_close(terms.length_sum, ref_length.sum())
+    torch.testing.assert_close(terms.loss_sum, ref_loss)
+    ref_loss.backward()
+    torch.testing.assert_close(ablated_grad, q.grad)
+
+    # The removed score term must change the gradient: full formula disagrees.
+    q.grad = None
+    full = tv_acceptance_beta_terms(q, p, mask, tokens, old)
+    full.loss_sum.backward()
+    assert not torch.allclose(ablated_grad, q.grad)
+
+
+def test_beta_no_prefix_weight_ablation_optimizes_plain_overlap_sum():
+    """Without prefix factors every position contributes its own overlap."""
+    torch.manual_seed(23)
+    q = torch.randn(2, 3, 5, dtype=torch.double, requires_grad=True)
+    p = torch.randn(2, 3, 5, dtype=torch.double)
+    tokens = torch.tensor([[1, 2, 3], [3, 0, 1]])
+    old = torch.log_softmax(q.detach(), -1).gather(-1, tokens[..., None]).squeeze(-1)
+    mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    terms = tv_acceptance_beta_terms(
+        q, p, mask, tokens, old, ablation="no-prefix-weight"
+    )
+    terms.loss_sum.backward()
+    ablated_grad = q.grad.clone()
+
+    q.grad = None
+    valid = mask.bool().int().cumprod(-1).bool()
+    log_q = torch.log_softmax(q, -1)
+    log_p = torch.log_softmax(p, -1)
+    overlap = torch.minimum(log_p.exp(), log_q.exp()).sum(-1).clamp(0, 1)
+    overlap = torch.where(valid, overlap, 0.0)
+    nonempty = valid.any(-1)
+    ref_length = overlap.sum(-1)
+    ref_loss = torch.where(nonempty, 1 - ref_length / 7, ref_length.new_zeros(())).sum()
+    torch.testing.assert_close(terms.length_sum, ref_length.sum())
+    torch.testing.assert_close(terms.loss_sum, ref_loss)
+    ref_loss.backward()
+    torch.testing.assert_close(ablated_grad, q.grad)
+
+    # Sampled tokens only matter through the prefix factors; dropping them must
+    # make the objective token-independent.
+    other_tokens = torch.tensor([[0, 0, 0], [1, 1, 1]])
+    rerolled = tv_acceptance_beta_terms(
+        q.detach(), p, mask, other_tokens, old, ablation="no-prefix-weight"
+    )
+    torch.testing.assert_close(rerolled.loss_sum, terms.loss_sum.detach())
+
+
+def test_beta_unknown_ablation_is_rejected():
+    logits = torch.zeros(1, 2, 3, dtype=torch.double)
+    tokens = torch.zeros(1, 2, dtype=torch.long)
+    old = torch.zeros(1, 2, dtype=torch.double)
+    with pytest.raises(ValueError, match="Unknown TV beta ablation"):
+        tv_acceptance_beta_terms(
+            logits, logits, torch.ones(1, 2), tokens, old, ablation="no-grad"
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.double, torch.float16, torch.bfloat16])
 def test_beta_gradients_nan_padding_and_log_space_small_probabilities(dtype):
     q = torch.tensor(

@@ -135,15 +135,48 @@ def build_dflash2_training_model(args, draft_model, target_components, mask_toke
 
 
 def forward_dflash2_native(
-    model, input_ids, hidden_states, loss_mask, attention_mask, last_hidden_states
+    model, input_ids, hidden_states, loss_mask, attention_mask, last_hidden_states,
+    is_dflash2=True,
 ):
-    """Adapt native scalar diagnostics to the legacy loop's six-value result."""
-    loss, accuracy, metrics = model(
-        input_ids=input_ids,
-        hidden_states=hidden_states,
-        loss_mask=loss_mask * attention_mask,
-        target_last_hidden_states=last_hidden_states,
-    )
+    """Adapt native scalar diagnostics to the legacy loop's six-value result.
+
+    When ``is_dflash2=True`` the model is a native algorithm model
+    (``OnlineDFlashModel`` / ``OnlineDSparkModel`` from
+    ``specforge.algorithms.common.dflash_family_model``) whose ``forward``
+    returns ``(loss, accuracy, metrics)``; these are expanded into the legacy
+    six-value contract.
+
+    When ``is_dflash2=False`` the model is the core DSpark
+    ``OnlineDSparkModel`` whose ``forward`` already returns the six-value
+    contract, so we pass through directly.
+    """
+    if not is_dflash2:
+        # Core DSpark model — forward already returns (loss, accuracy,
+        # loss_per_position, acc_per_position, count_per_position, components).
+        return model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask * attention_mask,
+            last_hidden_states=last_hidden_states,
+            attention_mask=attention_mask,
+        )
+
+    # Native algorithm models return (loss, accuracy, metrics).
+    from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
+
+    if isinstance(model, OnlineDSparkModel):
+        loss, accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask * attention_mask,
+            target_last_hidden_states=last_hidden_states,
+        )
+    else:
+        loss, accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask * attention_mask,
+        )
     components = {
         name: numerator.detach() / denominator.detach().clamp_min(1e-12)
         for name, (numerator, denominator) in metrics["ratio_metrics"].items()

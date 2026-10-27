@@ -231,6 +231,7 @@ def configure_tv_acceptance(
     anchor_mode="random",
     rollout_max_tokens=256,
     max_sequence_length=4096,
+    ablation="none",
 ):
     """Enable the pure objective before FSDP/optimizer creation.
 
@@ -239,8 +240,16 @@ def configure_tv_acceptance(
     token, hidden state and depth. Stateful CARH variants, recurrent, selector
     and refiner heads need their own rollout/replay integration.
     """
+    from specforge.core.tv_acceptance_beta import TV_BETA_ABLATIONS
+
     if not math.isfinite(temperature) or temperature <= 0 or chunk_blocks < 1:
         raise ValueError("temperature must be finite and > 0; chunk_blocks must be > 0")
+    if ablation not in TV_BETA_ABLATIONS:
+        raise ValueError("Unknown TV beta ablation")
+    if ablation != "none" and (not beta or anchor_mode == "on-policy"):
+        raise ValueError(
+            "TV beta ablations require tv-acceptance-beta with random anchors"
+        )
     draft = model.draft_model
     if beta and (
         model.block_size != 7 or getattr(draft.config, "block_size", None) != 7
@@ -312,5 +321,6 @@ def configure_tv_acceptance(
     model.tv_acceptance_beta = bool(beta)
     model.tv_verification_batch_size = verification_batch_size
     model.tv_anchor_mode = anchor_mode
+    model.tv_beta_ablation = ablation
     model.tv_rollout_max_tokens = int(rollout_max_tokens)
     model.tv_max_sequence_length = int(max_sequence_length)
