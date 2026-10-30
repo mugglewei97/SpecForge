@@ -40,8 +40,9 @@ def tv_acceptance_beta_terms(
 ):
     """R = a1 + r1*a2 + ...; r = min(p(d), q(d))/stopgrad(q_old(d)).
 
-    The denominator is always seven, including truncated blocks. Short tensors
-    are supported here for formula tests; the training model must have K=7.
+    The loss is the unnormalized 1 - length, so gradients are not downscaled
+    by the block size. Short tensors are supported here for formula tests; the
+    training model must have K=7.
     Do not clamp r to one or detach its prefix products: either changes the
     policy gradient, even when the on-policy forward value is unchanged.
 
@@ -85,7 +86,7 @@ def tv_acceptance_beta_terms(
         prefix = torch.cat((torch.ones_like(ratios[..., :1]), ratios[..., :-1]), -1)
         length = (prefix.cumprod(-1) * overlap).sum(-1)
     nonempty = valid.any(-1)
-    loss = torch.where(nonempty, 1 - length / BETA_BLOCK_SIZE, 0.0)
+    loss = torch.where(nonempty, 1 - length, 0.0)
     dims = tuple(range(valid.ndim - 1))
     correct = (q_logits.argmax(-1) == p_logits.argmax(-1)) & valid
     return TVAcceptanceTerms(

@@ -56,7 +56,7 @@ def candidate_beta_terms(
     prefix = torch.cat((torch.ones_like(ratios[..., :1]), ratios[..., :-1]), -1)
     length = (prefix.cumprod(-1) * overlap).sum(-1)
     nonempty = valid.any(-1)
-    loss = torch.where(nonempty, 1 - length / BETA_BLOCK_SIZE, 0.0)
+    loss = torch.where(nonempty, 1 - length, 0.0)
     predicted = candidate_ids.gather(-1, logits.argmax(-1, keepdim=True)).squeeze(-1)
     correct = (predicted == target_argmax) & valid
     dims = tuple(range(valid.ndim - 1))

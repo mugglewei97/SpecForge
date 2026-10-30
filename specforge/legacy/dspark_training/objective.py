@@ -300,7 +300,7 @@ def configure_objective(model, tokenizer, args):
         print_on_rank0(
             "TV acceptance beta: actual proposal prefixes, same-version rollout/replay, "
             "differentiable min(p(d),q(d))/stopgrad(q_old(d)) prefix factors, "
-            "loss=mean_blocks(1-(a1+r1*a2+r1*r2*a3+...)/7). "
+            "loss=mean_blocks(1-(a1+r1*a2+r1*r2*a3+...)). "
             "Conditional on each anchor; excludes bonus tokens and future round-start gradients. "
             "Reuse target hidden and full-attention Qwen3 prefix KV when available."
         )
@@ -311,7 +311,7 @@ def configure_objective(model, tokenizer, args):
                 f"At most {args.tv_rollout_max_tokens} new tokens and "
                 f"{args.num_anchors} rounds per prompt; the round limit stops "
                 "generation, not reservoir sampling. Rejected proposal suffixes "
-                "remain in replay; fixed denominator 7."
+                "remain in replay; no block-size loss rescaling."
             )
             if args.tv_verification_batch_size is not None:
                 print_on_rank0(

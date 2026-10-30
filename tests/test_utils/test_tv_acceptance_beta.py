@@ -70,7 +70,7 @@ def test_enumerated_value_and_policy_gradient_match_exact_tree(eos):
             old_prob.log()[None],
         )
         estimate = estimate + old_prob.prod() * terms.loss_sum
-    reference = 1 - exact() / 7
+    reference = 1 - exact()
     torch.testing.assert_close(estimate, reference)
     torch.testing.assert_close(
         torch.autograd.grad(estimate, logits)[0],
@@ -78,7 +78,7 @@ def test_enumerated_value_and_policy_gradient_match_exact_tree(eos):
     )
 
 
-def test_beta_formula_fixed_denominator_and_no_ratio_clamp():
+def test_beta_formula_no_block_rescaling_and_no_ratio_clamp():
     p = torch.tensor([[[0.8, 0.2], [0.5, 0.5], [0.4, 0.6]]], dtype=torch.double)
     q = torch.tensor([[[0.6, 0.4], [0.2, 0.8], [0.3, 0.7]]], dtype=torch.double)
     tokens = torch.tensor([[1, 0, 0]])
@@ -89,13 +89,13 @@ def test_beta_formula_fixed_denominator_and_no_ratio_clamp():
         terms.length_sum, torch.tensor(length, dtype=torch.double)
     )
     torch.testing.assert_close(
-        terms.loss_sum, torch.tensor(1 - length / 7, dtype=torch.double)
+        terms.loss_sum, torch.tensor(1 - length, dtype=torch.double)
     )
     partial = tv_acceptance_beta_terms(
         q.log(), p.log(), torch.tensor([[1, 0, 1]]), tokens, old
     )
     torch.testing.assert_close(
-        partial.loss_sum, torch.tensor(1 - 0.8 / 7, dtype=torch.double)
+        partial.loss_sum, torch.tensor(1 - 0.8, dtype=torch.double)
     )
     # Off-policy inputs are only for this derivative test: a training ratio must
     # be allowed above 1, rather than clipping the importance-weighted mass.
@@ -135,7 +135,7 @@ def test_beta_no_score_grad_ablation_removes_ratio_gradient():
     )
     ref_length = (prefix.cumprod(-1) * overlap).sum(-1)
     nonempty = valid.any(-1)
-    ref_loss = torch.where(nonempty, 1 - ref_length / 7, ref_length.new_zeros(())).sum()
+    ref_loss = torch.where(nonempty, 1 - ref_length, ref_length.new_zeros(())).sum()
     torch.testing.assert_close(terms.length_sum, ref_length.sum())
     torch.testing.assert_close(terms.loss_sum, ref_loss)
     ref_loss.backward()
@@ -171,7 +171,7 @@ def test_beta_no_prefix_weight_ablation_optimizes_plain_overlap_sum():
     overlap = torch.where(valid, overlap, 0.0)
     nonempty = valid.any(-1)
     ref_length = overlap.sum(-1)
-    ref_loss = torch.where(nonempty, 1 - ref_length / 7, ref_length.new_zeros(())).sum()
+    ref_loss = torch.where(nonempty, 1 - ref_length, ref_length.new_zeros(())).sum()
     torch.testing.assert_close(terms.length_sum, ref_length.sum())
     torch.testing.assert_close(terms.loss_sum, ref_loss)
     ref_loss.backward()
@@ -445,7 +445,7 @@ def test_real_beta_training_batch_closes_session_before_backward():
     with patch("torch.multinomial", side_effect=AssertionError("backward resampled")):
         result[0].backward()
     assert count == len(target.requests)
-    assert 0 <= result[0].item() <= 1
+    assert -6 <= result[0].item() <= 1
     assert any(
         p.grad is not None and p.grad.abs().sum() > 0
         for p in model.draft_model.layers.parameters()

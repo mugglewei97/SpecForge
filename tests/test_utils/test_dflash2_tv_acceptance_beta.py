@@ -191,7 +191,7 @@ def test_enumerated_selector_policy_gradient_matches_exact_acceptance_tree(with_
             model.tv_temperature,
         )
         estimate = estimate + old.exp().prod() * terms.loss_sum
-    reference = 1 - exact() / 7
+    reference = 1 - exact()
     parameters = [hidden, *selector.parameters()]
     torch.testing.assert_close(estimate, reference)
     actual = torch.autograd.grad(estimate, parameters, retain_graph=True)

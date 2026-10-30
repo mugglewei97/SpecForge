@@ -59,7 +59,7 @@ def test_candidate_beta_matches_dense_value_and_gradient(dtype, temperature):
     assert sparse_gradient[2].count_nonzero() == 0
 
 
-def test_candidate_beta_uses_full_target_normalizer_and_seven_token_denominator():
+def test_candidate_beta_uses_full_target_normalizer_without_block_rescaling():
     scores = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
     candidate_ids = torch.tensor([[[1, 3]]])
     # The candidate set covers only 0.3 target mass. Renormalizing it would
@@ -72,7 +72,7 @@ def test_candidate_beta_uses_full_target_normalizer_and_seven_token_denominator(
         full_target.argmax(-1), 1.0,
     )
     torch.testing.assert_close(terms.length_sum, torch.tensor(0.3))
-    torch.testing.assert_close(terms.loss_sum, torch.tensor(1 - 0.3 / 7))
+    torch.testing.assert_close(terms.loss_sum, torch.tensor(1 - 0.3))
 
 
 def test_sparse_replay_backpropagates_through_actual_selector_and_hidden():
